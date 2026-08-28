@@ -1,0 +1,29 @@
+[package]
+name = "easysql"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "stop typing connection strings, make sql easy: saved postgres, mysql, sqlite and sql server connections, their passwords and their tunnels in one CLI + TUI"
+authors = ["Pablo Antonio Hernández Hernández (safteinzz)"]
+license = "AGPL-3.0-only"
+readme = "README.md"
+repository = "https://gitlab.com/safteinzz/easysql"
+keywords = ["postgres", "mysql", "sql", "tui", "cli"]
+categories = ["command-line-utilities", "database"]
+# README screenshots are fetched over the network by crates.io via absolute raw
+# URLs, never read out of the package, so shipping them would only bloat every download.
+exclude = ["readme-assets/", "demo/", "dev/"]
+
+# The crate is `easysql`, but the command you type is the shorter `esql`
+# (sql + one letter, the same trade essh makes against ssh).
+[[bin]]
+name = "esql"
+path = "src/main.rs"
+
+[dependencies]
+anyhow    = "1"                                      # error handling in the config/credential engines
+clap      = { version = "4", features = ["derive"] } # CLI argument parsing
+ratatui   = "0.29"                                   # the TUI (bare `esql`)
+crossterm = "0.28"                                   # terminal backend for ratatui + key events
+colored   = "2"                                      # colored CLI output (ls)
+dirs      = "5"                                      # locate the config/state dirs portably

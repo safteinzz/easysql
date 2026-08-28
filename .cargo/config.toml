@@ -1,0 +1,10 @@
+# `cargo clippy-all` is the lint pass. A bare `cargo clippy` only sees the lib
+# and the bin, so it reports clean while skipping `tests/` and `examples/`, and
+# it warns where a release wants a failure.
+[alias]
+clippy-all = "clippy --release --all-targets -- -D warnings"
+
+# `cargo +1.88 msrv` is the floor check. The default toolchain is newer than the
+# `rust-version` this crate advertises and accepts code that 1.88 rejects, so only
+# running the older compiler proves the advertised floor is real.
+msrv = "check --all-targets"

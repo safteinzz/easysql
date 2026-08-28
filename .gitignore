@@ -1,0 +1,17 @@
+/target
+TODO-LIST.md
+
+# Tool-specific agent pointers (thin @AGENTS.md imports, never committed)
+CLAUDE.md
+GEMINI.md
+.cursor/
+.aider*
+.windsurfrules
+
+# Private reference material, never committed - see AGENTS.md
+/.nocommit
+
+# The screenshot rig's scratch: the staged home, which holds the pids, the
+# binary symlink and the shell rc too. `stage.sh` and the tapes are what counts.
+/demo/home/
+/demo/.env
