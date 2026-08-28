@@ -14,7 +14,7 @@ use crate::engines::{self, Conn, Engine};
 use crate::ini;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where one credential physically lives, which is what a delete has to know.
 #[derive(Clone, PartialEq)]
@@ -171,8 +171,21 @@ fn escape_pgpass(value: &str) -> String {
 /// is replaced in place rather than appended, so re-answering the wizard fixes
 /// a password instead of stacking a second line libpq would never reach.
 pub fn set_pg(host: &str, port: &str, database: &str, user: &str, password: &str) -> Result<()> {
-    let path = pgpass_path();
-    let text = fs::read_to_string(&path).unwrap_or_default();
+    set_pg_in(&pgpass_path(), host, port, database, user, password)
+}
+
+/// `set_pg` against a given file. The same seam `pg::list_in` and `vias::set_in`
+/// have, so the escaping and the replace can be exercised without a real
+/// `~/.pgpass` anywhere near it.
+pub fn set_pg_in(
+    path: &Path,
+    host: &str,
+    port: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+) -> Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
     let entry = [host, port, database, user, password]
         .iter()
         .map(|f| escape_pgpass(f))
@@ -195,9 +208,9 @@ pub fn set_pg(host: &str, port: &str, database: &str, user: &str, password: &str
         out.push(entry);
     }
     if path.exists() {
-        ini::backup(&path)?;
+        ini::backup(path)?;
     }
-    write_pgpass(&path, &out)
+    write_pgpass(path, &out)
 }
 
 pub fn delete(cred: &Cred) -> Result<()> {
@@ -242,4 +255,105 @@ fn write_pgpass(path: &std::path::Path, lines: &[String]) -> Result<()> {
     // hygiene, it is whether the file works at all.
     ini::harden(path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A throwaway `.pgpass` that deletes itself and its backups. The real one
+    /// is never opened by this suite.
+    struct Temp(PathBuf);
+
+    impl Temp {
+        fn new(body: &str) -> Temp {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("easysql-pgpass-{}-{stamp}", std::process::id()));
+            fs::write(&path, body).unwrap();
+            Temp(path)
+        }
+
+        fn lines(&self) -> Vec<String> {
+            fs::read_to_string(&self.0)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            if let Some(dir) = self.0.parent() {
+                let stem = format!("{}.bak.", self.0.file_name().unwrap().to_string_lossy());
+                if let Ok(entries) = fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        if e.file_name().to_string_lossy().starts_with(&stem) {
+                            let _ = fs::remove_file(e.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_colon_or_backslash_in_a_field_is_escaped() {
+        // `.pgpass` is colon-separated with `\` as the escape, so an unescaped
+        // `:` in a password would silently shift every field after it.
+        let f = Temp::new("");
+        set_pg_in(&f.0, "db.example.com", "5432", "app", "me", r"pa:ss\word").unwrap();
+        assert_eq!(
+            f.lines(),
+            vec![r"db.example.com:5432:app:me:pa\:ss\\word".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_entry_with_the_same_first_four_fields_is_replaced_in_place() {
+        // libpq takes the first match, so an appended second line for the same
+        // host/port/database/user would never be reached.
+        let f = Temp::new("db.example.com:5432:app:me:old\nother.example.com:5432:app:me:keep\n");
+        set_pg_in(&f.0, "db.example.com", "5432", "app", "me", "new").unwrap();
+        assert_eq!(
+            f.lines(),
+            vec![
+                "db.example.com:5432:app:me:new".to_string(),
+                "other.example.com:5432:app:me:keep".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_different_user_on_the_same_database_appends_instead() {
+        let f = Temp::new("db.example.com:5432:app:me:mine\n");
+        set_pg_in(&f.0, "db.example.com", "5432", "app", "you", "yours").unwrap();
+        assert_eq!(
+            f.lines(),
+            vec![
+                "db.example.com:5432:app:me:mine".to_string(),
+                "db.example.com:5432:app:you:yours".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_file_is_chmod_600() {
+        // Not hygiene: libpq flatly refuses a world-readable `.pgpass`, so the
+        // file simply does not work without it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Temp::new("");
+            set_pg_in(&f.0, "db.example.com", "5432", "app", "me", "s3cret").unwrap();
+            let mode = fs::metadata(&f.0).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "libpq ignores a .pgpass that is not 0600");
+        }
+    }
 }

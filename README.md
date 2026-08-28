@@ -1,18 +1,20 @@
-# easysql
+# easysql (`esql`)
 
-One command, `esql`, over `psql`, `mysql`, `sqlite3` and `sqlcmd`. Your saved
-connections in a list, their passwords where their clients already look for
-them, and the ssh tunnel you need to reach the ones that hide behind a bastion.
+> **Canonical:** [gitlab.com/safteinzz/easysql](https://gitlab.com/safteinzz/easysql) · **Mirror:** [github.com/safteinzz/easysql](https://github.com/safteinzz/easysql)
 
-It is a front end, never a client. easysql writes the files your tools already
-read and then hands the terminal over, so `\c`, `\dt`, your `.psqlrc` and every
-script on the machine keep working, and uninstalling it costs you nothing.
+<!-- desc:start -->
+getting to the sql prompt, quick and easy - saved connections, their passwords and their tunnels in one CLI + TUI
+<!-- desc:end -->
 
 ## Install
 
-```sh
+```bash
 cargo install easysql
+esql self check   # is a newer release out?
+esql self update  # install the latest
 ```
+
+No cargo yet? Rust installs the same way on every distro: [rustup.rs](https://rustup.rs).
 
 The real clients have to be on the machine, and cargo cannot bring them: they
 are not Rust. easysql works out the one command *your* machine needs and offers
@@ -28,7 +30,7 @@ already on file, and `no client` is the program that would open it missing.
 
 ![The Connections tab listing seven connections across postgres, mysql, sqlite and sqlserver, with a details panel showing host, port, database, user and the psql command that will run](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/connections.png)
 
-## A connection that only works through a tunnel
+## When it needs a tunnel
 
 A forward dies with a reboot; the connection that needs it does not. easysql
 remembers which one, says so before you press anything, and Enter reopens it and
@@ -36,7 +38,7 @@ connects in one step.
 
 ![The details panel for a connection whose tunnel is closed, reading "tunnel to bastion is not open - Enter reopens it and connects", with the ssh -L command it will run](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnel-aware.png)
 
-## Editing writes the file the client already reads
+## The command, built for you
 
 The wizard shows the command it is building and what that command resolves to,
 so nothing about it is a surprise. Keys you added by hand are carried through
@@ -44,7 +46,7 @@ untouched, and the file is backed up before every write.
 
 ![The edit wizard for a postgres connection, with name, host, port, database, user and sslmode fields, previewing both the psql command and the user@host:port/database it resolves to](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/wizard.png)
 
-## Passwords go where the client looks for them
+## Passwords, where the client looks
 
 Typed once into a hidden field, written straight to the file that engine's
 client reads, and never read back, never echoed, never put in an argv or an
@@ -66,9 +68,10 @@ is in. `d` puts any of them back.
 
 ![The Settings tab showing eight settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
-## The CLI
+## Commands
 
-Three things, all faster to type than to click. Everything else is in the TUI.
+The handful of things faster to type than to click. Everything else is in the
+toolbox, where `?` lists every key.
 
 ```sh
 esql                  # the toolbox
@@ -76,7 +79,6 @@ esql prod             # open a saved connection
 esql prod -c 'select 1'   # anything after the name goes to the client
 esql ls               # list them, one name per line
 esql ls -v            # ...and where each one points
-esql self update      # update this binary
 ```
 
 ![esql ls -v printing seven connections with their engine, name and user@host:port/database](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)
@@ -103,34 +105,28 @@ offers the step that would actually get you in:
 - `Connection refused`, or `no pg_hba.conf entry for host` → open an ssh tunnel
 - `database "x" does not exist` → edit the connection
 
-## Keys
-
-| key | what it does |
-| --- | --- |
-| `↵` | open the connection, change the setting |
-| `c` | new connection, password or tunnel |
-| `e` | edit |
-| `d` | delete, kill a tunnel, or put a setting back |
-| `p` | save a password for this connection |
-| `t` | reach it through an ssh host (`ssh -L`) |
-| `y` / `Y` | yank the command / the URL |
-| `Tab` | next tab |
-| `/` | filter the list you are in |
-| `r` | refresh |
-| `?` | help |
-| `q` | quit |
-
 ## Notes
 
-- Postgres, MySQL/MariaDB, SQLite and SQL Server.
-- SQL Server is the odd one: no file both `sqlcmd` builds read, so easysql keeps
-  that list itself and passes `-S host,port -d db -U user`. It saves no password
-  there either - `sqlcmd` asks you, which is Microsoft's own advice over `-P`.
-  It is also in no distro's repos, so there is no install to offer.
+- Nothing is sent anywhere. A front end, not a client: easysql speaks no wire
+  protocol and holds no connection open, it writes the files your tools already
+  read and runs them, so uninstalling it costs you nothing.
 - apt, pacman, dnf, zypper and apk are recognised for the install offer. On
   anything else easysql names the program rather than guessing a package.
-- Tunnel liveness is read from `/proc`, so tunnels are Linux only.
-- Nothing is sent anywhere. easysql speaks no wire protocol and holds no
-  connection open; it writes config and runs your client.
 
-Linux only. AGPL-3.0-only.
+## Compatibility
+
+Four engines, each handed over to the client you already have: Postgres to
+`psql`, MySQL and MariaDB to `mysql`, SQLite to `sqlite3`, SQL Server to
+`sqlcmd`. Any of them can be pointed somewhere else in Settings.
+
+SQL Server is the odd one out twice: no file both `sqlcmd` builds read, so
+easysql keeps that list itself and passes `-S host,port -d db -U user`, and it
+saves no password, because `sqlcmd` asking you is Microsoft's own advice over
+`-P`. It is in no distro's repos either, so there is no install to offer.
+
+Linux. Tunnel liveness is read from `/proc` and killing a forward shells out to
+`kill`, so macOS and BSD need a different implementation first.
+
+## License
+
+AGPL-3.0-only

@@ -117,3 +117,61 @@ pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<
     argv.push("select 1".into());
     (argv, Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn client_and_foreign_groups_are_never_ours() {
+        // `[client]` is read by every MySQL tool on the machine, so writing a
+        // host into it would silently redirect mysqldump and everything else.
+        assert_eq!(name_of("client"), None);
+        assert_eq!(name_of("mysqld"), None);
+        assert_eq!(name_of("mysqldump"), None);
+        // Ours round-trip.
+        assert_eq!(name_of(&group_of("prod")), Some("prod".to_string()));
+    }
+
+    #[test]
+    fn listing_skips_every_group_that_is_not_ours() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("easysql-mycnf-{}-{stamp}", std::process::id()));
+        fs::write(
+            &path,
+            "\
+[client]
+host=shared.example.com
+
+[mysqld]
+port=3306
+
+[clientprod]
+host=db.example.com
+port=3306
+database=app
+user=me
+connect_timeout=5
+",
+        )
+        .unwrap();
+
+        let conns = list_in(&path);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(conns.len(), 1, "only [clientNAME] groups are connections");
+        assert_eq!(conns[0].name, "prod");
+        assert_eq!(conns[0].host, "db.example.com");
+        // A key no wizard field owns is carried through rather than dropped.
+        assert_eq!(
+            conns[0].extra,
+            vec![("connect_timeout".to_string(), "5".to_string())]
+        );
+    }
+}

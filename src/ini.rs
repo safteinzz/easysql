@@ -260,3 +260,174 @@ pub fn collapse_tilde(path: &str) -> String {
         _ => path.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway file under the temp dir that deletes itself, so a test run
+    /// leaves the machine exactly as it found it.
+    struct Temp(PathBuf);
+
+    impl Temp {
+        fn new(body: &str) -> Temp {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("easysql-ini-{}-{stamp}.conf", std::process::id()));
+            fs::write(&path, body).unwrap();
+            Temp(path)
+        }
+
+        fn read(&self) -> String {
+            fs::read_to_string(&self.0).unwrap()
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            // Every write leaves a `<name>.bak.<epoch>` beside it.
+            if let Some(dir) = self.0.parent() {
+                let stem = format!("{}.bak.", self.0.file_name().unwrap().to_string_lossy());
+                if let Ok(entries) = fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        if e.file_name().to_string_lossy().starts_with(&stem) {
+                            let _ = fs::remove_file(e.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parses_sections_and_reads_keys_case_insensitively() {
+        let sections = parse(
+            "\
+# a comment nobody may touch
+[prod]
+host=db.example.com
+Port=5432
+
+[staging]
+host=stage.example.com
+",
+        );
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "prod");
+        assert_eq!(sections[0].get("host"), Some("db.example.com"));
+        // libpq and mysql both read keys case-insensitively, so we must too.
+        assert_eq!(sections[0].get("port"), Some("5432"));
+        assert_eq!(sections[1].get("host"), Some("stage.example.com"));
+    }
+
+    #[test]
+    fn duplicate_key_keeps_the_first_and_a_key_before_any_header_is_dropped() {
+        // Both clients take the first value; a key above the first `[header]`
+        // belongs to no section, and inventing one for it would write it back
+        // somewhere it was never meant to be.
+        let sections = parse("stray=1\n[prod]\nhost=a\nhost=b\n");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].get("host"), Some("a"));
+        assert_eq!(sections[0].get("stray"), None);
+    }
+
+    #[test]
+    fn rest_hands_back_the_keys_no_wizard_field_owns() {
+        // This is what stops a hand-written `connect_timeout` from vanishing
+        // the first time somebody edits the connection in the wizard.
+        let sections = parse("[prod]\nhost=a\nsslmode=require\nconnect_timeout=3\n");
+        let rest = sections[0].rest(&["host", "port", "dbname", "user"]);
+        assert_eq!(
+            rest,
+            vec![
+                ("sslmode".to_string(), "require".to_string()),
+                ("connect_timeout".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn upsert_rewrites_one_section_and_leaves_the_rest_verbatim() {
+        let f = Temp::new(
+            "\
+# hand-written, and not ours to reformat
+[keep]
+host = untouched.example.com
+connect_timeout=9
+
+[prod]
+host=old.example.com
+",
+        );
+        upsert(
+            &f.0,
+            None,
+            "prod",
+            &[
+                ("host".into(), "new.example.com".into()),
+                ("port".into(), "5432".into()),
+            ],
+        )
+        .unwrap();
+
+        let out = f.read();
+        assert!(out.contains("# hand-written, and not ours to reformat"));
+        assert!(out.contains("host = untouched.example.com"));
+        assert!(out.contains("connect_timeout=9"));
+        assert!(out.contains("new.example.com"));
+        assert!(!out.contains("old.example.com"));
+    }
+
+    #[test]
+    fn upsert_renames_in_place_rather_than_leaving_both() {
+        let f = Temp::new("[old]\nhost=a\n");
+        upsert(&f.0, Some("old"), "new", &[("host".into(), "a".into())]).unwrap();
+        let out = f.read();
+        assert!(out.contains("[new]"));
+        assert!(!out.contains("[old]"));
+    }
+
+    #[test]
+    fn remove_takes_the_blank_line_above_it_too() {
+        // Otherwise repeated add/delete cycles pad the file out with blanks.
+        let f = Temp::new("[keep]\nhost=a\n\n[drop]\nhost=b\n");
+        remove(&f.0, "drop").unwrap();
+        assert_eq!(f.read(), "[keep]\nhost=a\n");
+    }
+
+    #[test]
+    fn set_key_sets_and_clears_without_disturbing_the_group() {
+        let f = Temp::new("[clientprod]\nhost=a\nuser=me\n");
+        set_key(&f.0, "clientprod", "password", Some("s3cret")).unwrap();
+        let out = f.read();
+        assert!(out.contains("password=s3cret"));
+        assert!(out.contains("user=me"));
+
+        set_key(&f.0, "clientprod", "password", None).unwrap();
+        let out = f.read();
+        assert!(!out.contains("s3cret"));
+        assert!(out.contains("user=me"));
+    }
+
+    #[test]
+    fn tilde_expands_and_collapses_only_for_the_current_user() {
+        let home = dirs::home_dir().unwrap_or_default();
+        assert_eq!(expand_tilde("~/db.sqlite"), home.join("db.sqlite"));
+        // Children run without a shell, so anything we do not expand reaches
+        // sqlite3 as a directory literally named `~`.
+        assert_eq!(
+            expand_tilde("/srv/db.sqlite"),
+            PathBuf::from("/srv/db.sqlite")
+        );
+        assert_eq!(expand_tilde("~root/db"), PathBuf::from("~root/db"));
+        assert_eq!(
+            collapse_tilde(&home.join("db.sqlite").to_string_lossy()),
+            "~/db.sqlite"
+        );
+        assert_eq!(collapse_tilde("/srv/db.sqlite"), "/srv/db.sqlite");
+    }
+}

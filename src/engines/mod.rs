@@ -466,3 +466,103 @@ pub fn install_note(engine: Engine) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(engine: Engine, name: &str) -> Conn {
+        Conn {
+            engine,
+            name: name.to_string(),
+            host: "db.example.com".into(),
+            port: "5432".into(),
+            database: "app".into(),
+            user: "me".into(),
+            extra: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn key_is_slug_and_name_so_two_engines_may_share_a_name() {
+        assert_eq!(conn(Engine::Pg, "prod").key(), "pg:prod");
+        assert_eq!(conn(Engine::MySql, "prod").key(), "my:prod");
+        assert_eq!(conn(Engine::Sqlite, "prod").key(), "lite:prod");
+        assert_eq!(conn(Engine::MsSql, "prod").key(), "ms:prod");
+    }
+
+    #[test]
+    fn each_engine_is_opened_through_the_file_its_client_already_reads() {
+        // The whole design rule: we never pass a host or a password on the
+        // command line, we name the block the client reads it out of.
+        let s = Settings::default();
+        assert_eq!(
+            conn(Engine::Pg, "prod").connect_argv(&s),
+            vec!["psql", "service=prod"]
+        );
+        assert_eq!(
+            conn(Engine::MySql, "prod").connect_argv(&s),
+            vec!["mysql", "--defaults-group-suffix=prod"]
+        );
+    }
+
+    #[test]
+    fn sqlite_is_handed_an_expanded_path_because_children_run_without_a_shell() {
+        let mut c = conn(Engine::Sqlite, "notes");
+        c.database = "~/notes.sqlite".into();
+        let argv = c.connect_argv(&Settings::default());
+        let home = dirs::home_dir().unwrap_or_default();
+        assert_eq!(argv[0], "sqlite3");
+        assert_eq!(argv[1], home.join("notes.sqlite").to_string_lossy());
+        assert!(
+            !argv[1].starts_with('~'),
+            "a literal ~ reaches sqlite3 as a directory name"
+        );
+    }
+
+    #[test]
+    fn sqlcmd_takes_host_and_port_separated_by_a_comma_not_a_colon() {
+        let argv = conn(Engine::MsSql, "prod").connect_argv(&Settings::default());
+        assert_eq!(
+            argv,
+            vec![
+                "sqlcmd",
+                "-S",
+                "db.example.com,5432",
+                "-d",
+                "app",
+                "-U",
+                "me"
+            ]
+        );
+        // No `-P`: Microsoft's own advice is to let sqlcmd prompt.
+        assert!(!argv.iter().any(|a| a == "-P"));
+    }
+
+    #[test]
+    fn a_wrapper_client_with_its_own_arguments_survives_the_split() {
+        // Somebody who points psql_command at a docker wrapper meant it.
+        let s = Settings {
+            psql_command: "docker exec -it db psql".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            conn(Engine::Pg, "prod").connect_argv(&s),
+            vec!["docker", "exec", "-it", "db", "psql", "service=prod"]
+        );
+    }
+
+    #[test]
+    fn only_sql_server_refuses_to_store_a_password() {
+        assert!(Engine::Pg.stores_password());
+        assert!(Engine::MySql.stores_password());
+        assert!(!Engine::MsSql.stores_password());
+    }
+
+    #[test]
+    fn from_slug_accepts_both_the_slug_and_the_label() {
+        assert_eq!(Engine::from_slug("pg"), Some(Engine::Pg));
+        assert_eq!(Engine::from_slug("postgres"), Some(Engine::Pg));
+        assert_eq!(Engine::from_slug("nope"), None);
+    }
+}
