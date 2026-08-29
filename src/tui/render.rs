@@ -54,24 +54,19 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
 
 pub(super) fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     let idx = VIEWS.iter().position(|v| *v == app.view).unwrap_or(0);
-    let tabs = Tabs::new(vec![
-        "Connections",
-        "Passwords",
-        "Tunnels (ssh -L)",
-        "Settings",
-    ])
-    .select(idx)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" easysql · esql "),
-    )
-    .divider("│")
-    .highlight_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let tabs = Tabs::new(VIEWS.iter().map(|v| v.title()).collect::<Vec<_>>())
+        .select(idx)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" easysql · esql "),
+        )
+        .divider("│")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(tabs, area);
 }
 
@@ -258,6 +253,47 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
             f.render_stateful_widget(list, area, &mut app.tunnel_state);
         }
 
+        View::Snippets => {
+            let rows = app.snippet_rows();
+            if let Some(msg) = nothing_here(
+                app,
+                app.snippets.len(),
+                rows.len(),
+                "No saved queries.\nPress `c` to write one, then run it against any connection\nwith `esql <name> :<snippet>`.",
+            ) {
+                empty(f, area, "Snippets", &msg);
+                return;
+            }
+            let nw = rows
+                .iter()
+                .map(|&i| app.snippets[i].name.len())
+                .max()
+                .unwrap_or(0)
+                .min(20);
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|&i| {
+                    let s = &app.snippets[i];
+                    let room = (area.width as usize).saturating_sub(2 + 2 + nw + 2 + 12 + 2);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:nw$}", s.name), bold),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{:12}", format!(":{}", s.name)),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(fit_end(&s.summary(), room), dim),
+                    ]))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(counted("Snippets", rows.len(), app.snippets.len()))
+                .highlight_style(sel)
+                .highlight_symbol("▸ ");
+            f.render_stateful_widget(list, area, &mut app.snippet_state);
+        }
+
         View::Settings => {
             let rows = app.settings_rows();
             let total = app.settings.rows().len();
@@ -434,6 +470,7 @@ pub(super) fn render_status(f: &mut Frame, area: Rect, app: &App) {
                 View::Connections => CONN_HINTS,
                 View::Passwords => PASS_HINTS,
                 View::Tunnels => TUNNELS_HINTS,
+                View::Snippets => SNIP_HINTS,
                 View::Settings => SETTINGS_HINTS,
             };
             // A committed filter stays visible in front of the hints: rows are
@@ -453,7 +490,7 @@ pub(super) fn render_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 80, 28);
+    let rect = centered(area, 80, 30);
     f.render_widget(Clear, rect);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let lines = vec![
@@ -474,9 +511,16 @@ pub(super) fn render_help(f: &mut Frame, area: Rect) {
             "            r reload · ● up · ● down · ● tunnel closed · ○ checking · pw = password saved",
         ),
         Line::raw(""),
-        Line::raw("Passwords   c save one for a connection · d forget it · r reload"),
+        Line::raw(
+            "Passwords   c save one for a connection · e re-point it · d forget it · r reload",
+        ),
+        Line::raw(
+            "            o open the file in $EDITOR, which is the only way to reorder entries",
+        ),
         Line::raw("            easysql writes these files and never reads a password back"),
         Line::raw("Tunnels     d kill it (ends the background ssh -N)    r refresh"),
+        Line::raw("Snippets    c new · e edit the SQL · o open the file · d delete · r reload"),
+        Line::raw("            run one with `esql <connection> :<name>`; psql expands it too"),
         Line::raw("Settings    ↵ change it · d back to default · r reload the file"),
         Line::raw(""),
         Line::raw("In a form   type to fill (h/j/k/l are text!)"),

@@ -175,6 +175,32 @@ local=$TUN_PORT
 EOF
 }
 
+write_snippets() {
+  # Saved queries, the thing `esql <connection> :name` runs. Deliberately a mix:
+  # one that works anywhere, one that is Postgres-only, so the tab shows that
+  # they are plain SQL files and not an engine-scoped abstraction.
+  local d="$STAGE/.config/easysql/snippets"
+  mkdir -p "$d"
+  cat > "$d/tables.sql" <<'EOF'
+select table_schema, table_name
+  from information_schema.tables
+ where table_schema not in ('pg_catalog', 'information_schema')
+ order by 1, 2;
+EOF
+  cat > "$d/activity.sql" <<'EOF'
+select pid, usename, state, left(query, 60) as query
+  from pg_stat_activity
+ where state is not null
+ order by pid;
+EOF
+  cat > "$d/sizes.sql" <<'EOF'
+select relname, pg_size_pretty(pg_total_relation_size(c.oid)) as size
+  from pg_class c
+ order by pg_total_relation_size(c.oid) desc
+ limit 10;
+EOF
+}
+
 write_ssh_config() {
   # Read, never written. The tunnel wizard picks its hop from here, so the
   # picker has something to show. RFC 5737 documentation addresses.
@@ -313,6 +339,7 @@ up() {
   write_pgpass
   write_my
   write_easysql_conf
+  write_snippets
   write_ssh_config
   make_sqlite_db
   seed_history

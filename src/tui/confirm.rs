@@ -62,6 +62,9 @@ pub(crate) enum ConfirmAction {
         name: String,
     },
     ForgetPassword(creds::Cred),
+    DeleteSnippet {
+        name: String,
+    },
     /// Offered after an authentication failure: open the password wizard.
     SavePassword {
         key: String,
@@ -195,6 +198,13 @@ impl App {
                     None => self.set_status(format!("'{name}' is already gone")),
                 }
             }
+            ConfirmAction::DeleteSnippet { name } => match crate::snippets::delete(&name) {
+                Ok(_) => {
+                    self.refresh_snippets();
+                    self.set_status(format!("deleted '{name}'"));
+                }
+                Err(e) => self.set_status(format!("could not delete it: {e}")),
+            },
             ConfirmAction::ForgetPassword(cred) => {
                 let where_stored = cred.where_stored();
                 match creds::delete(&cred) {

@@ -16,8 +16,13 @@ use std::path::PathBuf;
 pub enum ConnOrder {
     /// Most recently opened first: the database you were in is the one you want.
     Recent,
-    /// Plain alphabetical, the order `esql ls` always uses.
-    Alpha,
+    /// Grouped by engine, then by name inside each - the order `esql ls` uses.
+    /// This used to be called "alphabetical", which is what it is *within* an
+    /// engine and misleading about the grouping, so the two are now separate
+    /// answers rather than one that quietly does both.
+    Engine,
+    /// By name alone, ignoring which engine it belongs to.
+    Name,
 }
 
 pub struct Settings {
@@ -33,6 +38,7 @@ pub struct Settings {
     pub mysql_command: String,
     pub sqlite_command: String,
     pub sqlcmd_command: String,
+    pub hints: bool,
     /// The ssh host a tunnel wizard offers first, for the bastion you always use.
     pub tunnel_host: String,
 }
@@ -47,6 +53,7 @@ impl Default for Settings {
             mysql_command: "mysql".into(),
             sqlite_command: "sqlite3".into(),
             sqlcmd_command: "sqlcmd".into(),
+            hints: true,
             tunnel_host: String::new(),
         }
     }
@@ -93,7 +100,7 @@ impl Row {
 
 const PROBE_CHOICES: &[&str] = &["on", "off"];
 const TIMEOUT_CHOICES: &[&str] = &["1", "2", "3", "5", "10"];
-const ORDER_CHOICES: &[&str] = &["recent", "alphabetical"];
+const ORDER_CHOICES: &[&str] = &["recent", "engine", "name"];
 
 pub fn path() -> PathBuf {
     dirs::config_dir()
@@ -139,7 +146,11 @@ impl Settings {
             }
             "conn_order" => {
                 self.conn_order = match value {
-                    "alphabetical" | "alpha" => ConnOrder::Alpha,
+                    // "alphabetical" is the old spelling of what is now
+                    // "engine", kept so an existing settings file still means
+                    // what it meant before this was split in two.
+                    "engine" | "alphabetical" | "alpha" => ConnOrder::Engine,
+                    "name" => ConnOrder::Name,
                     _ => ConnOrder::Recent,
                 }
             }
@@ -147,6 +158,7 @@ impl Settings {
             "mysql_command" => self.mysql_command = non_empty(value, "mysql"),
             "sqlite_command" => self.sqlite_command = non_empty(value, "sqlite3"),
             "sqlcmd_command" => self.sqlcmd_command = non_empty(value, "sqlcmd"),
+            "hints" => self.hints = value != "off",
             "tunnel_host" => self.tunnel_host = value.to_string(),
             _ => {}
         }
@@ -208,10 +220,11 @@ impl Settings {
                 key: "conn_order",
                 group: Group::Behaviour,
                 label: "List order",
-                help: "recent = last opened first · alphabetical = like esql ls",
+                help: "recent = last opened first · engine = grouped, like esql ls · name = ignoring engine",
                 value: match self.conn_order {
                     ConnOrder::Recent => "recent".into(),
-                    ConnOrder::Alpha => "alphabetical".into(),
+                    ConnOrder::Engine => "engine".into(),
+                    ConnOrder::Name => "name".into(),
                 },
                 default: "recent".into(),
                 choices: Some(ORDER_CHOICES),
@@ -251,6 +264,15 @@ impl Settings {
                 value: self.sqlcmd_command.clone(),
                 default: d.sqlcmd_command.clone(),
                 choices: None,
+            },
+            Row {
+                key: "hints",
+                group: Group::Behaviour,
+                label: "Prompt hints",
+                help: "print how to list tables in that client before handing the terminal over",
+                value: on_off(self.hints).into(),
+                default: on_off(d.hints).into(),
+                choices: Some(&["on", "off"]),
             },
             Row {
                 key: "tunnel_host",
@@ -293,5 +315,31 @@ fn non_empty(value: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_order_separates_grouping_by_engine_from_sorting_by_name() {
+        // These used to be one answer called "alphabetical", which grouped by
+        // engine without saying so. Somebody who wants plain alphabetical and
+        // somebody who wants engines kept together now get different orders.
+        let mut s = Settings::default();
+        s.set("conn_order", "name");
+        assert!(matches!(s.conn_order, ConnOrder::Name));
+        s.set("conn_order", "engine");
+        assert!(matches!(s.conn_order, ConnOrder::Engine));
+
+        // The old spelling still means what it always meant, so an existing
+        // settings file does not silently change somebody's list.
+        s.set("conn_order", "alphabetical");
+        assert!(matches!(s.conn_order, ConnOrder::Engine));
+
+        // Anything unrecognised falls back to the default rather than erroring.
+        s.set("conn_order", "nonsense");
+        assert!(matches!(s.conn_order, ConnOrder::Recent));
     }
 }

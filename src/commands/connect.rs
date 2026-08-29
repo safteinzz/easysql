@@ -52,7 +52,55 @@ pub fn run(args: Vec<String>) {
     // behave identically and the preview can never lie about what runs.
     let settings = crate::settings::load();
     let mut argv = conn.connect_argv(&settings);
-    argv.extend(args.into_iter().skip(1));
+
+    // `esql prod :slots` runs the saved query instead of opening a session. The
+    // colon is psql's own sigil for exactly this, and it cannot collide with a
+    // client flag or a database name, so a bare word after the connection still
+    // means what it always meant.
+    let rest: Vec<String> = args.into_iter().skip(1).collect();
+    // Nothing after the connection name means a session is being opened rather
+    // than a one-shot query. Asked before `rest` is consumed below.
+    let session = rest.is_empty();
+    let snippet: Option<String> = rest
+        .first()
+        .and_then(|a| a.strip_prefix(':'))
+        .map(str::to_string);
+    match snippet.as_deref() {
+        Some(name) => {
+            let Some(s) = crate::snippets::get(name) else {
+                eprintln!("{}", format!("esql: no snippet called '{name}'").red());
+                eprintln!(
+                    "{}",
+                    "      `esql` and the Snippets tab list and create them.".dimmed()
+                );
+                std::process::exit(2);
+            };
+            // sqlite3 takes the query as a bare argument, so it has no flag.
+            if let Some(flag) = conn.engine.query_flag() {
+                argv.push(flag.to_string());
+            }
+            argv.push(s.sql);
+            argv.extend(rest.into_iter().skip(1));
+        }
+        None => argv.extend(rest),
+    }
+    // Keep psql's own shortcuts in step on the way in. Doing it here rather
+    // than only when a snippet is saved is what makes it self-healing: the
+    // files are the source, and editing one by hand (or with `o`) would
+    // otherwise leave `:name` expanding to yesterday's query.
+    if conn.engine == crate::engines::Engine::Pg && snippet.is_none() {
+        let _ = crate::snippets::sync_psqlrc();
+    }
+
+    // Only when a session is actually being opened: a one-shot query prints its
+    // own result and a hint above it would just be noise in a pipe.
+    if settings.hints && session {
+        eprintln!(
+            "{}",
+            format!("  {}", crate::engines::hint_line(conn.engine)).dimmed()
+        );
+    }
+
     let (program, rest) = argv.split_first().expect("connect_argv is never empty");
     let program = program.clone();
     let rest: Vec<String> = rest.to_vec();

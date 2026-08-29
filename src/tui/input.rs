@@ -129,6 +129,7 @@ impl App {
             View::Connections => self.conns_key(key),
             View::Passwords => self.passwords_key(key),
             View::Tunnels => self.tunnels_key(key),
+            View::Snippets => self.snippets_key(key),
             View::Settings => self.settings_key(key),
         }
     }
@@ -269,9 +270,113 @@ impl App {
                 ));
                 None
             }
+            // `e` moves an entry to the right host/port/database/user without
+            // asking for the secret again. Only `.pgpass` has entries of its
+            // own: a MySQL password lives inside its connection's group, so
+            // there is nothing to edit here that is not the connection itself.
+            KeyCode::Char('e') => {
+                let cred = self.selected_cred()?.clone();
+                match cred.source {
+                    creds::Source::Pgpass(idx) => {
+                        self.prompt = Some(Prompt::edit_password(&cred, idx));
+                    }
+                    creds::Source::MyCnf(ref name) => {
+                        self.set_status(format!(
+                            "this password lives in [client{name}]: edit the connection instead"
+                        ));
+                    }
+                }
+                None
+            }
+            // `o` opens the file itself. Not a convenience: libpq takes the
+            // *first* matching line, so which of two overlapping entries wins is
+            // decided by their order, and no wizard field can express that. The
+            // file is backed up first, because an editor is the one write path
+            // easysql does not control.
+            KeyCode::Char('o') => {
+                let cred = self.selected_cred()?.clone();
+                let path = match cred.source {
+                    creds::Source::Pgpass(_) => creds::pgpass_path(),
+                    creds::Source::MyCnf(_) => engines::mysql::cnf_path(),
+                };
+                let editor = std::env::var("VISUAL")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_default();
+                if editor.is_empty() {
+                    self.set_status("set $EDITOR (or $VISUAL) to open it here");
+                    return None;
+                }
+                if let Err(e) = crate::ini::backup(&path) {
+                    self.set_status(format!("could not back it up, so not opening it: {e}"));
+                    return None;
+                }
+                // The same split the client commands get, so `EDITOR="code -w"`
+                // works the way `psql_command="docker exec -it pg psql"` does.
+                let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
+                argv.push(path.to_string_lossy().into_owned());
+                Some(PendingRun {
+                    label: shell_join(&argv),
+                    argv,
+                    connect: None,
+                })
+            }
             KeyCode::Char('r') => {
                 self.refresh_creds();
                 self.set_status("reloaded ~/.pgpass and ~/.my.cnf");
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn snippets_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
+        match key.code {
+            KeyCode::Char('c') => {
+                self.prompt = Some(Prompt::snippet(None));
+                None
+            }
+            KeyCode::Char('e') => {
+                let s = self.selected_snippet()?.clone();
+                self.prompt = Some(Prompt::snippet(Some(&s)));
+                None
+            }
+            // SQL is multi-line and a one-line field is the wrong shape for it,
+            // so the real editing path is the file itself.
+            KeyCode::Char('o') => {
+                let s = self.selected_snippet()?.clone();
+                let editor = std::env::var("VISUAL")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_default();
+                if editor.is_empty() {
+                    self.set_status("set $EDITOR (or $VISUAL) to open it here");
+                    return None;
+                }
+                let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
+                argv.push(s.path.to_string_lossy().into_owned());
+                Some(PendingRun {
+                    label: shell_join(&argv),
+                    argv,
+                    connect: None,
+                })
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') => {
+                let s = self.selected_snippet()?.clone();
+                self.confirm = Some(Confirm::new(
+                    "delete snippet",
+                    format!("Delete '{}'? The file goes with it.", s.name),
+                    ConfirmAction::DeleteSnippet { name: s.name },
+                ));
+                None
+            }
+            KeyCode::Char('r') => {
+                self.refresh_snippets();
+                match crate::snippets::sync_psqlrc() {
+                    Ok(p) => self.set_status(format!(
+                        "reloaded · rewrote the easysql block in {}",
+                        crate::ini::collapse_tilde(&p.to_string_lossy())
+                    )),
+                    Err(e) => self.set_status(format!("reloaded, but ~/.psqlrc: {e}")),
+                }
                 None
             }
             _ => None,

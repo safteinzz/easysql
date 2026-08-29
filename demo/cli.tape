@@ -26,3 +26,14 @@ Enter
 Sleep 2s
 Screenshot ../readme-assets/ls.png
 Sleep 1s
+
+# The saved query, run against a connection from the shell. Same word on any
+# engine, which is the whole point and is invisible in a still of the tab.
+Type "clear"
+Enter
+Sleep 300ms
+Type "esql app :tables"
+Enter
+Sleep 2.5s
+Screenshot ../readme-assets/snippet-run.png
+Sleep 1s

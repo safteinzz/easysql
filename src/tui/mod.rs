@@ -25,6 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::{ListState, Padding};
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -55,13 +56,30 @@ pub(super) enum View {
     Connections,
     Passwords,
     Tunnels,
+    Snippets,
     Settings,
 }
 
-const VIEWS: [View; 4] = [
+impl View {
+    /// The tab's label. Lives on the view itself so the strip is built from
+    /// `VIEWS` rather than from a second list beside it: a parallel array is how
+    /// a new tab ends up rendering under the previous one's name.
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            View::Connections => "Connections",
+            View::Passwords => "Passwords",
+            View::Tunnels => "Tunnels (ssh -L)",
+            View::Snippets => "Snippets",
+            View::Settings => "Settings",
+        }
+    }
+}
+
+const VIEWS: [View; 5] = [
     View::Connections,
     View::Passwords,
     View::Tunnels,
+    View::Snippets,
     View::Settings,
 ];
 
@@ -69,7 +87,9 @@ const VIEWS: [View; 4] = [
 // full cheat-sheet (navigation keys and the real command behind each action), so
 // the bar stays short instead of restating everything and overflowing.
 const CONN_HINTS: &str = "↵ open · c new · e edit · d del · p password · t tunnel · y yank · Y url · r refresh · / find · ? help";
-const PASS_HINTS: &str = "c new · d forget · r refresh · / find · ? help";
+const SNIP_HINTS: &str = "c new · e edit · o open the file · d delete · r reload · / find · ? help";
+const PASS_HINTS: &str =
+    "c new · e edit · o open the file · d forget · r refresh · / find · ? help";
 const TUNNELS_HINTS: &str = "d kill · r refresh · / find · ? help";
 const SETTINGS_HINTS: &str = "↵ change · d back to default · r reload · ? help";
 
@@ -91,6 +111,7 @@ pub(super) struct App {
     pub(super) conns: Vec<Conn>,
     pub(super) creds: Vec<Cred>,
     pub(super) tunnels: Vec<tunnels::Tunnel>,
+    pub(super) snippets: Vec<crate::snippets::Snippet>,
     pub(super) conn_state: ListState,
     pub(super) cred_state: ListState,
     pub(super) tunnel_state: ListState,
@@ -121,6 +142,7 @@ pub(super) struct App {
     pub(super) installed: [bool; 4],
     /// The choices that are yours rather than the clients'.
     pub(super) settings: Settings,
+    pub(super) snippet_state: ListState,
     pub(super) settings_state: ListState,
 }
 
@@ -134,6 +156,7 @@ impl App {
             conns: Vec::new(),
             creds: Vec::new(),
             tunnels: Vec::new(),
+            snippets: Vec::new(),
             conn_state: ListState::default().with_selected(Some(0)),
             cred_state: ListState::default().with_selected(Some(0)),
             tunnel_state: ListState::default().with_selected(Some(0)),
@@ -156,6 +179,7 @@ impl App {
             // Selected from the start: the detail panel beside a list that has
             // never been touched would otherwise read "nothing selected", which
             // looks like an empty tab rather than one you have not moved in.
+            snippet_state: ListState::default().with_selected(Some(0)),
             settings_state: ListState::default().with_selected(Some(0)),
         }
     }
@@ -187,6 +211,7 @@ impl App {
         self.refresh_conns();
         self.refresh_creds();
         self.refresh_tunnels();
+        self.refresh_snippets();
     }
 
     pub(super) fn refresh_conns(&mut self) {
@@ -209,9 +234,18 @@ impl App {
                 let history = &self.history;
                 self.conns.sort_by_key(|c| history.rank(&c.key()));
             }
-            ConnOrder::Alpha => self
+            // Engine first, then name inside it. `Engine::idx()` is the order
+            // `ENGINES` declares, not the slug: `lite/my/pg` is an abbreviation
+            // nobody asked to read.
+            ConnOrder::Engine => self
                 .conns
                 .sort_by(|a, b| (a.engine.idx(), &a.name).cmp(&(b.engine.idx(), &b.name))),
+            // And by name alone, for somebody who thinks in connection names
+            // rather than in engines. Ties fall back to the engine so the order
+            // is still total.
+            ConnOrder::Name => self
+                .conns
+                .sort_by(|a, b| (&a.name, a.engine.idx()).cmp(&(&b.name, b.engine.idx()))),
         }
     }
 
@@ -233,6 +267,23 @@ impl App {
                     && matches!(target, "127.0.0.1" | "localhost");
             (t.kind == 'L' && same_host && onward == port).then(|| open.to_string())
         })
+    }
+
+    pub(super) fn refresh_snippets(&mut self) {
+        self.snippets = crate::snippets::list();
+        // Keep psql's `\set` block in step with the files on every reload, not
+        // only when the wizard saves one: editing a `.sql` with `o` and coming
+        // back would otherwise leave `:name` expanding to the old query, which
+        // looks like the edit simply did not take. It writes nothing when
+        // nothing changed, so this is free on the common path.
+        let _ = crate::snippets::sync_psqlrc();
+        let n = self.snippet_rows().len();
+        Self::clamp(&mut self.snippet_state, n);
+    }
+
+    pub(super) fn selected_snippet(&self) -> Option<&crate::snippets::Snippet> {
+        let row = *self.snippet_rows().get(self.snippet_state.selected()?)?;
+        self.snippets.get(row)
     }
 
     pub(super) fn refresh_tunnels(&mut self) {
@@ -340,6 +391,15 @@ impl App {
             .collect()
     }
 
+    pub(super) fn snippet_rows(&self) -> Vec<usize> {
+        self.snippets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| filter::matches(&self.query, &[&s.name, &s.summary()]))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The settings the current query keeps. Every one is always relevant, so
     /// this filters the same way the other tabs do rather than specially.
     pub(super) fn settings_rows(&self) -> Vec<settings::Row> {
@@ -361,6 +421,7 @@ impl App {
             View::Connections => self.conn_rows().len(),
             View::Passwords => self.cred_rows().len(),
             View::Tunnels => self.tunnel_rows().len(),
+            View::Snippets => self.snippet_rows().len(),
             View::Settings => self.settings_rows().len(),
         }
     }
@@ -407,6 +468,7 @@ impl App {
         self.conn_state.select(Some(0));
         self.cred_state.select(Some(0));
         self.tunnel_state.select(Some(0));
+        self.snippet_state.select(Some(0));
         self.settings_state.select(Some(0));
         let n = self.conn_rows().len();
         Self::clamp(&mut self.conn_state, n);
@@ -414,6 +476,8 @@ impl App {
         Self::clamp(&mut self.cred_state, n);
         let n = self.tunnel_rows().len();
         Self::clamp(&mut self.tunnel_state, n);
+        let n = self.snippet_rows().len();
+        Self::clamp(&mut self.snippet_state, n);
         let n = self.settings_rows().len();
         Self::clamp(&mut self.settings_state, n);
     }
@@ -467,6 +531,7 @@ impl App {
             View::Connections => Self::move_state(&mut self.conn_state, len, delta),
             View::Passwords => Self::move_state(&mut self.cred_state, len, delta),
             View::Tunnels => Self::move_state(&mut self.tunnel_state, len, delta),
+            View::Snippets => Self::move_state(&mut self.snippet_state, len, delta),
             View::Settings => Self::move_state(&mut self.settings_state, len, delta),
         }
     }
@@ -523,7 +588,16 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
         }
 
         if let Some(run) = app.on_key(key) {
-            let status = run_suspended(terminal, &run.argv)?;
+            // The same orientation line the CLI prints. It belongs here too, and
+            // more so: Enter in the list is the usual way in, and the whole gap
+            // it closes is "I am at a prompt and cannot remember this client's
+            // word for `list the tables`".
+            let hint = run
+                .connect
+                .as_ref()
+                .filter(|_| app.settings.hints)
+                .map(|c| crate::engines::hint_line(c.engine));
+            let status = run_suspended(terminal, &run.argv, hint)?;
 
             if let Some(conn) = run.connect.clone() {
                 match status {
@@ -556,7 +630,11 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
 /// Leave the TUI, run an interactive command with the real terminal, then
 /// restore the TUI. This is what lets psql own its prompt, its pager and its
 /// readline instead of us pretending to be a database client.
-fn run_suspended(terminal: &mut Term, argv: &[String]) -> Result<Option<ExitStatus>> {
+fn run_suspended(
+    terminal: &mut Term,
+    argv: &[String],
+    hint: Option<String>,
+) -> Result<Option<ExitStatus>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     // ratatui hides the cursor while drawing and leaving the alt-screen does not
@@ -564,7 +642,39 @@ fn run_suspended(terminal: &mut Term, argv: &[String]) -> Result<Option<ExitStat
     // you cannot see where you are typing.
     terminal.show_cursor()?;
 
-    let status = Command::new(&argv[0]).args(&argv[1..]).status().ok();
+    // After the alt-screen is gone, so it lands on the shell's screen above the
+    // client's own banner rather than being wiped with the TUI.
+    if let Some(hint) = hint {
+        // Dim, so it reads as a footnote under the client's own banner.
+        println!("\x1b[2m  {hint}\x1b[0m");
+    }
+
+    // Ctrl-C at the terminal is delivered to every process in the foreground
+    // group, which is us as well as the client. Without this, Ctrl-C inside
+    // psql or sqlite3 kills easysql too - mid-suspend, before it can put the
+    // terminal back - and the shell you return to is left in raw mode with a
+    // mangled prompt and a broken history.
+    //
+    // So do what `system(3)` does: ignore it here for as long as the child runs.
+    // SIG_IGN survives exec, so the child must put it back to SIG_DFL itself, or
+    // Ctrl-C would stop working in the client too, which is worse than the bug.
+    let status;
+    unsafe {
+        let prev_int = libc::signal(libc::SIGINT, libc::SIG_IGN);
+        let prev_quit = libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+        status = cmd.status().ok();
+
+        libc::signal(libc::SIGINT, prev_int);
+        libc::signal(libc::SIGQUIT, prev_quit);
+    }
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;

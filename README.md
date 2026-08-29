@@ -20,7 +20,7 @@ The real clients have to be on the machine, and cargo cannot bring them: they
 are not Rust. easysql works out the one command *your* machine needs and offers
 to run it, so you never have to go and find out.
 
-![The easysql tour: opening a saved postgres connection into a real psql session, coming back to the list, inspecting a connection that needs an ssh tunnel, editing one in the wizard, filtering, and the Passwords, Tunnels and Settings tabs](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/demo.gif)
+![The easysql tour: opening a saved postgres connection into a real psql session, coming back to the list, inspecting a connection that needs an ssh tunnel, editing one in the wizard, filtering, and the Passwords, Tunnels, Snippets and Settings tabs](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/demo.gif)
 
 ## What you see first
 
@@ -61,6 +61,24 @@ Each forward says which connection it serves, and `d` kills it.
 
 ![The Tunnels tab listing two ssh forwards by pid, one labelled "for metrics (postgres)", with a details panel showing the ssh -N -L command and the kill command](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnels.png)
 
+## Saved queries
+
+The check you keep rewriting, kept as a `.sql` file and run against any
+connection. easysql hands each client the flag it wants, so the same word works
+on every engine.
+
+```sh
+esql app :tables       # → psql … -c
+esql notes :tables     # → sqlite3 … (bare argument)
+```
+
+![The Snippets tab listing three saved queries with the :name that runs each, and a details panel showing the SQL, the file it lives in and the command that runs it](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.png)
+
+For Postgres they also become `\set` shortcuts in `~/.psqlrc`, so `:tables`
+expands at the psql prompt too. Your own lines in that file are left alone.
+
+![Running esql app :tables from the shell, printing the table list from the connection](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippet-run.png)
+
 ## Settings
 
 Which program opens each engine, whether ports are checked, what order the list
@@ -79,6 +97,7 @@ esql prod             # open a saved connection
 esql prod -c 'select 1'   # anything after the name goes to the client
 esql ls               # list them, one name per line
 esql ls -v            # ...and where each one points
+esql prod :tables     # run a saved query against it
 ```
 
 ![esql ls -v printing seven connections with their engine, name and user@host:port/database](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)

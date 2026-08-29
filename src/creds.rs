@@ -213,6 +213,62 @@ pub fn set_pg_in(
     write_pgpass(path, &out)
 }
 
+/// Move an entry to a different host, port, database or user, keeping whatever
+/// password it already holds.
+///
+/// The secret is copied from the old line to the new one and never leaves this
+/// function: not shown, not previewed, not logged, not passed to a child. That
+/// is the same handling every write already gives it, since rewriting the file
+/// at all means reading the other entries through memory - the invariant is
+/// that easysql never *surfaces* a stored password, not that it never touches
+/// the bytes.
+///
+/// `idx` counts entries, not lines, so comments and blanks cannot shift which
+/// row moves.
+pub fn rekey_pg(idx: usize, host: &str, port: &str, database: &str, user: &str) -> Result<()> {
+    rekey_pg_in(&pgpass_path(), idx, host, port, database, user)
+}
+
+pub fn rekey_pg_in(
+    path: &Path,
+    idx: usize,
+    host: &str,
+    port: &str,
+    database: &str,
+    user: &str,
+) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    let mut moved = false;
+    for line in text.lines() {
+        let blank = line.trim().is_empty() || line.trim_start().starts_with('#');
+        if blank {
+            out.push(line.to_string());
+            continue;
+        }
+        let f = split_pgpass(line);
+        if seen == idx && f.len() == 5 {
+            out.push(
+                [host, port, database, user, &f[4]]
+                    .iter()
+                    .map(|s| escape_pgpass(s))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+            moved = true;
+        } else {
+            out.push(line.to_string());
+        }
+        seen += 1;
+    }
+    if !moved {
+        anyhow::bail!("that entry is no longer in the file (press r to reload)");
+    }
+    ini::backup(path)?;
+    write_pgpass(path, &out)
+}
+
 pub fn delete(cred: &Cred) -> Result<()> {
     match &cred.source {
         Source::MyCnf(name) => engines::mysql::set_password(name, None),
@@ -341,6 +397,19 @@ mod tests {
                 "db.example.com:5432:app:you:yours".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn moving_an_entry_keeps_its_password_and_everything_else_in_the_file() {
+        // The point of `e` on the Passwords tab: correct the host or widen the
+        // database without being asked for a secret easysql cannot show you.
+        let f =
+            Temp::new("# mine\n\nold.example.com:5432:app:bob:s3cret\nother:5432:*:eve:hunter2\n");
+        rekey_pg_in(&f.0, 0, "new.example.com", "5433", "*", "bob").unwrap();
+        let lines = f.lines();
+        assert!(lines.contains(&"new.example.com:5433:*:bob:s3cret".to_string()));
+        assert!(lines.contains(&"# mine".to_string()));
+        assert!(lines.contains(&"other:5432:*:eve:hunter2".to_string()));
     }
 
     #[test]

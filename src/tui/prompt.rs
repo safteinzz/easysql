@@ -94,6 +94,14 @@ pub(crate) enum Action {
         /// where a `.pgpass` line stands on its own four fields.
         name: String,
     },
+    /// Write a saved query. `original` is set when renaming an existing one.
+    Snippet {
+        original: Option<String>,
+    },
+    /// Move a `.pgpass` entry to different match fields, keeping its secret.
+    EditPassword {
+        idx: usize,
+    },
     /// Open an `ssh -L` to a database that is not routable from here. Carries
     /// the connection it was opened for, because once the forward is up that
     /// connection is one field away from working and should not have to fail a
@@ -229,14 +237,14 @@ impl Prompt {
                     },
                 ),
                 Field::filled("Port (* matches any)", &c.port_or_default()),
-                Field::filled(
-                    "Database (* matches any)",
-                    if c.database.is_empty() {
-                        "*"
-                    } else {
-                        &c.database
-                    },
-                ),
+                // `*` even when the connection names a database, because a
+                // Postgres password belongs to the *role* and roles are
+                // cluster-wide: the same secret unlocks every database on that
+                // server, and narrowing it here only means `\c elsewhere`
+                // prompts. It stays editable, because behind a pooler
+                // (pgbouncer, an RDS proxy) the database name really does
+                // select a different backend with different credentials.
+                Field::filled("Database (* = every database on this server)", "*"),
                 Field::filled("User (* matches any)", &c.user),
                 Field::secret("Password (never shown, never in an argv)"),
             ],
@@ -295,6 +303,52 @@ pub(super) fn forward_target(via: &str, db_host: &str) -> String {
 }
 
 impl Prompt {
+    /// Change which connection a saved password answers for, without ever
+    /// asking for the password again: easysql cannot show you the one on file,
+    /// but it can carry it across to the corrected line.
+    pub(super) fn edit_password(cred: &crate::creds::Cred, idx: usize) -> Self {
+        Self {
+            title: format!("Which connection is {}'s password for?", cred.user),
+            idx: 0,
+            action: Action::EditPassword { idx },
+            fields: vec![
+                Field::filled("Host (* matches any)", &cred.host),
+                Field::filled("Port (* matches any)", &cred.port),
+                Field::filled(
+                    "Database (* = every database on this server)",
+                    &cred.database,
+                ),
+                Field::filled("User (* matches any)", &cred.user),
+            ],
+        }
+    }
+
+    /// Name a saved query and give it its SQL. One line here on purpose: this
+    /// is for writing a short one quickly, and anything longer is what `o` and
+    /// a real editor are for.
+    pub(super) fn snippet(from: Option<&crate::snippets::Snippet>) -> Self {
+        Self {
+            title: match from {
+                Some(s) => format!("Edit the snippet '{}'", s.name),
+                None => "New saved query".to_string(),
+            },
+            idx: 0,
+            action: Action::Snippet {
+                original: from.map(|s| s.name.clone()),
+            },
+            fields: vec![
+                Field::filled(
+                    "Name (what you type after the connection, as :name)",
+                    from.map(|s| s.name.as_str()).unwrap_or(""),
+                ),
+                Field::filled(
+                    "SQL (o opens it in $EDITOR afterwards, for anything longer)",
+                    &from.map(|s| s.summary()).unwrap_or_default(),
+                ),
+            ],
+        }
+    }
+
     /// A one-field wizard for a typed setting, pre-filled with what it is now.
     pub(super) fn edit_setting(row: &settings::Row) -> Self {
         let mut field = Field::filled(row.help, &row.value);
@@ -393,6 +447,17 @@ impl Prompt {
             }
             // The shape of the line, never its secret: the point is to teach the
             // file's format so you can read and edit it yourself afterwards.
+            Action::Snippet { .. } => {
+                let name = v(0);
+                (!name.is_empty()).then(|| format!("esql <connection> :{name}"))
+            }
+            Action::EditPassword { .. } => Some(format!(
+                "~/.pgpass   {}:{}:{}:{}:•••• (kept)",
+                v(0),
+                v(1),
+                v(2),
+                v(3)
+            )),
             Action::SetPassword { engine, name } => Some(match engine {
                 Engine::Pg => format!("~/.pgpass   {}:{}:{}:{}:••••", v(0), v(1), v(2), v(3)),
                 _ => format!("~/.my.cnf   [client{name}]  password=••••"),

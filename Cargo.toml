@@ -1,6 +1,6 @@
 [package]
 name = "easysql"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "getting to the sql prompt, quick and easy - saved connections, their passwords and their tunnels in one CLI + TUI"
@@ -27,3 +27,4 @@ ratatui   = "0.29"                                   # the TUI (bare `esql`)
 crossterm = "0.28"                                   # terminal backend for ratatui + key events
 colored   = "2"                                      # colored CLI output (ls)
 dirs      = "5"                                      # locate the config/state dirs portably
+libc      = "0.2"                                    # signal handling around a suspended client (see tui::run_suspended)

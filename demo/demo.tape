@@ -78,7 +78,11 @@ Sleep 3s
 Tab
 Sleep 3s
 
-# --- beat 8: settings, and back to where we started -------------------------
+# --- beat 8: snippets, the saved queries `:name` runs ------------------------
+Tab
+Sleep 3.5s
+
+# --- beat 9: settings, and back to where we started -------------------------
 Tab
 Sleep 3s
 Tab

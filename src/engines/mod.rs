@@ -116,6 +116,41 @@ impl Engine {
         }
     }
 
+    /// How this client is handed a query to run and exit. Every one of them can
+    /// do it; no two spell it the same way, which is the whole reason a snippet
+    /// shortcut has to live in easysql rather than in any one client's rc file.
+    /// SQLite takes it as a bare argument, so there is no flag to give.
+    pub fn query_flag(self) -> Option<&'static str> {
+        match self {
+            Engine::Pg => Some("-c"),
+            Engine::MySql => Some("-e"),
+            Engine::Sqlite => None,
+            Engine::MsSql => Some("-Q"),
+        }
+    }
+
+    /// The one line of orientation printed before the terminal is handed over.
+    ///
+    /// Ordered the way you actually move through a server - databases, then
+    /// schemas, then tables, then one object - because that is the sequence
+    /// somebody who has forgotten the client is trying to walk. Recall is the
+    /// gap here; none of these clients is missing a feature, they just spell
+    /// "list the tables" four different ways.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Engine::Pg => {
+                "\\l dbs · \\c name · \\dn schemas · \\dt tables · \\d name · \\? help · \\q quit"
+            }
+            Engine::MySql => {
+                "show databases; · use name; · show tables; · desc name; · help; · \\q quit"
+            }
+            Engine::Sqlite => ".databases · .tables · .schema name · .help · .quit",
+            Engine::MsSql => {
+                "select name from sys.databases; · use name; · select name from sys.tables; · :help · exit"
+            }
+        }
+    }
+
     /// True when this engine has a server to reach, and therefore a port to
     /// probe and a tunnel worth opening. SQLite is a file.
     pub fn networked(self) -> bool {
@@ -433,6 +468,24 @@ pub fn install_argv(engine: Engine) -> Option<Vec<String>> {
         manager.verb().to_string(),
         pkg.to_string(),
     ])
+}
+
+/// The hint plus this machine's snippets, when the client can expand them
+/// itself. Only psql can, so only psql is told about them - offering `:tables`
+/// to a client that will read it as a syntax error is worse than saying nothing.
+pub fn hint_line(engine: Engine) -> String {
+    let base = engine.hint().to_string();
+    if engine != Engine::Pg {
+        return base;
+    }
+    let names: Vec<String> = crate::snippets::list()
+        .into_iter()
+        .map(|s| format!(":{}", s.name))
+        .collect();
+    match names.is_empty() {
+        true => base,
+        false => format!("{base}\n  {}", names.join(" · ")),
+    }
 }
 
 /// Just the package name this machine calls the client, for a row that has no

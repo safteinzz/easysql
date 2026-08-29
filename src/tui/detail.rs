@@ -29,6 +29,7 @@ pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         View::Connections => conn_lines(app),
         View::Passwords => cred_lines(app),
         View::Tunnels => tunnel_lines(app),
+        View::Snippets => snippet_lines(app),
         View::Settings => setting_lines(app),
     };
     let para = Paragraph::new(lines)
@@ -186,6 +187,40 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
         Style::default().fg(Color::Green),
     ));
     lines.push(Line::styled(format!("esql {}", c.name), dim()));
+    lines
+}
+
+fn snippet_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(s) = app.selected_snippet() else {
+        return vec![Line::styled("nothing selected", dim())];
+    };
+    let mut lines = vec![
+        Line::styled(s.name.clone(), heading()),
+        Line::styled("saved query".to_string(), dim()),
+        Line::raw(""),
+    ];
+    // The query itself, as written. This is the one panel that shows a file's
+    // whole contents, because a snippet *is* its contents.
+    for line in s.sql.lines() {
+        lines.push(Line::styled(
+            line.to_string(),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(row(
+        "File",
+        crate::ini::collapse_tilde(&s.path.to_string_lossy()),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("esql <connection> :{}", s.name),
+        Style::default().fg(Color::Cyan),
+    ));
+    lines.push(Line::styled(
+        "runs it against any engine, with that client's own flag".to_string(),
+        dim(),
+    ));
     lines
 }
 

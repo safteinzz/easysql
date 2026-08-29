@@ -68,6 +68,12 @@ Sleep 2s
 Screenshot ../readme-assets/tunnels.png
 Sleep 700ms
 
+# --- the Snippets tab, and what `:name` runs --------------------------------
+Tab
+Sleep 2s
+Screenshot ../readme-assets/snippets.png
+Sleep 700ms
+
 # --- the Settings tab -------------------------------------------------------
 Tab
 Sleep 2s

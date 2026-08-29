@@ -65,14 +65,15 @@ pub(super) fn centered(area: Rect, pct_x: u16, height: u16) -> Rect {
     }
 }
 
-/// An argv rendered the way you would type it into a shell. Only an argument
-/// that actually needs quoting gets it, so `psql service=prod` stays readable
-/// and a path with a space still pastes correctly.
-/// The same command, spelled for a human. `connect_argv` expands `~` because a
-/// child runs without a shell and would otherwise be handed a directory
-/// literally called `~`, but an absolute home path is noise on screen and it is
-/// what puts `/home/somebody/...` in a screenshot. Display collapses it back;
-/// nothing that runs ever sees this string.
+/// An argv rendered the way you would type it into a shell, for a human to read.
+/// Only an argument that actually needs quoting gets it, so `psql service=prod`
+/// stays readable and a path with a space still pastes correctly.
+///
+/// `connect_argv` expands `~` because a child runs without a shell and would
+/// otherwise be handed a directory literally called `~`, but an absolute home
+/// path is noise on screen and it is what puts `/home/somebody/...` in a
+/// screenshot. Display collapses it back; nothing that runs ever sees this
+/// string.
 pub(super) fn shell_join_display(argv: &[String]) -> String {
     let shown: Vec<String> = argv
         .iter()

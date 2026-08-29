@@ -287,6 +287,44 @@ impl App {
                 None
             }
 
+            Action::Snippet { original } => {
+                if v[0].is_empty() || v[1].is_empty() {
+                    self.set_status("a snippet needs a name and some SQL");
+                    self.prompt = Some(prompt);
+                    return None;
+                }
+                match crate::snippets::save(&v[0], &v[1]) {
+                    Ok(_) => {
+                        // A rename leaves the old file behind otherwise.
+                        if let Some(was) = original.filter(|w| *w != v[0]) {
+                            let _ = crate::snippets::delete(&was);
+                        }
+                        self.goto_view(View::Snippets);
+                        self.refresh_snippets();
+                        // psql is the one client that can also expand `:name`
+                        // at its own prompt, so its rc file is kept in step.
+                        let also = match crate::snippets::sync_psqlrc() {
+                            Ok(_) => " · :name works in psql too",
+                            Err(_) => "",
+                        };
+                        self.set_status(format!("saved · esql <connection> :{}{also}", v[0]));
+                    }
+                    Err(e) => self.set_status(format!("could not save it: {e}")),
+                }
+                None
+            }
+
+            Action::EditPassword { idx } => {
+                match creds::rekey_pg(idx, &v[0], &v[1], &v[2], &v[3]) {
+                    Ok(_) => {
+                        self.refresh_creds();
+                        self.set_status("moved it, and kept the password that was on it");
+                    }
+                    Err(e) => self.set_status(format!("could not move it: {e}")),
+                }
+                None
+            }
+
             Action::SetPassword { engine, name } => {
                 // The secret is the last field in both shapes, and it is the only
                 // value in this program that is never echoed back anywhere.

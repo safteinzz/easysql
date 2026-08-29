@@ -6,6 +6,7 @@
 //!
 //!   esql                 Launch the TUI: connections, passwords, tunnels
 //!   esql <name>          Open it (anything unknown is a saved connection)
+//!   esql <name> :<query> Run a saved query from ~/.config/easysql/snippets
 //!   esql ls              List every saved connection  (-v shows targets)
 //!   esql self update     Reinstall the latest release from crates.io
 //!   esql self check      Ask crates.io whether a newer release exists
@@ -24,6 +25,7 @@ mod history;
 mod ini;
 mod reach;
 mod settings;
+mod snippets;
 mod sshhosts;
 mod tui;
 mod tunnels;
@@ -35,11 +37,16 @@ use clap::{Parser, Subcommand};
 /// aren't subcommands: bare `esql` opens the TUI, and any saved name connects.
 const AFTER: &str = concat!(
     "\
-Two more ways to run it (not subcommands):
+Three more ways to run it (not subcommands):
   esql                 open the toolbox (TUI): connections, passwords, tunnels
   esql <name>          open a saved connection (e.g. `esql prod`, or `esql pg:prod`)
+  esql <name> :<query> run a saved query against it (see the Snippets tab)
 
-The toolbox is where passwords, tunnels and adding/editing connections live.
+Anything else after a name goes straight to that client, so
+`esql prod -c 'select 1'` runs psql with that query and exits.
+
+The toolbox is where passwords, tunnels, saved queries and adding/editing
+connections live.
 Run `esql <command> --help` for a command's details.",
     "\n\n",
     env!("CARGO_PKG_REPOSITORY"),
