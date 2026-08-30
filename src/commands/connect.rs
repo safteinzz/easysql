@@ -97,7 +97,7 @@ pub fn run(args: Vec<String>) {
     if settings.hints && session {
         eprintln!(
             "{}",
-            format!("  {}", crate::engines::hint_line(conn.engine)).dimmed()
+            format!("  {}", crate::engines::hint_line(conn.engine, &settings)).dimmed()
         );
     }
 

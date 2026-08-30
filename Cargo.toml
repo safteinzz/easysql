@@ -1,6 +1,6 @@
 [package]
 name = "easysql"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "getting to the sql prompt, quick and easy - saved connections, their passwords and their tunnels in one CLI + TUI"

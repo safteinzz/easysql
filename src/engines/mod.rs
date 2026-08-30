@@ -138,15 +138,21 @@ impl Engine {
     /// "list the tables" four different ways.
     pub fn hint(self) -> &'static str {
         match self {
+            // Angle brackets mark what you type *after* the command, so `\c <db>`
+            // reads as "connect to a database" rather than as a command called
+            // "name". Running a file is in here because it is the one people
+            // reach for and cannot guess: every client spells it differently.
             Engine::Pg => {
-                "\\l dbs · \\c name · \\dn schemas · \\dt tables · \\d name · \\? help · \\q quit"
+                "\\l dbs · \\c <db> · \\dn schemas · \\dt tables · \\d <table> · \\i <file> · \\? help · \\q quit"
             }
             Engine::MySql => {
-                "show databases; · use name; · show tables; · desc name; · help; · \\q quit"
+                "show databases; · use <db>; · show tables; · desc <table>; · source <file> · \\q quit"
             }
-            Engine::Sqlite => ".databases · .tables · .schema name · .help · .quit",
+            Engine::Sqlite => {
+                ".databases · .tables · .schema <table> · .read <file> · .help · .quit"
+            }
             Engine::MsSql => {
-                "select name from sys.databases; · use name; · select name from sys.tables; · :help · exit"
+                "select name from sys.databases; · use <db>; · select name from sys.tables; · :r <file> · exit"
             }
         }
     }
@@ -473,15 +479,29 @@ pub fn install_argv(engine: Engine) -> Option<Vec<String>> {
 /// The hint plus this machine's snippets, when the client can expand them
 /// itself. Only psql can, so only psql is told about them - offering `:tables`
 /// to a client that will read it as a syntax error is worse than saying nothing.
-pub fn hint_line(engine: Engine) -> String {
+pub fn hint_line(engine: Engine, s: &Settings) -> String {
+    hint_line_from(engine, s, &crate::snippets::list())
+}
+
+/// The half that decides, kept apart from the half that reads the disk, so it
+/// can be exercised without a real `~/.config/easysql/snippets` anywhere near
+/// it - the same seam `pg::list_in` and `creds::set_pg_in` have.
+fn hint_line_from(engine: Engine, s: &Settings, snips: &[crate::snippets::Snippet]) -> String {
     let base = engine.hint().to_string();
-    if engine != Engine::Pg {
+    // The `\set` block lives in `~/.psqlrc`, which only psql reads. Somebody
+    // who pointed `psql_command` at pgcli or a docker wrapper gets a client with
+    // its own history, its own completion and no variables at all, so offering
+    // `:name` there would be advertising something that answers with a syntax
+    // error. Same gate the install offer uses: default client, or nothing.
+    let is_psql = engine
+        .client_argv(s)
+        .first()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .is_some_and(|p| p == engine.default_client());
+    if engine != Engine::Pg || !is_psql {
         return base;
     }
-    let names: Vec<String> = crate::snippets::list()
-        .into_iter()
-        .map(|s| format!(":{}", s.name))
-        .collect();
+    let names: Vec<String> = snips.iter().map(|s| format!(":{}", s.name)).collect();
     match names.is_empty() {
         true => base,
         false => format!("{base}\n  {}", names.join(" · ")),
@@ -610,6 +630,44 @@ mod tests {
         assert!(Engine::Pg.stores_password());
         assert!(Engine::MySql.stores_password());
         assert!(!Engine::MsSql.stores_password());
+    }
+
+    #[test]
+    fn snippets_are_only_advertised_to_a_client_that_can_expand_them() {
+        // `:name` is a psql variable, expanded from the `\set` block easysql
+        // writes into `~/.psqlrc`. pgcli reads neither, so offering `:name`
+        // there advertises something that answers with a syntax error - which
+        // is exactly what it did before this gate existed.
+        let snips = vec![crate::snippets::Snippet {
+            name: "tables".into(),
+            sql: "select 1;".into(),
+            path: std::path::PathBuf::new(),
+        }];
+        let line = |cmd: &str| {
+            let s = Settings {
+                psql_command: cmd.into(),
+                ..Default::default()
+            };
+            hint_line_from(Engine::Pg, &s, &snips)
+        };
+
+        // The real psql, by name or by full path, gets the shortcuts - and so
+        // does an empty command, because `client_argv` reads that as "the
+        // default", which is psql.
+        assert!(line("psql").contains(":tables"));
+        assert!(line("/usr/bin/psql").contains(":tables"));
+        assert!(line("").contains(":tables"));
+
+        // Anything else does not, however it is spelled.
+        assert_eq!(line("pgcli"), Engine::Pg.hint());
+        assert_eq!(line("docker exec -it db psql"), Engine::Pg.hint());
+
+        // And the other three never get the line at all, because none of them
+        // has variables of any kind.
+        let s = Settings::default();
+        for e in [Engine::MySql, Engine::Sqlite, Engine::MsSql] {
+            assert_eq!(hint_line_from(e, &s, &snips), e.hint());
+        }
     }
 
     #[test]

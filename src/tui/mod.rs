@@ -596,7 +596,7 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 .connect
                 .as_ref()
                 .filter(|_| app.settings.hints)
-                .map(|c| crate::engines::hint_line(c.engine));
+                .map(|c| crate::engines::hint_line(c.engine, &app.settings));
             let status = run_suspended(terminal, &run.argv, hint)?;
 
             if let Some(conn) = run.connect.clone() {
