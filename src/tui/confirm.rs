@@ -8,7 +8,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::probe::{self, Fix};
 use super::widgets::shell_join;
@@ -92,57 +92,25 @@ pub(crate) enum ConfirmAction {
 pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     // Size the box to the wrapped message so short prompts stay small and long
     // ones (a server's own error text) are not cut off. Padding gives every line,
-    // wrapped continuations included, a uniform margin instead of butting the border.
-    let width = (area.width * 66 / 100).clamp(34, 74);
-    let inner = width.saturating_sub(6) as usize; // borders (2) + horizontal padding (4)
-    let msg_rows = wrapped_line_count(&c.message, inner) as u16;
-    // borders (2) + vertical padding (2) + blank + buttons. Forgetting the borders
-    // here clips the buttons off, leaving no visible way to answer.
-    let height = (msg_rows + 6).min(area.height);
-
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
+    // A gate is red and starts on No; an offer is cyan and starts on Yes. The
+    // colour says how much is at stake, the default focus says what Enter does.
+    let accent = if c.danger { Color::Red } else { Color::Cyan };
+    let width = box_width(area.width);
+    let msg_rows = wrapped_line_count(&c.message, box_inner_width(width)) as u16;
+    // The message, a blank, and the button row.
+    // The message, a blank, the buttons, a blank, the keys.
+    let rect = box_area(area, width, box_height(msg_rows + 4, area.height));
     f.render_widget(Clear, rect);
 
-    let accent = if c.danger { Color::Red } else { Color::Cyan };
-    // The selected button is highlighted, so the answer is visible at a glance
-    // rather than being a keystroke you had to know about.
-    let button = |label: &str, selected: bool| {
-        let style = if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        Span::styled(format!(" {label} "), style)
-    };
     let lines = vec![
         Line::raw(c.message.clone()),
         Line::raw(""),
-        Line::from(vec![
-            button("Yes (y)", c.yes),
-            Span::raw("  "),
-            button("No (n)", !c.yes),
-            Span::styled(
-                "   ←/→ then Enter",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]),
+        box_buttons(accent, c.yes),
+        Line::raw(""),
+        box_hint("h/l ←/→ move · enter select · y/n"),
     ];
     let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", c.title))
-                .border_style(Style::default().fg(accent))
-                .padding(Padding::new(2, 2, 1, 1)),
-        )
+        .block(box_block(accent, &c.title))
         .wrap(Wrap { trim: false });
     f.render_widget(para, rect);
 }

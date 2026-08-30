@@ -50,6 +50,10 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
     if let Some(c) = &app.confirm {
         render_confirm(f, area, c);
     }
+    // Last, so a failure is never drawn under the thing that caused it.
+    if let Some(a) = &app.alert {
+        super::alert::render_alert(f, area, a);
+    }
 }
 
 pub(super) fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
@@ -490,10 +494,11 @@ pub(super) fn render_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn render_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 80, 30);
-    f.render_widget(Clear, rect);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let lines = vec![
+    // Sized like every other box: the widest line plus the chrome, capped at
+    // four fifths of the screen. A hardcoded height is how the last two rows
+    // got clipped the last time this pane grew.
+    let width = box_width(area.width);
+    let mut lines = vec![
         Line::from(Span::styled(
             "easysql - saved connections, their passwords and their tunnels",
             Style::default().add_modifier(Modifier::BOLD),
@@ -507,9 +512,8 @@ pub(super) fn render_help(f: &mut Frame, area: Rect) {
         Line::raw("            p save its password (~/.pgpass · ~/.my.cnf, chmod 600)"),
         Line::raw("            t reach it through an ssh host (ssh -L)"),
         Line::raw("            y yank the command · Y yank the URL (never the password)"),
-        Line::raw(
-            "            r reload · ● up · ● down · ● tunnel closed · ○ checking · pw = password saved",
-        ),
+        Line::raw("            r reload · ● up · ● down · ● tunnel closed · ○ checking"),
+        Line::raw("            pw = a password is saved for it"),
         Line::raw(""),
         Line::raw(
             "Passwords   c save one for a connection · e re-point it · d forget it · r reload",
@@ -530,13 +534,11 @@ pub(super) fn render_help(f: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::raw("Connections live in ~/.pg_service.conf, ~/.my.cnf and"),
         Line::raw("~/.config/easysql/sqlite.conf - the files your clients already read."),
-        Line::from(Span::styled("press ? or Esc to close", dim)),
     ];
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" help ")
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    lines.push(Line::raw(""));
+    lines.push(super::widgets::box_hint("? esc close"));
+    let rect = box_area(area, width, box_height(lines.len() as u16, area.height));
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(lines).block(super::widgets::box_block(Color::Cyan, "help"));
     f.render_widget(para, rect);
 }

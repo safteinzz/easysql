@@ -17,6 +17,12 @@ impl App {
             }
             return None;
         }
+        // An alert owns every key until it is dismissed: it is there because
+        // something failed and the message is the only copy of why.
+        if self.alert.is_some() {
+            self.alert_key(key);
+            return None;
+        }
         if self.confirm.is_some() {
             return self.confirm_key(key);
         }

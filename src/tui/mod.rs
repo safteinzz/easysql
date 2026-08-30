@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+mod alert;
 mod confirm;
 mod detail;
 mod filter;
@@ -48,7 +49,10 @@ use detail::render_detail;
 use picker::Picker;
 use prompt::{Action, Kind, Prompt, render_prompt};
 use render::ui;
-use widgets::{centered, empty, titled, wrapped_line_count};
+use widgets::{
+    box_area, box_block, box_buttons, box_height, box_hint, box_inner_width, box_width, empty,
+    titled, wrapped_line_count,
+};
 
 /// The tabs. Order here is the left-to-right / Tab-cycle order.
 #[derive(Clone, Copy, PartialEq)]
@@ -141,6 +145,8 @@ pub(super) struct App {
     /// rather than per row per frame.
     pub(super) installed: [bool; 4],
     /// The choices that are yours rather than the clients'.
+    /// A failure that has to be read. It owns every key until dismissed.
+    pub(super) alert: Option<alert::Alert>,
     pub(super) settings: Settings,
     pub(super) snippet_state: ListState,
     pub(super) settings_state: ListState,
@@ -163,6 +169,7 @@ impl App {
             prompt: None,
             picker: None,
             confirm: None,
+            alert: None,
             status: String::new(),
             status_at: None,
             show_help: false,
@@ -615,12 +622,43 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 }
             }
 
-            let msg = match status {
-                Some(s) if s.success() => format!("{} ✓", run.label),
-                Some(s) => format!("{} failed (exit {})", run.label, s.code().unwrap_or(-1)),
-                None => format!("{}: could not run '{}'", run.label, run.argv[0]),
-            };
-            app.set_status(msg);
+            match status {
+                Some(s) if s.success() => app.set_status(format!("{} ✓", run.label)),
+                // The client ran and failed. `offer_fix` above already put up an
+                // offer when the server's answer could be classified; when it
+                // could not, the exit code is all we have and it belongs in the
+                // status line, not in a box with nothing to say.
+                Some(s) => app.set_status(format!(
+                    "{} failed (exit {})",
+                    run.label,
+                    s.code().unwrap_or(-1)
+                )),
+                // Nothing ran at all: the program is missing or not executable,
+                // and this is the one line explaining why the screen came back
+                // unchanged. A status line would clear it after STATUS_TTL.
+                None => {
+                    let program = run.argv[0].clone();
+                    // Name the one command this machine needs, never a list of
+                    // distros' guesses, and never an errno in place of advice.
+                    let advice = run
+                        .connect
+                        .as_ref()
+                        .map(|c| c.engine)
+                        .and_then(|e| match engines::install_argv(e) {
+                            Some(argv) => Some(format!("Install it with:\n\n    {}", argv.join(" "))),
+                            None => engines::install_note(e).map(str::to_string),
+                        })
+                        .unwrap_or_else(|| {
+                            "Check that it is installed and on your PATH, or point the setting for this engine at the program you do have.".to_string()
+                        });
+                    app.alert(
+                        "could not run it",
+                        format!(
+                            "`{program}` could not be started, so nothing was opened.\n\n{advice}"
+                        ),
+                    )
+                }
+            }
             app.refresh_all();
         }
     }

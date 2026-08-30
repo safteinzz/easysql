@@ -3,7 +3,7 @@
 
 use crate::tunnels::Tunnel;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::*;
 
@@ -210,7 +210,7 @@ impl Prompt {
 
     pub(super) fn edit_conn(c: &Conn) -> Self {
         Self {
-            title: format!("Edit {} connection '{}'", c.engine.label(), c.name),
+            title: format!("edit {} connection '{}'", c.engine.label(), c.name),
             idx: 0,
             action: Action::EditConn {
                 engine: c.engine,
@@ -251,7 +251,7 @@ impl Prompt {
             _ => vec![Field::secret("Password (never shown, never in an argv)")],
         };
         Self {
-            title: format!("Save the password for '{}'", c.name),
+            title: format!("save the password for '{}'", c.name),
             idx: 0,
             action: Action::SetPassword {
                 engine: c.engine,
@@ -273,7 +273,7 @@ impl Prompt {
         };
         let db_host = forward_target(&via, &c.host);
         Self {
-            title: format!("Reach {} through an ssh host (ssh -L)", c.name),
+            title: format!("reach {} through an ssh host (ssh -L)", c.name),
             idx: 0,
             action: Action::Forward { key: c.key() },
             fields: vec![
@@ -308,7 +308,7 @@ impl Prompt {
     /// but it can carry it across to the corrected line.
     pub(super) fn edit_password(cred: &crate::creds::Cred, idx: usize) -> Self {
         Self {
-            title: format!("Which connection is {}'s password for?", cred.user),
+            title: format!("which connection is {}'s password for?", cred.user),
             idx: 0,
             action: Action::EditPassword { idx },
             fields: vec![
@@ -354,7 +354,7 @@ impl Prompt {
         let mut field = Field::filled(row.help, &row.value);
         field.default = row.default.clone();
         Self {
-            title: format!("Setting: {}", row.label),
+            title: format!("setting: {}", row.label),
             idx: 0,
             action: Action::EditSetting {
                 key: row.key.to_string(),
@@ -477,16 +477,12 @@ impl Prompt {
     }
 }
 
-/// Wizard box width, as the percentage of the area `centered` takes. A preview
-/// line can be wider than the box, so the height has to be counted against the
-/// wrapped width, not the line count.
-pub(super) const PROMPT_PCT: u16 = 72;
-
 pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tunnel]) {
-    let mut lines: Vec<Line> = vec![Line::raw("")];
+    // No leading blank: the box's own top padding is that row.
+    let mut lines: Vec<Line> = Vec::new();
     // Plain text of every line, kept alongside so the box can be sized against
     // what the lines wrap to rather than how many there are.
-    let mut texts: Vec<String> = vec![String::new()];
+    let mut texts: Vec<String> = Vec::new();
     for (i, field) in p.fields.iter().enumerate() {
         let active = i == p.idx;
         let head = if field.default.is_empty() {
@@ -562,30 +558,25 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tu
             Style::default().add_modifier(Modifier::DIM),
         )));
     }
-    let hint = "  Enter next/submit   Ctrl-j/k · Ctrl-↑↓ · Tab move field · Esc cancel";
+    let hint = "Enter next/submit · Ctrl-j/k · Ctrl-↑↓ · Tab move field · Esc cancel";
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().add_modifier(Modifier::DIM),
-    )));
+    lines.push(box_hint(hint));
     texts.push(String::new());
     texts.push(hint.to_string());
 
     // Size to the *wrapped* content: a preview can be far wider than the box,
-    // and counting lines instead of rows pushes the hint out of the border.
-    let inner = (area.width * PROMPT_PCT / 100).saturating_sub(2) as usize;
-    let rows: usize = texts.iter().map(|t| wrapped_line_count(t, inner)).sum();
-    let height = ((rows + 2) as u16).min(area.height);
-    let rect = centered(area, PROMPT_PCT, height);
+    // and counting lines instead of rows pushes the keys out through the
+    // bottom border.
+    let width = box_width(area.width);
+    let rows: usize = texts
+        .iter()
+        .map(|t| wrapped_line_count(t, box_inner_width(width)))
+        .sum();
+    let rect = box_area(area, width, box_height(rows as u16, area.height));
     f.render_widget(Clear, rect);
 
     let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", p.title))
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .block(super::widgets::box_block(Color::Cyan, &p.title))
         .wrap(Wrap { trim: false });
     f.render_widget(para, rect);
 }

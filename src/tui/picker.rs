@@ -3,7 +3,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 use super::*;
 
@@ -60,9 +60,33 @@ pub(crate) enum PickerAction {
 }
 
 pub(super) fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
-    let height = (p.items.len() as u16 + 2).clamp(5, 14);
-    let rect = centered(area, 60, height);
+    // Ten rows of list at most, so a long host list scrolls inside the box
+    // rather than growing one that swallows the screen.
+    // Two more rows than the list needs, for the blank and the key line, which
+    // live in the body here like in every other kind of box.
+    let rows = (p.items.len() as u16).clamp(1, 10);
+    let rect = box_area(
+        area,
+        box_width(area.width),
+        box_height(rows + 2, area.height),
+    );
     f.render_widget(Clear, rect);
+
+    // The frame is drawn on its own so the list and the key line can share the
+    // body: a List cannot hold a trailing line of its own.
+    let block = super::widgets::box_block(Color::Cyan, &p.title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let list_area = Rect {
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    let hint_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
 
     let items: Vec<ListItem> = p
         .items
@@ -70,20 +94,19 @@ pub(super) fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
         .map(|it| ListItem::new(Span::raw(it.clone())))
         .collect();
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", p.title))
-                .title_bottom(" ↵ select   Esc cancel ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▸ ");
 
     // A local state gives us scrolling for free when there are many rows.
     let mut state = ListState::default();
     state.select(Some(p.idx));
-    f.render_stateful_widget(list, rect, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
+    f.render_widget(
+        Paragraph::new(super::widgets::box_hint(
+            "j/k ↑↓ move · enter pick · esc cancel",
+        )),
+        hint_area,
+    );
 }
 
 impl App {
