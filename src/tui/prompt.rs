@@ -7,15 +7,24 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::*;
 
-/// One editable line in a wizard. `default` is shown in brackets and used when
-/// the field is left blank on submit (the semantics differ per action).
+/// One editable line in a wizard: a label in the left column, a value in the
+/// right. `default` is what a blank field submits (the semantics differ per
+/// action) and stands in as the dim example until something is typed.
 pub(crate) struct Field {
     pub(crate) label: String,
     pub(crate) default: String,
+    /// The dim example shown in the value column while the field is empty: what
+    /// the field wants, not what it is called. It lives here rather than in the
+    /// label so every label stays one short noun and the values line up.
+    pub(crate) hint: String,
     pub(crate) value: String,
     pub(crate) kind: Kind,
     /// Which option a `Choice` field has selected. Unused by the other kinds.
     pub(crate) choice: usize,
+    /// Marked with a red `*`, the form convention everyone already reads. Only
+    /// set it on a field the submit path actually refuses to go without, or the
+    /// star is a lie: everything unmarked can be left blank.
+    pub(crate) required: bool,
 }
 
 pub(crate) enum Kind {
@@ -34,9 +43,11 @@ impl Field {
         Self {
             label: label.into(),
             default: default.into(),
+            hint: String::new(),
             value: String::new(),
             kind: Kind::Text,
             choice: 0,
+            required: false,
         }
     }
     /// A field that starts pre-filled with `value` - for the edit wizard.
@@ -52,6 +63,30 @@ impl Field {
             ..Self::new(label, "")
         }
     }
+    /// Builder: the submit path refuses a blank here, so it gets the red `*`.
+    pub(super) fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Builder: the dim example shown while the field is empty.
+    pub(super) fn hint(mut self, hint: &str) -> Self {
+        self.hint = hint.into();
+        self
+    }
+
+    /// What stands in the value column while the field is empty: what a blank
+    /// submits, then what it wants typed. Both are dim, and both are gone the
+    /// moment there is a value, so neither can be mistaken for one.
+    pub(super) fn placeholder(&self) -> String {
+        [self.default.as_str(), self.hint.as_str()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
     /// A cycled answer, starting on the option at `at`.
     pub(super) fn choice(label: &str, options: &[&str], at: usize) -> Self {
         let options: Vec<String> = options.iter().map(|o| o.to_string()).collect();
@@ -151,8 +186,10 @@ fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
     let get = |pick: fn(&Conn) -> &String| from.map(pick).cloned().unwrap_or_default();
     if engine == Engine::Sqlite {
         return vec![
-            Field::filled("Name (what you type after esql)", &get(|c| &c.name)),
-            Field::filled("Database file", &get(|c| &c.database)),
+            Field::filled("Name", &get(|c| &c.name))
+                .required()
+                .hint("what you type after esql"),
+            Field::filled("Database file", &get(|c| &c.database)).required(),
         ];
     }
     let port = Field {
@@ -160,8 +197,10 @@ fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
         ..Field::filled("Port", &get(|c| &c.port))
     };
     let mut fields = vec![
-        Field::filled("Name (what you type after esql)", &get(|c| &c.name)),
-        Field::filled("Host (IP or DNS name)", &get(|c| &c.host)),
+        Field::filled("Name", &get(|c| &c.name))
+            .required()
+            .hint("what you type after esql"),
+        Field::filled("Host", &get(|c| &c.host)).hint("IP or DNS name"),
         port,
         Field::filled("Database", &get(|c| &c.database)),
         Field::filled("User", &get(|c| &c.user)),
@@ -179,7 +218,7 @@ fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
                 .iter()
                 .position(|m| *m == extra("sslmode"))
                 .unwrap_or(0);
-            fields.push(Field::choice("Encryption (sslmode)", &SSLMODES, at));
+            fields.push(Field::choice("Encryption", &SSLMODES, at));
         }
         Engine::MsSql => {
             let at = usize::from(extra("trust_cert") == "yes");
@@ -229,14 +268,14 @@ impl Prompt {
         let fields = match c.engine {
             Engine::Pg => vec![
                 Field::filled(
-                    "Host (* matches any)",
+                    "Host",
                     if c.host.is_empty() {
                         "localhost"
                     } else {
                         &c.host
                     },
                 ),
-                Field::filled("Port (* matches any)", &c.port_or_default()),
+                Field::filled("Port", &c.port_or_default()),
                 // `*` even when the connection names a database, because a
                 // Postgres password belongs to the *role* and roles are
                 // cluster-wide: the same secret unlocks every database on that
@@ -244,11 +283,17 @@ impl Prompt {
                 // prompts. It stays editable, because behind a pooler
                 // (pgbouncer, an RDS proxy) the database name really does
                 // select a different backend with different credentials.
-                Field::filled("Database (* = every database on this server)", "*"),
-                Field::filled("User (* matches any)", &c.user),
-                Field::secret("Password (never shown, never in an argv)"),
+                Field::filled("Database", "*"),
+                Field::filled("User", &c.user),
+                Field::secret("Password")
+                    .required()
+                    .hint("never shown, never in an argv"),
             ],
-            _ => vec![Field::secret("Password (never shown, never in an argv)")],
+            _ => vec![
+                Field::secret("Password")
+                    .required()
+                    .hint("never shown, never in an argv"),
+            ],
         };
         Self {
             title: format!("save the password for '{}'", c.name),
@@ -277,10 +322,12 @@ impl Prompt {
             idx: 0,
             action: Action::Forward { key: c.key() },
             fields: vec![
-                Field::filled("Tunnel through (ssh host, Ctrl-o to pick)", &via),
-                Field::filled("Database host, as that machine sees it", &db_host),
-                Field::filled("Database port", &c.port_or_default()),
-                Field::new("Local port (where you'll reach it)", "= database port"),
+                Field::filled("Tunnel through", &via)
+                    .required()
+                    .hint("an ssh host"),
+                Field::filled("Database host", &db_host).required(),
+                Field::filled("Database port", &c.port_or_default()).required(),
+                Field::new("Local port", "= database port").hint("where you'll reach it"),
             ],
         }
     }
@@ -312,13 +359,10 @@ impl Prompt {
             idx: 0,
             action: Action::EditPassword { idx },
             fields: vec![
-                Field::filled("Host (* matches any)", &cred.host),
-                Field::filled("Port (* matches any)", &cred.port),
-                Field::filled(
-                    "Database (* = every database on this server)",
-                    &cred.database,
-                ),
-                Field::filled("User (* matches any)", &cred.user),
+                Field::filled("Host", &cred.host),
+                Field::filled("Port", &cred.port),
+                Field::filled("Database", &cred.database),
+                Field::filled("User", &cred.user),
             ],
         }
     }
@@ -337,14 +381,12 @@ impl Prompt {
                 original: from.map(|s| s.name.clone()),
             },
             fields: vec![
-                Field::filled(
-                    "Name (what you type after the connection, as :name)",
-                    from.map(|s| s.name.as_str()).unwrap_or(""),
-                ),
-                Field::filled(
-                    "SQL (o opens it in $EDITOR afterwards, for anything longer)",
-                    &from.map(|s| s.summary()).unwrap_or_default(),
-                ),
+                Field::filled("Name", from.map(|s| s.name.as_str()).unwrap_or(""))
+                    .required()
+                    .hint("typed after the connection, as :name"),
+                Field::filled("SQL", &from.map(|s| s.summary()).unwrap_or_default())
+                    .required()
+                    .hint("one line - o opens $EDITOR for a longer one"),
             ],
         }
     }
@@ -361,6 +403,23 @@ impl Prompt {
                 label: row.label.to_string(),
             },
             fields: vec![field],
+        }
+    }
+
+    /// The one line of guidance a form carries under its fields, dim, or empty
+    /// for a form that needs none. It lives here rather than in a label because
+    /// what it explains is true of the whole form and stays true once a field
+    /// is filled in - a parenthetical in a pre-filled label is invisible where
+    /// it is needed most, and four of them are a wall.
+    pub(super) fn note(&self) -> &'static str {
+        match &self.action {
+            Action::SetPassword { .. } | Action::EditPassword { .. } if self.fields.len() > 1 => {
+                "* in a field matches any host, port, database or user"
+            }
+            Action::Forward { .. } => {
+                "ctrl-o picks the ssh host · the database host is what that machine sees"
+            }
+            _ => "",
         }
     }
 
@@ -477,19 +536,44 @@ impl Prompt {
     }
 }
 
+/// The column a wizard's values start in, measured from the label's first
+/// character. Fixed rather than measured off the longest label: a form whose
+/// widest label decides the column moves every value the moment that label
+/// changes. A longer label simply pushes its own row rather than dragging the
+/// whole column out with it.
+const LABEL_COL: usize = 14;
+/// How far a wide form may push that column before the labels are the ones that
+/// give way, so a single long label cannot shove every value off the box.
+const LABEL_COL_MAX: usize = 22;
+
+/// The columns a label cell eats: the label, its star, and the colon.
+fn label_width(field: &Field) -> usize {
+    field.label.chars().count() + usize::from(field.required) + 1
+}
+
+/// Where this form's values start.
+fn value_column(fields: &[Field]) -> usize {
+    let widest = fields.iter().map(label_width).max().unwrap_or(0) + 2;
+    widest.clamp(LABEL_COL, LABEL_COL_MAX)
+}
+
+/// The wizard box: labels in one column, values in another, and nothing that
+/// appears or disappears with the cursor. The key for a choice row used to be
+/// printed on whichever row was focused, which made every row grow and shrink
+/// as you moved through the form to repeat what the key line already says.
 pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tunnel]) {
     // No leading blank: the box's own top padding is that row.
     let mut lines: Vec<Line> = Vec::new();
     // Plain text of every line, kept alongside so the box can be sized against
     // what the lines wrap to rather than how many there are.
     let mut texts: Vec<String> = Vec::new();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let col = value_column(&p.fields);
     for (i, field) in p.fields.iter().enumerate() {
         let active = i == p.idx;
-        let head = if field.default.is_empty() {
-            format!("{}: ", field.label)
-        } else {
-            format!("{} [{}]: ", field.label, field.default)
-        };
+        // Required-ness is a property of the field, not of where the cursor is,
+        // so the star keeps its colour while the label around it dims.
+        let star = if field.required { "*" } else { "" };
         let label_style = if active {
             Style::default()
                 .fg(Color::Cyan)
@@ -497,36 +581,50 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tu
         } else {
             Style::default().add_modifier(Modifier::DIM)
         };
-        // A choice has no text cursor; it shows its options key instead, so the
-        // way to change it is on screen rather than something you must know.
-        let (value_style, tail) = if field.is_choice() {
-            let style = if active {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            (style, if active { "   h/l or ←/→" } else { "" })
+        let pad = " ".repeat(col.saturating_sub(label_width(field)).max(1));
+        let mut spans = vec![
+            Span::raw(if active { "▸ " } else { "  " }),
+            Span::styled(field.label.clone(), label_style),
+            Span::styled(star, Style::default().fg(Color::Red)),
+            Span::styled(format!(":{pad}"), label_style),
+        ];
+        let value = field.display();
+        let tail = if field.is_choice() {
+            // A cycled answer, in the colour a form uses for what it will
+            // submit; the guillemets are what say it can be stepped.
+            let mut style = Style::default().fg(Color::Cyan);
+            if active {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(value.clone(), style));
+            String::new()
+        } else if value.is_empty() {
+            let example = field.placeholder();
+            spans.push(Span::raw(if active { "█ " } else { "" }));
+            spans.push(Span::styled(example.clone(), dim));
+            example
         } else {
-            (Style::default(), if active { "█" } else { "" })
+            spans.push(Span::raw(value.clone()));
+            spans.push(Span::raw(if active { "█" } else { "" }));
+            String::new()
         };
         texts.push(format!(
-            "{}{}{}{}",
+            "{}{}{}:{pad}{}{}",
             if active { "▸ " } else { "  " },
-            head,
-            field.display(),
+            field.label,
+            star,
+            value,
             tail
         ));
-        lines.push(Line::from(vec![
-            Span::raw(if active { "▸ " } else { "  " }),
-            Span::styled(head, label_style),
-            Span::styled(field.display(), value_style),
-            Span::styled(
-                tail.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
+        lines.push(Line::from(spans));
+    }
+    // One line of guidance for the whole form, where four parentheticals used
+    // to sit in four labels that were pre-filled anyway.
+    if !p.note().is_empty() {
+        lines.push(Line::raw(""));
+        texts.push(String::new());
+        lines.push(Line::from(Span::styled(p.note(), dim)));
+        texts.push(p.note().to_string());
     }
     // Live command preview: shows the exact command being built as you type, so
     // the wizard teaches the underlying tool instead of hiding it.
@@ -535,7 +633,7 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tu
         texts.push(String::new());
         texts.push(format!("  runs  {cmd}"));
         lines.push(Line::from(vec![
-            Span::styled("  runs  ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  runs  ", dim),
             Span::styled(cmd, Style::default().fg(Color::Green)),
         ]));
     }
@@ -553,16 +651,16 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tu
             None => format!("        {target}"),
         };
         texts.push(line.clone());
-        lines.push(Line::from(Span::styled(
-            line,
-            Style::default().add_modifier(Modifier::DIM),
-        )));
+        lines.push(Line::from(Span::styled(line, dim)));
     }
-    let hint = "Enter next/submit · Ctrl-j/k · Ctrl-↑↓ · Tab move field · Esc cancel";
+    let mut hint = "↑↓ tab move · ←→ choose · enter next/submit · esc cancel".to_string();
+    if p.fields.iter().any(|f| f.required) {
+        hint.push_str(" · * required");
+    }
     lines.push(Line::raw(""));
-    lines.push(box_hint(hint));
+    lines.push(box_hint(&hint));
     texts.push(String::new());
-    texts.push(hint.to_string());
+    texts.push(hint.clone());
 
     // Size to the *wrapped* content: a preview can be far wider than the box,
     // and counting lines instead of rows pushes the keys out through the

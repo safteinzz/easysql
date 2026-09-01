@@ -91,13 +91,12 @@ pub(crate) enum ConfirmAction {
 
 pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     // Size the box to the wrapped message so short prompts stay small and long
-    // ones (a server's own error text) are not cut off. Padding gives every line,
-    // A gate is red and starts on No; an offer is cyan and starts on Yes. The
-    // colour says how much is at stake, the default focus says what Enter does.
+    // ones (a server's own error text) are not cut off. A gate is red and starts
+    // on No; an offer is cyan and starts on Yes: the colour says how much is at
+    // stake, the default focus says what Enter does.
     let accent = if c.danger { Color::Red } else { Color::Cyan };
     let width = box_width(area.width);
     let msg_rows = wrapped_line_count(&c.message, box_inner_width(width)) as u16;
-    // The message, a blank, and the button row.
     // The message, a blank, the buttons, a blank, the keys.
     let rect = box_area(area, width, box_height(msg_rows + 4, area.height));
     f.render_widget(Clear, rect);

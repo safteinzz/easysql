@@ -159,8 +159,9 @@ EOF
   # The forward `warehouse` depends on. Recorded but not running, so the list
   # shows the tunnel state rather than blaming the database.
   cat > "$cfg/vias" <<EOF
-# `metrics` has a forward that is running, `warehouse` has one that is not, so
-# the list shows both halves of what a remembered tunnel looks like.
+# metrics has a forward that is running, warehouse has one that is not, so the
+# list shows both halves of what a remembered tunnel looks like. No backticks in
+# this heredoc: it interpolates \$TUN_PORT below, so bash would run them.
 [pg:metrics]
 host=dbhost
 target=127.0.0.1

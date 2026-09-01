@@ -169,7 +169,7 @@ impl App {
                 let target = p
                     .fields
                     .iter()
-                    .position(|f| f.label.contains("as that machine sees it"));
+                    .position(|f| f.label.contains("Database host"));
                 if let Some(i) = target {
                     let was = p.fields[i].value.clone();
                     let now = super::prompt::forward_target(&choice, &was);

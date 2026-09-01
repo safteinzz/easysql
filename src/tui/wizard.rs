@@ -16,14 +16,14 @@ impl App {
         let Some(p) = self.prompt.as_mut() else {
             return;
         };
-        if !p.fields[p.idx].label.contains("ssh host") {
+        if !p.fields[p.idx].label.contains("Tunnel through") {
             return;
         }
         let via = p.fields[p.idx].value.clone();
         let Some(i) = p
             .fields
             .iter()
-            .position(|f| f.label.contains("as that machine sees it"))
+            .position(|f| f.label.contains("Database host"))
         else {
             return;
         };
@@ -50,7 +50,7 @@ impl App {
         if ctrl && key.code == KeyCode::Char('o') {
             let p = self.prompt.as_ref().unwrap();
             let idx = p.idx;
-            if p.fields[idx].label.contains("ssh host") {
+            if p.fields[idx].label.contains("Tunnel through") {
                 let items = crate::sshhosts::aliases();
                 if items.is_empty() {
                     self.set_status("no hosts in ~/.ssh/config to tunnel through");
