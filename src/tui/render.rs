@@ -212,7 +212,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 app,
                 app.tunnels.len(),
                 rows.len(),
-                "No open tunnels.\nOpen one from the Connections tab with `t`, for a database\nyou can only reach from inside the network.",
+                "No tunnels yet.\nOpen one from the Connections tab with `t`, for a database\nyou can only reach from inside the network.",
             ) {
                 empty(f, area, "Tunnels", &msg);
                 return;
@@ -228,10 +228,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     // nothing: an orphan means the connection was deleted or
                     // renamed outside easysql, and a tunnel for a thing that no
                     // longer exists is worth seeing rather than reading as noise.
-                    let owner = match t
-                        .ports()
-                        .and_then(|(open, _, _)| crate::vias::owner_of(open))
-                    {
+                    let owner = match t.owner.clone() {
                         Some(key) => match app.conns.iter().find(|c| c.key() == key) {
                             Some(c) => format!("   for {} ({})", c.name, c.engine.label()),
                             None => "   for a connection that no longer exists".to_string(),
@@ -427,7 +424,9 @@ fn reach_mark(reach: Option<&Reach>, networked: bool, sleeping_via: bool) -> (&'
     // Yellow rather than a half-filled circle: the list already says up and
     // down with green and red on the same glyph, and a rarer codepoint is one
     // font fallback away from rendering as a stray `‹`.
-    if sleeping_via && matches!(reach, Some(Reach::Down)) {
+    // Up counts too, and matters more: a port that answers while the forward is
+    // down is answering for something else entirely.
+    if sleeping_via && matches!(reach, Some(Reach::Down) | Some(Reach::Up(_))) {
         return ("●", Style::default().fg(Color::Yellow));
     }
     if !networked {
@@ -468,7 +467,16 @@ pub(super) fn render_status(f: &mut Frame, area: Rect, app: &App) {
     // Show the last action's result while it is fresh; otherwise the key hints,
     // so a stale message never masquerades as the current state.
     let (text, style) = match app.live_status() {
-        Some(msg) => (msg.to_string(), Style::default().fg(Color::Green)),
+        // Green for what worked, yellow for what did not, and never red: red
+        // means a gate in front of something you are about to lose.
+        Some(msg) => (
+            msg.to_string(),
+            Style::default().fg(if app.status_failed {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
+        ),
         None => {
             let hints = match app.view {
                 View::Connections => CONN_HINTS,
@@ -522,7 +530,7 @@ pub(super) fn render_help(f: &mut Frame, area: Rect) {
             "            o open the file in $EDITOR, which is the only way to reorder entries",
         ),
         Line::raw("            easysql writes these files and never reads a password back"),
-        Line::raw("Tunnels     d kill it (ends the background ssh -N)    r refresh"),
+        Line::raw("Tunnels     ↵ on/off · d stop it (the background ssh -N)   r refresh"),
         Line::raw("Snippets    c new · e edit the SQL · o open the file · d delete · r reload"),
         Line::raw("            run one with `esql <connection> :<name>`; psql expands it too"),
         Line::raw("Settings    ↵ change it · d back to default · r reload the file"),

@@ -256,14 +256,17 @@ seed_history() {
 }
 
 seed_tunnels() {
-  # easysql keeps a row only while /proc/<pid> exists, so a placeholder process
-  # per row is a complete and harmless stand-in for an ssh it must not run.
+  # A row is kept only while /proc/<pid>/cmdline still holds that forward's own
+  # flag, spec and host, so the stand-in for the ssh this rig must not run has
+  # to carry them too: a bare `sleep` is not that pid's forward and is pruned on
+  # the first refresh. The loop sleeps in short hops so nothing outlives the
+  # teardown that kills its parent.
   local state="$STAGE/.local/state/easysql"
   mkdir -p "$state/tunnels"
   : > "$state/tunnels.tsv"
   local i=0
   while read -r kind spec host; do
-    sleep 86400 > /dev/null 2>&1 &
+    sh -c 'while :; do sleep 5; done' "-$kind" "$spec" "$host" > /dev/null 2>&1 &
     local pid=$!
     echo "$pid" >> "$PIDS"
     local log="$state/tunnels/stage-$i.log"

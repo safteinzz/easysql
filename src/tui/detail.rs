@@ -276,23 +276,30 @@ fn tunnel_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
 
     lines.push(row("Through", t.host.clone()));
-    lines.push(row("Process", format!("pid {}", t.pid)));
-    if let Some(started) = t.started_at() {
-        // The log file is created as the tunnel is spawned, so its age is the
-        // tunnel's age.
-        let secs = started
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        lines.push(row("Opened", history::ago(secs, history::now())));
-    }
+    match t.live.as_ref() {
+        Some(live) => {
+            lines.push(row("Process", format!("pid {}", live.pid)));
+            if let Some(started) = live.started_at() {
+                // The log file is created as the tunnel is spawned, so its age
+                // is the tunnel's age.
+                let secs = started
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                lines.push(row("Opened", history::ago(secs, history::now())));
+            }
 
-    // A forward that half-died is otherwise silent: ssh's own words are the
-    // only explanation there is.
-    let stderr = t.stderr();
-    if !stderr.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(stderr, Style::default().fg(Color::Yellow)));
+            // A forward that half-died is otherwise silent: ssh's own words are
+            // the only explanation there is.
+            let stderr = live.stderr();
+            if !stderr.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(stderr, Style::default().fg(Color::Yellow)));
+            }
+        }
+        // Not running, but something recorded it, which is why it is listed at
+        // all and how it can be started again.
+        None => lines.push(row("Process", "off - ↵ opens it".into())),
     }
 
     if let Some((open, _, _)) = t.ports() {
@@ -305,7 +312,9 @@ fn tunnel_lines(app: &App) -> Vec<Line<'static>> {
 
     lines.push(Line::raw(""));
     lines.push(Line::styled(t.command(), Style::default().fg(Color::Green)));
-    lines.push(Line::styled(format!("kill {}", t.pid), dim()));
+    if let Some(pid) = t.pid() {
+        lines.push(Line::styled(format!("kill {pid}"), dim()));
+    }
     lines
 }
 
@@ -354,22 +363,32 @@ fn label(name: &str) -> Span<'static> {
     Span::styled(format!("{name}{:pad$}", "", pad = pad), dim())
 }
 
-/// A connection whose forward is recorded but not running: the port really is
-/// closed, so the probe is not wrong, but "down" would blame the database for a
-/// tunnel that simply is not open yet - and one keypress fixes it.
-pub(super) fn sleeping_via(c: &crate::engines::Conn) -> Option<String> {
+/// A connection whose forward is recorded but not running. The probe is not
+/// wrong either way, but it is answering a different question: "down" would
+/// blame the database for a tunnel that is one keypress from opening, and "up"
+/// is worse, because whatever answered on that port cannot be the tunnel.
+pub(super) fn sleeping_via(c: &crate::engines::Conn) -> Option<crate::vias::Via> {
     let v = crate::vias::get(&c.key())?;
-    crate::tunnels::carrying(&v.local)
-        .is_none()
-        .then_some(v.host)
+    crate::tunnels::carrying(&v.local).is_none().then_some(v)
 }
 
-fn reach_line(reach: Option<&Reach>, sleeping: Option<String>) -> Line<'static> {
-    if let (Some(Reach::Down), Some(host)) = (reach, sleeping.as_ref()) {
-        return Line::styled(
-            format!("● tunnel to {host} is not open · Enter reopens it and connects"),
-            Style::default().fg(Color::Yellow),
-        );
+fn reach_line(reach: Option<&Reach>, sleeping: Option<crate::vias::Via>) -> Line<'static> {
+    if let Some(via) = sleeping.as_ref() {
+        // Something answering on the near end of a forward that is not running
+        // is not this database: it is whatever else holds the port, and going
+        // in without saying so is how you run a migration against the wrong
+        // server. The tunnel cannot even be opened until it lets go.
+        let text = match reach {
+            Some(Reach::Up(_)) => format!(
+                "● something else answers on {}: the tunnel to {} is not open",
+                via.local, via.host
+            ),
+            _ => format!(
+                "● tunnel to {} is not open · Enter reopens it and connects",
+                via.host
+            ),
+        };
+        return Line::styled(text, Style::default().fg(Color::Yellow));
     }
     match reach {
         // A loopback or LAN answer rounds to zero, and "answered in 0 ms" reads

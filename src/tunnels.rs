@@ -33,28 +33,61 @@ pub struct Tunnel {
     pub log: PathBuf,
 }
 
-impl Tunnel {
+/// One row of the Tunnels tab: a forward that is running, or one a connection
+/// remembers and nobody has opened yet. The second kind used to be invisible
+/// here, which made the tab a list of processes rather than of the forwards this
+/// tool knows about - and left an `off` state you could see on the Connections
+/// tab but not act on.
+pub struct Entry {
+    /// The connection that asked for it (`Conn::key()`), when one did.
+    pub owner: Option<String>,
+    pub kind: char,
+    pub spec: String,
+    pub host: String,
+    /// The process carrying it, when it is up.
+    pub live: Option<Tunnel>,
+}
+
+/// The three parts of a `-L`/`-R` spec: the port opened on this side, and the
+/// `host:port` the far side connects onward to. `None` for a spec we did not
+/// write (a bind address in front makes it four fields). Shared, because the
+/// row and the process it may be carrying are asked the same question.
+fn ports_of(spec: &str) -> Option<(&str, &str, &str)> {
+    let mut f = spec.split(':');
+    match (f.next(), f.next(), f.next(), f.next()) {
+        (Some(open), Some(target), Some(port), None) => Some((open, target, port)),
+        _ => None,
+    }
+}
+
+impl Entry {
+    pub fn on(&self) -> bool {
+        self.live.is_some()
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.live.as_ref().map(|t| t.pid)
+    }
+
     /// One-line human summary for the listing / TUI.
     pub fn describe(&self) -> String {
         // The host used to be printed twice ("dbhost (local → dbhost)"), which
         // said nothing the spec did not and pushed the row off the pane. The
-        // arrow carries the direction on its own.
+        // arrow carries the direction on its own. What used to lead the row was
+        // the pid, which is in the detail panel and is not why you are looking.
         let arrow = if self.kind == 'L' { "→" } else { "←" };
         format!(
-            "pid {:>7}  -{} {}  {} {}",
-            self.pid, self.kind, self.spec, arrow, self.host
+            "{:<3}  -{} {}  {} {}",
+            if self.on() { "on" } else { "off" },
+            self.kind,
+            self.spec,
+            arrow,
+            self.host
         )
     }
 
-    /// The three parts of a `-L`/`-R` spec: the port opened on this side, and
-    /// the `host:port` the far side connects onward to. `None` for a spec we
-    /// did not write (a bind address in front makes it four fields).
     pub fn ports(&self) -> Option<(&str, &str, &str)> {
-        let mut f = self.spec.split(':');
-        match (f.next(), f.next(), f.next(), f.next()) {
-            (Some(open), Some(target), Some(port), None) => Some((open, target, port)),
-            _ => None,
-        }
+        ports_of(&self.spec)
     }
 
     /// What this forward does, in the words of what you would use it for.
@@ -79,9 +112,15 @@ impl Tunnel {
         }
     }
 
-    /// The command that opened it, exactly as it was run.
+    /// The command that opens it, exactly as it is run.
     pub fn command(&self) -> String {
         format!("ssh -N -{} {} {}", self.kind, self.spec, self.host)
+    }
+}
+
+impl Tunnel {
+    pub fn ports(&self) -> Option<(&str, &str, &str)> {
+        ports_of(&self.spec)
     }
 
     /// When it was opened: the log file is created as the tunnel is spawned, so
@@ -102,14 +141,28 @@ impl Tunnel {
             .join(" · ")
     }
 
-    /// A tunnel is alive while its PID still has a `/proc` entry (Linux).
+    /// A tunnel is alive while its PID is still running *this* forward. The
+    /// argv is checked rather than only `/proc/<pid>`: the state file outlives a
+    /// reboot, and a pid the kernel has since handed to something else would
+    /// otherwise read as up and be what `d` kills.
     pub fn alive(&self) -> bool {
-        proc_alive(self.pid)
+        proc_is_ours(self.pid, self.kind, &self.spec, &self.host)
     }
 }
 
-fn proc_alive(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+/// Is this pid running the forward we think it is? `/proc/<pid>` existing only
+/// says *something* is running under that number.
+fn proc_is_ours(pid: u32, kind: char, spec: &str, host: &str) -> bool {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let flag = format!("-{kind}");
+    args.contains(&flag) && args.iter().any(|a| a == spec) && args.iter().any(|a| a == host)
 }
 
 /// `~/.local/state/easysql/` - persists tunnel state + logs across `esql` runs.
@@ -246,7 +299,7 @@ pub fn open(kind: char, spec: &str, host: &str) -> Result<Tunnel> {
             .unwrap_or("ssh exited immediately")
             .to_string()
     };
-    if !proc_alive(pid) {
+    if !proc_is_ours(pid, kind, spec, host) {
         let reason = first();
         let _ = fs::remove_file(&log);
         bail!("{reason}");

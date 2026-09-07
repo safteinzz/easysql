@@ -160,7 +160,7 @@ impl App {
                         self.set_status(msg);
                     }
                     Some(Err(e)) => {
-                        self.set_status(format!("could not reopen the tunnel: {e}"));
+                        self.set_failed(format!("could not reopen the tunnel: {e}"));
                         return None;
                     }
                     None => {}
@@ -313,7 +313,7 @@ impl App {
                     return None;
                 }
                 if let Err(e) = crate::ini::backup(&path) {
-                    self.set_status(format!("could not back it up, so not opening it: {e}"));
+                    self.set_failed(format!("could not back it up, so not opening it: {e}"));
                     return None;
                 }
                 // The same split the client commands get, so `EDITOR="code -w"`
@@ -391,11 +391,26 @@ impl App {
 
     pub(super) fn tunnels_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
         match key.code {
+            // A row a connection remembers can be turned back on from here: the
+            // forward is the one thing between you and a database that is not
+            // reachable any other way, and rebuilding it by hand is what this
+            // tab exists to stop.
+            KeyCode::Enter => {
+                self.toggle_tunnel();
+                None
+            }
             KeyCode::Char('d') | KeyCode::Char('x') => {
-                let pid = self.selected_tunnel()?.pid;
+                let (host, pid) = {
+                    let t = self.selected_tunnel()?;
+                    (t.host.clone(), t.pid())
+                };
+                let Some(pid) = pid else {
+                    self.set_failed("not running - ↵ opens it");
+                    return None;
+                };
                 let _ = tunnels::kill(pid);
                 self.refresh_tunnels();
-                self.set_status(format!("killed tunnel {pid}"));
+                self.set_status(format!("stopped the tunnel through {host}"));
                 None
             }
             KeyCode::Char('r') => {
@@ -404,6 +419,39 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Enter on the Tunnels tab: off when it is up, on when it is not. Opening
+    /// one is only possible for a forward something remembers, which is every
+    /// row that is off.
+    fn toggle_tunnel(&mut self) {
+        let Some(t) = self.selected_tunnel() else {
+            return;
+        };
+        let (kind, spec, host, pid) = (t.kind, t.spec.clone(), t.host.clone(), t.pid());
+        match pid {
+            Some(pid) => {
+                let _ = tunnels::kill(pid);
+                self.refresh_tunnels();
+                self.set_status(format!("stopped the tunnel through {host}"));
+            }
+            None => match tunnels::open(kind, &spec, &host) {
+                Ok(t) => {
+                    self.refresh_tunnels();
+                    self.select_tunnel(&spec, &host);
+                    self.set_status(format!(
+                        "reopened the tunnel through {host} (pid {})",
+                        t.pid
+                    ));
+                }
+                // Nothing to propose: the port is taken, or the host said no.
+                // It is ssh's own words, and they have to be read.
+                Err(e) => self.alert(
+                    "tunnel failed",
+                    format!("ssh -N -{kind} {spec} {host}\n\n{e}"),
+                ),
+            },
         }
     }
 

@@ -18,7 +18,11 @@ Set Framerate 24
 Set TypingSpeed 55ms
 
 Hide
-Type "./stage.sh shell"
+# `exec`, so a stage that refuses to open takes the terminal with it: without it
+# the script exits, the outer shell survives, and every keystroke after this
+# lands in the *real* home - which is how a README image ends up showing
+# somebody's actual connections.
+Type "exec ./stage.sh shell"
 Enter
 Sleep 2s
 Show

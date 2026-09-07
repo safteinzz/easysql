@@ -1,7 +1,7 @@
 //! The wizards: a list of fields, what kind each one is, how the prompt steps
 //! through them, and how it draws.
 
-use crate::tunnels::Tunnel;
+use crate::tunnels::Entry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
@@ -561,7 +561,7 @@ fn value_column(fields: &[Field]) -> usize {
 /// appears or disappears with the cursor. The key for a choice row used to be
 /// printed on whichever row was focused, which made every row grow and shrink
 /// as you moved through the form to repeat what the key line already says.
-pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tunnel]) {
+pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Entry]) {
     // No leading blank: the box's own top padding is that row.
     let mut lines: Vec<Line> = Vec::new();
     // Plain text of every line, kept alongside so the box can be sized against
@@ -644,7 +644,9 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Tu
     if let Some((target, port)) = p.resolves_to() {
         let via = tunnels.iter().find_map(|t| {
             let (open, _, _) = t.ports()?;
-            (t.kind == 'L' && open == port).then(|| t.host.clone())
+            // Only one that is actually up carries anything; a row that is off
+            // would otherwise promise a tunnel nothing is holding.
+            (t.on() && t.kind == 'L' && open == port).then(|| t.host.clone())
         });
         let line = match via {
             Some(host) => format!("        {target}   · through the tunnel to {host}"),

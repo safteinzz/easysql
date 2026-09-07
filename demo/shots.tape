@@ -22,7 +22,11 @@ Set TypingSpeed 55ms
 # the stage exists, so a broken setup stops the render instead of quietly
 # screenshotting the real home.
 Hide
-Type "./stage.sh shell"
+# `exec`, so a stage that refuses to open takes the terminal with it: without it
+# the script exits, the outer shell survives, and every keystroke after this
+# lands in the *real* home - which is how a README image ends up showing
+# somebody's actual connections.
+Type "exec ./stage.sh shell"
 Enter
 Sleep 2s
 Show
@@ -57,8 +61,11 @@ Escape
 Sleep 500ms
 
 # --- the Passwords tab ------------------------------------------------------
+# Long enough for the status line from the Escape above to expire: a status
+# lasts 3s everywhere, and a shot taken inside that window carries a green
+# "cancelled" that has nothing to do with the tab being photographed.
 Tab
-Sleep 2s
+Sleep 3.5s
 Screenshot ../readme-assets/passwords.png
 Sleep 700ms
 

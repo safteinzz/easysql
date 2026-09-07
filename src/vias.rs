@@ -160,14 +160,56 @@ pub fn ensure(key: &str) -> Option<Result<String>> {
     })
 }
 
-/// Which connection asked for the forward on this local port, if any. The
-/// Tunnels tab is otherwise a list of ports with no idea what they are for,
-/// which makes `d` on it a guess.
-pub fn owner_of(local: &str) -> Option<String> {
-    load_from(&store_path())
-        .into_iter()
+/// The rows of the Tunnels tab: what is running, then what a connection
+/// remembers and nobody has opened. A sleeping via used to be listed nowhere -
+/// the tab showed processes - so the only sign of it was a yellow dot on the
+/// connection, which is a state you can see and not act on.
+pub fn rows() -> Vec<crate::tunnels::Entry> {
+    rows_from(&crate::tunnels::list(), all())
+}
+
+fn rows_from(
+    live: &[crate::tunnels::Tunnel],
+    recorded: Vec<(String, Via)>,
+) -> Vec<crate::tunnels::Entry> {
+    let mut rows: Vec<crate::tunnels::Entry> = live
+        .iter()
+        .map(|t| crate::tunnels::Entry {
+            owner: t.ports().and_then(|(open, _, _)| owner_in(&recorded, open)),
+            kind: t.kind,
+            spec: t.spec.clone(),
+            host: t.host.clone(),
+            live: Some(t.clone()),
+        })
+        .collect();
+
+    for (key, via) in recorded {
+        // Carrying the local port is what counts, exactly as `ensure` decides
+        // it: a forward already holding that port is the one this connection
+        // will use, whatever spec it was opened with, and it is on screen
+        // already as a row of its own.
+        if live
+            .iter()
+            .any(|t| t.kind == 'L' && t.ports().is_some_and(|(open, _, _)| open == via.local))
+        {
+            continue;
+        }
+        rows.push(crate::tunnels::Entry {
+            owner: Some(key),
+            kind: 'L',
+            spec: via.spec(),
+            host: via.host,
+            live: None,
+        });
+    }
+    rows
+}
+
+fn owner_in(recorded: &[(String, Via)], local: &str) -> Option<String> {
+    recorded
+        .iter()
         .find(|(_, v)| v.local == local)
-        .map(|(key, _)| key)
+        .map(|(key, _)| key.clone())
 }
 
 /// Every recorded via, for the checks that have to look at all of them.
@@ -191,5 +233,66 @@ pub fn default_host(key: &str) -> Option<String> {
     match hosts.as_slice() {
         [only] => Some((*only).to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnels::Tunnel;
+
+    fn via(local: &str, port: &str) -> Via {
+        Via {
+            host: "bastion".into(),
+            target: "127.0.0.1".into(),
+            port: port.into(),
+            local: local.into(),
+        }
+    }
+
+    fn running(spec: &str) -> Tunnel {
+        Tunnel {
+            pid: 4242,
+            kind: 'L',
+            spec: spec.into(),
+            host: "bastion".into(),
+            log: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn a_remembered_forward_is_listed_whether_or_not_it_is_running() {
+        let recorded = vec![
+            ("pg:prod".to_string(), via("5432", "5432")),
+            ("pg:metrics".to_string(), via("5433", "5432")),
+        ];
+        let rows = rows_from(&[running("5432:127.0.0.1:5432")], recorded);
+
+        // One row each, never two for the same forward: the one that is up is
+        // the live row, and the one that is not is still on the list, which is
+        // the whole point - an `off` you can see is an `off` you can turn on.
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].on());
+        assert_eq!(rows[0].owner.as_deref(), Some("pg:prod"));
+        assert!(!rows[1].on());
+        assert_eq!(rows[1].owner.as_deref(), Some("pg:metrics"));
+        assert_eq!(rows[1].spec, "5433:127.0.0.1:5432");
+    }
+
+    #[test]
+    fn holding_the_port_is_what_counts_as_carrying_it() {
+        // `ensure` decides a via is satisfied by whatever holds its local port,
+        // whatever spec that forward was opened with. The list has to agree, or
+        // it grows a second row for a tunnel that is already there.
+        let recorded = vec![("pg:prod".to_string(), via("5432", "5432"))];
+        let rows = rows_from(&[running("5432:10.0.0.9:5432")], recorded);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].on());
+
+        // A forward nothing recorded is still a row, just one with no owner to
+        // name: it is running, and `d` on it has to mean something.
+        let rows = rows_from(&[running("9000:127.0.0.1:80")], Vec::new());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].owner.is_none());
     }
 }

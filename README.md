@@ -25,7 +25,8 @@ to run it, so you never have to go and find out.
 ## What you see first
 
 Every connection you have saved, from every engine, in one list. Green answered,
-red did not, yellow means the tunnel it needs is not running. `pw` is a password
+red did not, yellow means the tunnel it needs is not running - whatever answered
+on that port cannot be the database, so it is worth knowing before you go in. `pw` is a password
 already on file, and `no client` is the program that would open it missing.
 
 ![The Connections tab listing seven connections across postgres, mysql, sqlite and sqlserver, with a details panel showing host, port, database, user and the psql command that will run](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/connections.png)
@@ -57,9 +58,11 @@ environment variable. easysql only ever shows you that one exists.
 ## Tunnels are just `ssh -L`
 
 Opened from the connection that needs one, with every field already filled in.
-Each forward says which connection it serves, and `d` kills it.
+Each forward says which connection it serves, and every one this tool knows about
+is listed - the ones running and the ones a connection remembers - so `↵` turns
+one back on and `d` kills it.
 
-![The Tunnels tab listing two ssh forwards by pid, one labelled "for metrics (postgres)", with a details panel showing the ssh -N -L command and the kill command](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnels.png)
+![The Tunnels tab listing three forwards, two on and one off, each labelled with the connection it serves, with a details panel showing the ssh -N -L command and the kill command](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnels.png)
 
 ## Saved queries
 
@@ -108,7 +111,7 @@ esql prod :tables     # run a saved query against it
 | --- | --- | --- |
 | Connections | every saved connection, from every engine | `~/.pg_service.conf`, `~/.my.cnf`, `~/.config/easysql/{sqlite,mssql}.conf` |
 | Passwords | what unlocks them, written and never read back | `~/.pgpass`, `~/.my.cnf` (both chmod 600) |
-| Tunnels | the `ssh -L` between you and a database you cannot route to | tracked by pid, killable |
+| Tunnels | the `ssh -L` between you and a database you cannot route to | on and off, remembered per connection |
 | Settings | the choices that are yours rather than a client's | `~/.config/easysql/settings` |
 
 Every write backs the file up first and rewrites only the one section, so your

@@ -161,7 +161,7 @@ impl App {
                         self.refresh_conns();
                         self.set_status(format!("deleted '{name}' (file backed up first)"));
                     }
-                    Some(Err(e)) => self.set_status(format!("delete failed: {e}")),
+                    Some(Err(e)) => self.set_failed(format!("delete failed: {e}")),
                     None => self.set_status(format!("'{name}' is already gone")),
                 }
             }
@@ -170,7 +170,7 @@ impl App {
                     self.refresh_snippets();
                     self.set_status(format!("deleted '{name}'"));
                 }
-                Err(e) => self.set_status(format!("could not delete it: {e}")),
+                Err(e) => self.set_failed(format!("could not delete it: {e}")),
             },
             ConfirmAction::ForgetPassword(cred) => {
                 let where_stored = cred.where_stored();
@@ -179,7 +179,7 @@ impl App {
                         self.refresh_creds();
                         self.set_status(format!("forgotten from {where_stored} (backed up first)"));
                     }
-                    Err(e) => self.set_status(format!("could not forget it: {e}")),
+                    Err(e) => self.set_failed(format!("could not forget it: {e}")),
                 }
             }
             // The three offered fixes all end the same way: open the wizard that

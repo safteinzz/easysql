@@ -53,7 +53,7 @@ impl App {
             if p.fields[idx].label.contains("Tunnel through") {
                 let items = crate::sshhosts::aliases();
                 if items.is_empty() {
-                    self.set_status("no hosts in ~/.ssh/config to tunnel through");
+                    self.set_failed("no hosts in ~/.ssh/config to tunnel through");
                 } else {
                     self.picker = Some(Picker::plain(
                         "Which ssh host does the tunnel go through?",
@@ -282,7 +282,7 @@ impl App {
                             crate::ini::collapse_tilde(&engine.store().to_string_lossy())
                         ));
                     }
-                    Err(e) => self.set_status(format!("{verb} failed: {e}")),
+                    Err(e) => self.set_failed(format!("{verb} failed: {e}")),
                 }
                 None
             }
@@ -309,7 +309,7 @@ impl App {
                         };
                         self.set_status(format!("saved · esql <connection> :{}{also}", v[0]));
                     }
-                    Err(e) => self.set_status(format!("could not save it: {e}")),
+                    Err(e) => self.set_failed(format!("could not save it: {e}")),
                 }
                 None
             }
@@ -320,7 +320,7 @@ impl App {
                         self.refresh_creds();
                         self.set_status("moved it, and kept the password that was on it");
                     }
-                    Err(e) => self.set_status(format!("could not move it: {e}")),
+                    Err(e) => self.set_failed(format!("could not move it: {e}")),
                 }
                 None
             }
@@ -349,7 +349,7 @@ impl App {
                             _ => format!("saved into [client{name}] in ~/.my.cnf (chmod 600)"),
                         });
                     }
-                    Err(e) => self.set_status(format!("could not save the password: {e}")),
+                    Err(e) => self.set_failed(format!("could not save the password: {e}")),
                 }
                 None
             }
@@ -377,7 +377,7 @@ impl App {
                     Ok(t) => {
                         self.goto_view(View::Tunnels);
                         self.refresh_tunnels();
-                        self.select_tunnel(t.pid);
+                        self.select_tunnel(&t.spec, &t.host);
                         self.set_status(format!(
                             "localhost:{local} is now {db_host}:{db_port} via {via} (pid {})",
                             t.pid
@@ -394,7 +394,7 @@ impl App {
                             local: local.clone(),
                         };
                         if let Err(e) = crate::vias::set(&key, &v) {
-                            self.set_status(format!("tunnel open, but not remembered: {e}"));
+                            self.set_failed(format!("tunnel open, but not remembered: {e}"));
                         }
                         // The forward exists now, so the connection that asked
                         // for it is one field from working. Say so here rather
@@ -421,7 +421,7 @@ impl App {
                     // Leave the wizard open on the port that failed, so the fix
                     // is editing one number rather than starting again.
                     Err(e) => {
-                        self.set_status(format!("tunnel failed: {e}"));
+                        self.set_failed(format!("tunnel failed: {e}"));
                         self.prompt = Some(prompt);
                     }
                 }

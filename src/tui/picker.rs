@@ -239,7 +239,7 @@ impl App {
             })
             .collect();
         if rows.is_empty() {
-            self.set_status("no connections to save a password for yet (press c on Connections)");
+            self.set_failed("no connections to save a password for yet (press c on Connections)");
             return;
         }
         self.picker = Some(Picker::keyed(
