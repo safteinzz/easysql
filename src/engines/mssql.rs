@@ -72,11 +72,9 @@ pub fn flags(c: &Conn) -> Vec<String> {
         argv.push("-U".into());
         argv.push(c.user.clone());
     }
-    // ODBC driver 18 encrypts by default and validates the certificate, so a
-    // server with a self-signed one refuses until you say you trust it. That is
-    // the single most common wall in front of a dev SQL Server, and it is a
-    // choice rather than a default because waiving validation silently would be
-    // us weakening somebody's connection for them.
+    // ODBC driver 18 encrypts and validates the certificate by default, so a
+    // self-signed server refuses until you say you trust it. A choice, not a
+    // default: waiving validation silently would weaken the connection for you.
     if trusts_cert(c) {
         argv.push("-C".into());
     }

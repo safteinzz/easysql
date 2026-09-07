@@ -203,6 +203,24 @@ impl App {
         self.status_failed = false;
     }
 
+    /// Report a failure where it fits: the status line when the message is
+    /// short, an alert box when it is long or spans several lines.
+    ///
+    /// A line is enough for `Address already in use`, because the list behind
+    /// it still shows the state. A box is for what you have to read twice, and
+    /// it carries the command too, which a line has no room for.
+    pub(super) fn report_failure(&mut self, title: &str, said: &str, cmd: &str, err: &str) {
+        let err = err.trim();
+        // Our sentence, a colon, then the program's own words.
+        let line = format!("{said}: {err}");
+        // Too tall or too wide for the bar, so it goes in the box.
+        if err.lines().count() > 1 || line.chars().count() > 90 {
+            self.alert(title, format!("{cmd}\n\n{err}"));
+        } else {
+            self.set_failed(line);
+        }
+    }
+
     /// The same line for something that did not. Yellow, the same yellow an
     /// alert uses: red is reserved for a gate in front of something about to be
     /// lost, and this has already happened. A failure worth acting on is an
@@ -299,11 +317,8 @@ impl App {
 
     pub(super) fn refresh_snippets(&mut self) {
         self.snippets = crate::snippets::list();
-        // Keep psql's `\set` block in step with the files on every reload, not
-        // only when the wizard saves one: editing a `.sql` with `o` and coming
-        // back would otherwise leave `:name` expanding to the old query, which
-        // looks like the edit simply did not take. It writes nothing when
-        // nothing changed, so this is free on the common path.
+        // Editing a `.sql` with `o` would otherwise leave `:name` expanding to the old
+        // query. Writes nothing when nothing changed.
         let _ = crate::snippets::sync_psqlrc();
         let n = self.snippet_rows().len();
         Self::clamp(&mut self.snippet_state, n);
@@ -681,6 +696,11 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 }
             }
             app.refresh_all();
+            // A dot learned before the session is a claim about a world we
+            // stopped watching: the tunnel it went through may have died while
+            // the client owned the terminal, and a `\c` inside psql can leave
+            // the connection pointing somewhere else entirely.
+            app.start_probes();
         }
     }
     Ok(())
@@ -708,15 +728,10 @@ fn run_suspended(
         println!("\x1b[2m  {hint}\x1b[0m");
     }
 
-    // Ctrl-C at the terminal is delivered to every process in the foreground
-    // group, which is us as well as the client. Without this, Ctrl-C inside
-    // psql or sqlite3 kills easysql too - mid-suspend, before it can put the
-    // terminal back - and the shell you return to is left in raw mode with a
-    // mangled prompt and a broken history.
-    //
-    // So do what `system(3)` does: ignore it here for as long as the child runs.
-    // SIG_IGN survives exec, so the child must put it back to SIG_DFL itself, or
-    // Ctrl-C would stop working in the client too, which is worse than the bug.
+    // Ctrl-C reaches every process in the foreground group, so without this it
+    // kills easysql mid-suspend and the shell comes back in raw mode. Do what
+    // `system(3)` does and ignore it while the child runs; SIG_IGN survives exec,
+    // so the child restores SIG_DFL itself.
     let status;
     unsafe {
         let prev_int = libc::signal(libc::SIGINT, libc::SIG_IGN);
@@ -764,4 +779,33 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_goes_in_the_container_its_length_earns() {
+        // A short one fits the bar, where the list behind it still shows the
+        // state; a long one has to be readable twice, which only a box allows.
+        let mut app = App::empty();
+        app.report_failure(
+            "tunnel failed",
+            "could not reopen it",
+            "ssh -N",
+            "port taken",
+        );
+        assert!(app.alert.is_none(), "a one-liner needs no box");
+        assert!(app.status_failed, "and it is yellow, not green");
+        assert!(app.live_status().is_some_and(|s| s.contains("port taken")));
+
+        app.report_failure(
+            "tunnel failed",
+            "could not reopen it",
+            "ssh -N",
+            "line one\nline two",
+        );
+        assert!(app.alert.is_some(), "more than one line has to be read");
+    }
 }

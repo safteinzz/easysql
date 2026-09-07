@@ -377,16 +377,16 @@ impl App {
                     Ok(t) => {
                         self.goto_view(View::Tunnels);
                         self.refresh_tunnels();
+                        // A forward that just came up changes what answers on
+                        // the near port, which is what the dots are about.
+                        self.start_probes();
                         self.select_tunnel(&t.spec, &t.host);
                         self.set_status(format!(
                             "localhost:{local} is now {db_host}:{db_port} via {via} (pid {})",
                             t.pid
                         ));
-                        // Remember it against the connection that asked, so a
-                        // reboot costs a keypress instead of an archaeology
-                        // session. Recorded even if the repoint below is
-                        // declined: what the tunnel *is* does not depend on
-                        // whether the connection points at it yet.
+                        // Remembered against the connection that asked, even if the repoint below is
+                        // declined: what the tunnel is does not depend on what points at it.
                         let v = crate::vias::Via {
                             host: via.clone(),
                             target: db_host.clone(),
@@ -396,11 +396,8 @@ impl App {
                         if let Err(e) = crate::vias::set(&key, &v) {
                             self.set_failed(format!("tunnel open, but not remembered: {e}"));
                         }
-                        // The forward exists now, so the connection that asked
-                        // for it is one field from working. Say so here rather
-                        // than leaving it to be discovered by failing again:
-                        // the app dug this tunnel for this connection and knows
-                        // exactly which address moved.
+                        // The app dug this tunnel for this connection and knows which address moved,
+                        // so it offers rather than leaving it to fail again.
                         if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
                             self.confirm = Some(Confirm::offer(
                                 "the tunnel is open",

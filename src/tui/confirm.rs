@@ -288,11 +288,8 @@ impl App {
                 ),
                 ConfirmAction::SavePassword { key },
             ),
-            // A tunnel that already carries this exact target changes the
-            // advice completely: the forward is not missing, the connection is
-            // simply still pointed past it at an address that will not answer.
-            // Offering to dig a second identical tunnel would be the app not
-            // looking at what it already has.
+            // A forward already carrying this target means nothing is missing: the
+            // connection is simply still pointed past it.
             Fix::Tunnel => match self.tunnel_carrying(conn) {
                 Some(local) => Confirm::offer(
                     "a tunnel to it is already open",

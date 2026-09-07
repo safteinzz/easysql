@@ -103,14 +103,13 @@ pub fn delete(name: &str) -> Result<()> {
     fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
 }
 
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 // the psql half
-// ---------------------------------------------------------------------------
-// psql is the one client with variables, so its users can have the shortcut
-// *inside* the session too: `\set tables '…'` in `~/.psqlrc` makes `:tables`
-// expand at the prompt. The snippet files stay the single source, and this
-// block is regenerated from them - never hand-edited, and never touching a line
-// outside the markers, because a `.psqlrc` is usually somebody's own work.
+// --------------------------------------------------------------------------
+//
+// `\set tables '…'` in `~/.psqlrc` makes `:tables` expand at the prompt. The
+// block is regenerated from the snippet files and never touches a line outside
+// its markers, because a `.psqlrc` is usually somebody's own work.
 
 const START: &str = "-- easysql:start (generated from ~/.config/easysql/snippets, do not edit)";
 const END: &str = "-- easysql:end";

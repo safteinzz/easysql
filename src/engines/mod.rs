@@ -371,11 +371,8 @@ pub fn on_path(program: &str) -> bool {
 
 // ---- installing a missing client ------------------------------------------
 //
-// `cargo install easysql` gets you the front end and nothing else, because the
-// clients are not Rust and never will be. That is not an excuse to hand somebody
-// a tool that does not work: easysql works out the one command *this* machine
-// needs and offers to run it, rather than printing three distros' worth of
-// guesses and calling that help.
+// The clients are not Rust, so easysql works out the one command this machine
+// needs and offers to run it, rather than printing three distros' guesses.
 
 /// The package managers we know how to drive. An enum rather than a string, so
 /// the table below is checked by the compiler instead of by whoever last read it.
@@ -488,11 +485,9 @@ pub fn hint_line(engine: Engine, s: &Settings) -> String {
 /// it - the same seam `pg::list_in` and `creds::set_pg_in` have.
 fn hint_line_from(engine: Engine, s: &Settings, snips: &[crate::snippets::Snippet]) -> String {
     let base = engine.hint().to_string();
-    // The `\set` block lives in `~/.psqlrc`, which only psql reads. Somebody
-    // who pointed `psql_command` at pgcli or a docker wrapper gets a client with
-    // its own history, its own completion and no variables at all, so offering
-    // `:name` there would be advertising something that answers with a syntax
-    // error. Same gate the install offer uses: default client, or nothing.
+    // Only psql reads `~/.psqlrc`, so pgcli or a docker wrapper would answer
+    // `:name` with a syntax error. Same gate as the install offer: default
+    // client, or nothing.
     let is_psql = engine
         .client_argv(s)
         .first()

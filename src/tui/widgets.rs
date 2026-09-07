@@ -101,9 +101,7 @@ pub(super) fn shell_join(argv: &[String]) -> String {
 
 // ── the house box ───────────────────────────────────────────────────────────
 // Every overlay is built from these, so only its colour and its buttons carry
-// meaning: gate red, alert yellow, offer/picker/form/reader cyan. The anatomy
-// is written down in AGENTS.md under "What every box looks like"; this is that
-// paragraph as code, and nothing should draw a bordered overlay without it.
+// meaning: gate red, alert yellow, offer/picker/form/reader cyan.
 
 /// Narrowest a box may be, so a two-word message still reads as a box.
 pub(super) const BOX_MIN_W: u16 = 24;

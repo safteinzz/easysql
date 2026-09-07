@@ -276,13 +276,9 @@ impl Prompt {
                     },
                 ),
                 Field::filled("Port", &c.port_or_default()),
-                // `*` even when the connection names a database, because a
-                // Postgres password belongs to the *role* and roles are
-                // cluster-wide: the same secret unlocks every database on that
-                // server, and narrowing it here only means `\c elsewhere`
-                // prompts. It stays editable, because behind a pooler
-                // (pgbouncer, an RDS proxy) the database name really does
-                // select a different backend with different credentials.
+                // A Postgres password belongs to the role, which is cluster-wide, so the same
+                // secret unlocks every database on that server. Editable, because behind a
+                // pooler the database name really can select a different backend.
                 Field::filled("Database", "*"),
                 Field::filled("User", &c.user),
                 Field::secret("Password")

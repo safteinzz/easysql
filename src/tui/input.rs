@@ -157,10 +157,18 @@ impl App {
                 match crate::vias::ensure(&conn.key()) {
                     Some(Ok(msg)) => {
                         self.refresh_tunnels();
+                        // The port that was closed a moment ago is open now, so
+                        // the dot beside this connection is out of date before
+                        // the session even starts.
+                        self.start_probes();
                         self.set_status(msg);
                     }
                     Some(Err(e)) => {
-                        self.set_failed(format!("could not reopen the tunnel: {e}"));
+                        let said = format!("could not reopen the tunnel for {}", conn.name);
+                        let cmd = crate::vias::get(&conn.key())
+                            .map(|v| v.command())
+                            .unwrap_or_default();
+                        self.report_failure("tunnel failed", &said, &cmd, &e.to_string());
                         return None;
                     }
                     None => {}
@@ -294,11 +302,9 @@ impl App {
                 }
                 None
             }
-            // `o` opens the file itself. Not a convenience: libpq takes the
-            // *first* matching line, so which of two overlapping entries wins is
-            // decided by their order, and no wizard field can express that. The
-            // file is backed up first, because an editor is the one write path
-            // easysql does not control.
+            // libpq takes the *first* matching line, so which of two overlapping entries
+            // wins is decided by their order, which no wizard field can express. Backed
+            // up first, since an editor is the one write path easysql does not control.
             KeyCode::Char('o') => {
                 let cred = self.selected_cred()?.clone();
                 let path = match cred.source {
@@ -410,6 +416,7 @@ impl App {
                 };
                 let _ = tunnels::kill(pid);
                 self.refresh_tunnels();
+                self.start_probes();
                 self.set_status(format!("stopped the tunnel through {host}"));
                 None
             }
@@ -434,22 +441,29 @@ impl App {
             Some(pid) => {
                 let _ = tunnels::kill(pid);
                 self.refresh_tunnels();
+                // Whatever was reachable through it is not any more.
+                self.start_probes();
                 self.set_status(format!("stopped the tunnel through {host}"));
             }
             None => match tunnels::open(kind, &spec, &host) {
                 Ok(t) => {
                     self.refresh_tunnels();
+                    self.start_probes();
                     self.select_tunnel(&spec, &host);
                     self.set_status(format!(
                         "reopened the tunnel through {host} (pid {})",
                         t.pid
                     ));
                 }
-                // Nothing to propose: the port is taken, or the host said no.
-                // It is ssh's own words, and they have to be read.
-                Err(e) => self.alert(
+                // The message decides the container: `Address already in use`
+                // is one self-explanatory line and the row behind it still
+                // says `off`, so it fades harmlessly; a long one is the kind
+                // you have to read twice, and that gets the box.
+                Err(e) => self.report_failure(
                     "tunnel failed",
-                    format!("ssh -N -{kind} {spec} {host}\n\n{e}"),
+                    &format!("could not reopen the tunnel through {host}"),
+                    &format!("ssh -N -{kind} {spec} {host}"),
+                    &e.to_string(),
                 ),
             },
         }

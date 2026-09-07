@@ -119,12 +119,9 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .max()
                 .unwrap_or(0)
                 .min(38)
-                // ...but never wider than what is left once every column that
-                // must survive has had its share. The age is last on the row, so
-                // an over-wide target silently clips it to "3m a", which reads
-                // as a rendering fault rather than as a wide column. Count the
-                // block's borders and the highlight symbol too: both eat width
-                // that `area` still includes.
+                // Never wider than what is left once every column that must survive has had
+                // its share, or the age clips to `3m a` and reads as a rendering fault. The
+                // block's borders and the highlight symbol eat width that `area` still counts.
                 .min({
                     let usable = (area.width as usize).saturating_sub(2 + 2);
                     let fixed = 1 + 1 + nw + 2 + ew + 2 + 2 + 9 + 9;
@@ -221,13 +218,9 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .iter()
                 .map(|&i| {
                     let t = &app.tunnels[i];
-                    // Name the connection this was dug for, so the list is not
-                    // a set of ports whose purpose you have to remember.
-                    // Resolved back to a real connection rather than shown as
-                    // a raw `pg:name` key, and called out when it resolves to
-                    // nothing: an orphan means the connection was deleted or
-                    // renamed outside easysql, and a tunnel for a thing that no
-                    // longer exists is worth seeing rather than reading as noise.
+                    // Name the connection this was dug for, resolved back to a real one rather
+                    // than shown as a raw `pg:name` key. An orphan is called out: it means the
+                    // connection was deleted or renamed outside easysql.
                     let owner = match t.owner.clone() {
                         Some(key) => match app.conns.iter().find(|c| c.key() == key) {
                             Some(c) => format!("   for {} ({})", c.name, c.engine.label()),
@@ -418,14 +411,11 @@ fn fit(s: &str, w: usize) -> String {
 }
 
 fn reach_mark(reach: Option<&Reach>, networked: bool, sleeping_via: bool) -> (&'static str, Style) {
-    // A closed port in front of a tunnel we know how to reopen is not the same
-    // as a server that is gone, and painting both red says the wrong thing
-    // about the one that is a keypress from working.
-    // Yellow rather than a half-filled circle: the list already says up and
-    // down with green and red on the same glyph, and a rarer codepoint is one
-    // font fallback away from rendering as a stray `‹`.
-    // Up counts too, and matters more: a port that answers while the forward is
-    // down is answering for something else entirely.
+    // A closed port in front of a tunnel we can reopen is not a server that is
+    // gone. Yellow on the same glyph rather than a rarer codepoint, which is one
+    // font fallback from rendering as a stray `‹`. Up counts too, and matters
+    // more: a port answering while the forward is down is answering for something
+    // else.
     if sleeping_via && matches!(reach, Some(Reach::Down) | Some(Reach::Up(_))) {
         return ("●", Style::default().fg(Color::Yellow));
     }
