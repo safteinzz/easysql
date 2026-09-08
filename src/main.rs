@@ -4,12 +4,9 @@
 //! password manager, a wiki page or your own notes for a connection string
 //! again.
 //!
-//!   esql                 Launch the TUI: connections, passwords, tunnels
-//!   esql <name>          Open it (anything unknown is a saved connection)
-//!   esql <name> :<query> Run a saved query from ~/.config/easysql/snippets
-//!   esql ls              List every saved connection  (-v shows targets)
-//!   esql self update     Reinstall the latest release from crates.io
-//!   esql self check      Ask crates.io whether a newer release exists
+//! This file is the clap `Cmd` enum and the dispatch match; what you can run is
+//! `esql --help`, which renders from the manifest, those doc comments and
+//! `AFTER`, and is the only copy of that list.
 //!
 //! The philosophy, and it is the only rule that matters here: easysql is a
 //! front end, never a client. It writes the files psql and mysql already read
@@ -33,20 +30,32 @@ mod vias;
 
 use clap::{Parser, Subcommand};
 
-/// Shown under `esql --help`. The command list can't convey the two things that
-/// aren't subcommands: bare `esql` opens the TUI, and any saved name connects.
+/// clap's own layout with one change: `{before-help}` moves from above the
+/// description to just under `Usage:`, so the shapes block lands on top of the
+/// command list rather than on top of the screen.
+const TEMPLATE: &str =
+    "{about-with-newline}\n{usage-heading} {usage}\n\n{before-help}{all-args}{after-help}\n";
+
+/// Shown under `esql --help`: the shapes clap cannot list, because most of this
+/// tool is not a subcommand, and then the contract a script needs. Read top to
+/// bottom by somebody - or something - looking for the one line that answers
+/// "how do I ask this database a question", so that line is in the block rather
+/// than in prose below it.
+const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
+  esql                       open the toolbox (TUI): connections, passwords, tunnels, saved queries
+  esql <name>                open a saved connection (e.g. `esql prod`, or `esql pg:prod`)
+  esql <name>/<db>           the same connection, another database on that server
+  esql <name> 'select 1'     run one query and exit, the way `ssh host 'cmd'` does
+  esql <name> :<query>       run a saved query (see the Snippets tab)
+  esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)";
+
+/// The rest of the block: what a script can expect, then where to look next.
 const AFTER: &str = concat!(
     "\
-Three more ways to run it (not subcommands):
-  esql                 open the toolbox (TUI): connections, passwords, tunnels
-  esql <name>          open a saved connection (e.g. `esql prod`, or `esql pg:prod`)
-  esql <name> :<query> run a saved query against it (see the Snippets tab)
-
-Anything else after a name goes straight to that client, so
-`esql prod -c 'select 1'` runs psql with that query and exits.
-
-The toolbox is where passwords, tunnels, saved queries and adding/editing
-connections live.
+Rows go to stdout and easysql's own words to stderr, so a pipe carries only
+data, and the exit code is the client's own: a `psql` that refuses to connect
+exits 2 for its own reasons, not for easysql's. Everything after `--` reaches
+the client untouched.
 Run `esql <command> --help` for a command's details.",
     "\n\n",
     env!("CARGO_PKG_REPOSITORY"),
@@ -74,6 +83,10 @@ const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about,
+    // The shapes come first: this is a bare-first binary, so the command list is
+    // the leftovers and burying them above it answers the wrong question first.
+    help_template = TEMPLATE,
+    before_help = WAYS,
     after_help = AFTER
 )]
 struct Cli {
@@ -84,13 +97,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// List every saved connection, from every engine
-    ///   -v   also show where each one connects
+    ///   -v   also show where each connection points
     #[command(verbatim_doc_comment)]
     Ls(commands::ls::Args),
     /// Manage easysql itself: `self update` reinstalls, `self check` looks for a newer release
     #[command(name = "self", subcommand)]
     Selfie(commands::selfcmd::Cmd),
-    /// Any other word is a saved connection, opened in its own client
+    /// Any other word is a saved connection (`<name>`, or `<name>/<database>`)
     #[command(external_subcommand)]
     Connect(Vec<String>),
 }
