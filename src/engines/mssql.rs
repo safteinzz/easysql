@@ -53,20 +53,22 @@ pub fn trusts_cert(c: &Conn) -> bool {
         .any(|(k, v)| k.eq_ignore_ascii_case("trust_cert") && v == "yes")
 }
 
-/// The connection flags, which are the whole handoff for this engine.
+/// The connection flags, which are the whole handoff for this engine. `db`
+/// overrides the saved database when one was asked for.
 ///
 /// `-S host,port` is sqlcmd's own syntax: a comma, not a colon. `-P` is never
 /// passed, so sqlcmd asks for the password itself.
-pub fn flags(c: &Conn) -> Vec<String> {
+pub fn flags(c: &Conn, db: Option<&str>) -> Vec<String> {
     let host = if c.host.is_empty() {
         "localhost"
     } else {
         &c.host
     };
     let mut argv = vec!["-S".to_string(), format!("{host},{}", c.port_or_default())];
-    if !c.database.is_empty() {
+    let database = db.unwrap_or(&c.database);
+    if !database.is_empty() {
         argv.push("-d".into());
-        argv.push(c.database.clone());
+        argv.push(database.to_string());
     }
     if !c.user.is_empty() {
         argv.push("-U".into());

@@ -95,13 +95,19 @@ The handful of things faster to type than to click. Everything else is in the
 toolbox, where `?` lists every key.
 
 ```sh
-esql                  # the toolbox
-esql prod             # open a saved connection
-esql prod -c 'select 1'   # anything after the name goes to the client
-esql ls               # list them, one name per line
-esql ls -v            # ...and where each one points
-esql prod :tables     # run a saved query against it
+esql                        # the toolbox
+esql prod                   # open a saved connection
+esql prod 'select 1'        # run one query and exit, like `ssh host 'cmd'`
+esql prod/reporting         # the same connection, another database
+esql prod :tables           # run a saved query against it
+esql ls                     # list them, one name per line
+esql ls -v                  # ...and where each one points
 ```
+
+Rows go to stdout and easysql's own words to stderr, and the exit code is the
+client's, so a one-shot is safe to pipe. An argument starting with `-` goes
+straight to the client (`esql prod -c 'select 1'`), as does everything after
+`--`.
 
 ![esql ls -v printing seven connections with their engine, name and user@host:port/database](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)
 

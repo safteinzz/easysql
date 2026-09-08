@@ -86,6 +86,17 @@ impl Engine {
         }
     }
 
+    /// The setting that names this engine's client, so a refusal can say which
+    /// line to change rather than "a setting".
+    pub fn client_setting(self) -> &'static str {
+        match self {
+            Engine::Pg => "psql_command",
+            Engine::MySql => "mysql_command",
+            Engine::Sqlite => "sqlite_command",
+            Engine::MsSql => "sqlcmd_command",
+        }
+    }
+
     pub fn default_client(self) -> &'static str {
         match self {
             Engine::Pg => "psql",
@@ -235,16 +246,35 @@ impl Conn {
     /// The exact command Enter runs. Every engine points its client at the
     /// block by name, so no host, user or password is ever on the command line.
     pub fn connect_argv(&self, s: &Settings) -> Vec<String> {
+        self.connect_argv_db(s, None)
+    }
+
+    /// The same command aimed at another database on the same server, which is
+    /// what `esql <name>/<db>` asks for.
+    ///
+    /// It has to be built here rather than passed through, because each client
+    /// spells it in a way that collides with the argument carrying the
+    /// connection: psql's `-d` and its bare positional both fill libpq's
+    /// dbname and username slots, so `service=` is demoted to a username and
+    /// the host, port and user are lost. SQLite has no database to switch to -
+    /// another file is another connection - so `db` is refused by the caller
+    /// and ignored here.
+    pub fn connect_argv_db(&self, s: &Settings, db: Option<&str>) -> Vec<String> {
         let mut argv = self.engine.client_argv(s);
         match self.engine {
-            Engine::Pg => argv.push(format!("service={}", self.name)),
-            Engine::MySql => argv.push(format!("--defaults-group-suffix={}", self.name)),
+            Engine::Pg => argv.push(pg::conninfo(&self.name, db)),
+            Engine::MySql => {
+                argv.push(format!("--defaults-group-suffix={}", self.name));
+                if let Some(db) = db {
+                    argv.push(format!("--database={db}"));
+                }
+            }
             Engine::Sqlite => argv.push(
                 crate::ini::expand_tilde(&self.database)
                     .to_string_lossy()
                     .into_owned(),
             ),
-            Engine::MsSql => argv.extend(mssql::flags(self)),
+            Engine::MsSql => argv.extend(mssql::flags(self, db)),
         }
         argv
     }
@@ -329,6 +359,21 @@ pub fn find(needle: &str) -> Result<Conn> {
                 names.join(", ")
             )
         }
+    }
+}
+
+/// What the CLI is handed: a name, or `<name>/<db>` to point that connection at
+/// another database on the same server. The whole string is tried as a name
+/// first, so a connection whose own name contains a slash still resolves.
+pub fn find_target(needle: &str) -> Result<(Conn, Option<String>)> {
+    match find(needle) {
+        Ok(c) => Ok((c, None)),
+        Err(e) => match needle.rsplit_once('/') {
+            Some((name, db)) if !name.is_empty() && !db.is_empty() => {
+                Ok((find(name)?, Some(db.to_string())))
+            }
+            _ => Err(e),
+        },
     }
 }
 
@@ -478,6 +523,19 @@ pub fn install_argv(engine: Engine) -> Option<Vec<String>> {
 /// to a client that will read it as a syntax error is worse than saying nothing.
 pub fn hint_line(engine: Engine, s: &Settings) -> String {
     hint_line_from(engine, s, &crate::snippets::list())
+}
+
+/// True when the configured command really is this engine's own client, even
+/// wrapped: `docker exec -it db psql` still takes psql's flags, `pgcli` does
+/// not. Every one-shot form is spelled in the real client's flags, so this is
+/// the gate in front of them - a `-c` handed to pgcli is a usage error, and one
+/// invented for it would be a guess.
+pub fn speaks_client_flags(engine: Engine, s: &Settings) -> bool {
+    engine.client_argv(s).iter().any(|w| {
+        std::path::Path::new(w)
+            .file_name()
+            .is_some_and(|f| f == engine.default_client())
+    })
 }
 
 /// The half that decides, kept apart from the half that reads the disk, so it

@@ -26,6 +26,35 @@ pub fn service_path() -> PathBuf {
         .join(".pg_service.conf")
 }
 
+/// The one argument psql is handed: the service block, plus an explicit
+/// `dbname` when another database on the same server was asked for. Keywords
+/// given here win over the service file's own, verified against a real server,
+/// and it is the only place a database can be swapped - `-d` and the bare
+/// positional land in libpq's dbname and username slots instead.
+pub fn conninfo(name: &str, db: Option<&str>) -> String {
+    match db {
+        None => format!("service={name}"),
+        Some(db) => format!("service={name} dbname={}", quote(db)),
+    }
+}
+
+/// libpq conninfo quoting: single quotes around a value with whitespace in it,
+/// a backslash before a quote or a backslash.
+fn quote(v: &str) -> String {
+    if !v.is_empty() && !v.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\') {
+        return v.to_string();
+    }
+    let mut out = String::from("'");
+    for c in v.chars() {
+        if c == '\'' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
 pub fn list() -> Vec<Conn> {
     list_in(&service_path())
 }
