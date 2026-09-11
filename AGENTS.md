@@ -5,8 +5,6 @@ AI-ONLY DOCUMENT. This file exists to give an AI agent the COMPLETE operating pi
 
 Working brief for an AI coding agent, not documentation for people (the README covers that): the rules, invariants and gotchas needed to change this project correctly without rediscovering them.
 
-**What does not belong here.** How to write code - comments, tests, error wording, how to answer, when to commit - is not project knowledge: it comes from `~/dotfiles/development/MYRULES.md`, imported ahead of this file and outranking it. A rule that would be true in any repo is a sign it belongs there instead. Where the two genuinely contradict, ask rather than pick.
-
 ## Hard rules
 - **easysql is a front end and never a client.** It does not speak any wire protocol, does not link a driver, and never invents a store where the client already has one: it writes `~/.pg_service.conf`, `~/.pgpass`, `~/.my.cnf` and hands the terminal to the real `psql`/`mysql`/`sqlite3`. That is what keeps `\c`, `.psqlrc`, every script and every GUI on the machine working, and it is what makes uninstalling easysql cost nothing. A feature that requires holding a connection open is out of scope, not a missing dependency.
 - **Never leave somebody with a tool that does not work.** `cargo install easysql` cannot bring the clients, because they are not Rust; that is a reason to handle it, not an excuse. Anywhere a missing client can be discovered, easysql names the *one* command this machine needs (`engines::install_argv` walks PATH for apt-get/pacman/dnf/zypper/apk) and, in the TUI, offers to run it suspended so sudo and the package manager can both prompt. Printing three distros' worth of guesses is not help, and an errno from a failed spawn is not an error message. When a manager or a package name is not known for certain, `package()` returns `None` and we name the program rather than inventing a package that does not exist.
@@ -71,11 +69,9 @@ Working brief for an AI coding agent, not documentation for people (the README c
 - `dev/db.sh up` starts a throwaway postgres and mariadb in podman (or docker) to point connections at; `dev/db.sh down` removes them. The *clients* still have to be installed on the machine, because easysql never talks to a database itself.
 
 ## The README pictures
-- `demo/` is the rig that renders every image in `readme-assets/`, and it is committed because it is the *source* of those assets the way a build script is the source of a binary. Never capture a frame by hand and never crop one: change the tool, rerun the tape.
-- `demo/stage.sh up` builds a fake HOME in `demo/home/` (gitignored), seeds every file easysql reads, starts two throwaway podman containers on 127.0.0.1:55432 and :53306 so a session really opens, and stamps `.easysql-demo-stage`; `down` refuses to delete anything without that marker. `./stage.sh shell` opens a shell where `esql` is this build, and it **refuses to open one when the stage is missing** - without that guard a mistyped path renders the real `~/.pg_service.conf` into a published image, which has already happened once in this repo.
-- Three tapes, run one at a time (two sharing the stage delete each other's fixtures mid-take, and the symptom is identical images rather than an error): `shots.tape` for the TUI stills, `cli.tape` for the CLI ones (its own tape because the frame is sized to its content), `demo.tape` for the GIF. All three set `Catppuccin Mocha` and `JetBrainsMono NF`, which is the house style shared with the sibling crates.
+- `demo/stage.sh up` builds a fake HOME in `demo/home/` (gitignored), seeds every file easysql reads, starts two throwaway podman containers on 127.0.0.1:55432 and :53306 so a session really opens, and stamps `.easysql-demo-stage`. The stage guard exists here because a mistyped path once rendered the real `~/.pg_service.conf` into a published image.
+- Three tapes, run one at a time (two sharing the stage delete each other's fixtures mid-take, and the symptom is identical images rather than an error): `shots.tape` for the TUI stills, `cli.tape` for the CLI ones (its own tape because the frame is sized to its content), `demo.tape` for the GIF.
 - Tabs move with `Tab`, never a number key; a tape that types `2` silently captures the same frame four times.
-- The README is never allowed to mention `demo/`: it is read by people installing the crate, who got a package with `demo/` excluded.
 
 ## Overview
 Layout:
