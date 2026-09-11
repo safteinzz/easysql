@@ -1,4 +1,6 @@
-# Every still in the README, rendered straight into ../readme-assets/.
+# The TUI's one still in the README, Settings, rendered into ../readme-assets/.
+# Every screen you act on is a GIF of its own tape instead; a still is kept for
+# a screen that shows everything at once.
 #
 #   cd demo && ./stage.sh up && vhs shots.tape && ./stage.sh down
 #
@@ -31,56 +33,15 @@ Enter
 Sleep 2s
 Show
 
-# --- the Connections list, which is what you see first ----------------------
-# Up, sleeping-tunnel and unreachable all in one frame, with the detail panel
-# open on the connection the rest of the README talks about.
 Type "esql"
 Enter
 Sleep 3s
-Screenshot ../readme-assets/connections.png
-Sleep 700ms
-
-# --- the detail panel on a connection that needs a tunnel -------------------
-Down
-Sleep 300ms
-Down
-Sleep 300ms
-Down
-Sleep 2.5s
-Screenshot ../readme-assets/tunnel-aware.png
-Sleep 700ms
-
-# --- the connection wizard, showing the command it will run -----------------
-Escape
-Sleep 300ms
-Type "e"
-Sleep 1.5s
-Screenshot ../readme-assets/wizard.png
-Sleep 700ms
-Escape
-Sleep 500ms
-
-# --- the Passwords tab ------------------------------------------------------
-# Long enough for the status line from the Escape above to expire: a status
-# lasts 3s everywhere, and a shot taken inside that window carries a green
-# "cancelled" that has nothing to do with the tab being photographed.
 Tab
-Sleep 3.5s
-Screenshot ../readme-assets/passwords.png
-Sleep 700ms
-
-# --- the Tunnels tab, each forward naming the connection it serves ----------
+Sleep 300ms
 Tab
-Sleep 2s
-Screenshot ../readme-assets/tunnels.png
-Sleep 700ms
-
-# --- the Snippets tab, and what `:name` runs --------------------------------
+Sleep 300ms
 Tab
-Sleep 2s
-Screenshot ../readme-assets/snippets.png
-Sleep 700ms
-
+Sleep 300ms
 # --- the Settings tab -------------------------------------------------------
 Tab
 Sleep 2s

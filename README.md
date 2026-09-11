@@ -20,96 +20,116 @@ The real clients have to be on the machine, and cargo cannot bring them: they
 are not Rust. easysql works out the one command *your* machine needs and offers
 to run it, so you never have to go and find out.
 
-![The easysql tour: opening a saved postgres connection into a real psql session, coming back to the list, inspecting a connection that needs an ssh tunnel, editing one in the wizard, filtering, and the Passwords, Tunnels, Snippets and Settings tabs](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/demo.gif)
+## Browse and connect
 
-## What you see first
+![Moving down the connection list to a postgres connection whose tunnel is not running, pressing Enter to reopen it into a real psql session, then turning that forward off on the Tunnels tab](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/browse.gif)
 
-Every connection you have saved, from every engine, in one list. Green answered,
-red did not, yellow means the tunnel it needs is not running - whatever answered
-on that port cannot be the database, so it is worth knowing before you go in. `pw` is a password
-already on file, and `no client` is the program that would open it missing.
+Legend: green answered, red did not, yellow means the tunnel it needs is not
+running; `pw` is a password on file, `no client` the program that opens it is
+missing, and a blue name refuses writes.
 
-![The Connections tab listing seven connections across postgres, mysql, sqlite and sqlserver, with a details panel showing host, port, database, user and the psql command that will run](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/connections.png)
+```bash
+esql                        # the toolbox
+esql warehouse              # straight into one, tunnel and all
+```
 
-## When it needs a tunnel
+Every connection you have saved, from every engine, in one list, with where it
+points and whether it answers. A yellow dot is not a dead server: whatever
+answers on that port cannot be the database, so it is worth knowing before you
+go in.
 
 A forward dies with a reboot; the connection that needs it does not. easysql
-remembers which one, says so before you press anything, and Enter reopens it and
-connects in one step.
+remembers which one, and Enter reopens it and connects in one step. The Tunnels
+tab lists every forward it knows about, the running ones and the remembered
+ones, and `↵` turns one off or back on.
 
-![The details panel for a connection whose tunnel is closed, reading "tunnel to bastion is not open - Enter reopens it and connects", with the ssh -L command it will run](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnel-aware.png)
+## Edit a connection
 
-## The command, built for you
+![Editing a postgres connection: the preview follows the database as it is typed, then Read only is switched on and the saved connection's name turns blue](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/edit.gif)
 
-The wizard shows the command it is building and what that command resolves to,
-so nothing about it is a surprise. Keys you added by hand are carried through
-untouched, and the file is backed up before every write.
+```bash
+esql analytics 'select count(*) from orders'   # rows, as usual
+esql analytics 'truncate orders'               # ERROR: cannot execute TRUNCATE TABLE in a read-only transaction
+esql ls -v                                     # marks it (read-only)
+```
 
-![The edit wizard for a postgres connection, with name, host, port, database, user and sslmode fields, previewing both the psql command and the user@host:port/database it resolves to](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/wizard.png)
+`e` opens the form with the command it builds and what that command resolves
+to, updated as you type. Keys you added by hand are carried through untouched,
+and the file is backed up before every write.
+
+**Read only** makes every session on it refuse writes: a Postgres connection
+gets `default_transaction_read_only` in its service block, so pgAdmin and every
+driver using that service get it too, and a SQLite one opens its file with
+`-readonly`. Before going in on a Postgres connection, easysql asks the server
+whether writes really are refused, and stops if they are not - a connection
+pooler such as pgbouncer can drop the setting on the way.
+
+It is a guardrail, not a permission: a session can switch it back off, so a
+production database also wants a login role granted nothing but `SELECT`.
 
 ## Passwords, where the client looks
+
+![Saving a password for the one connection without one, typed as dots, then the Passwords tab listing it among the others, never shown](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/passwords.gif)
 
 Typed once into a hidden field, written straight to the file that engine's
 client reads, and never read back, never echoed, never put in an argv or an
 environment variable. easysql only ever shows you that one exists.
 
-![The Passwords tab listing five saved passwords by engine, host, database and user, each shown as dots, with a details panel noting the password itself is never read back](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/passwords.png)
-
-## Tunnels are just `ssh -L`
-
-Opened from the connection that needs one, with every field already filled in.
-Each forward says which connection it serves, and every one this tool knows about
-is listed - the ones running and the ones a connection remembers - so `↵` turns
-one back on and `d` kills it.
-
-![The Tunnels tab listing three forwards, two on and one off, each labelled with the connection it serves, with a details panel showing the ssh -N -L command and the kill command](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/tunnels.png)
-
 ## Saved queries
 
-The check you keep rewriting, kept as a `.sql` file and run against any
-connection. easysql hands each client the flag it wants, so the same word works
-on every engine.
+![Making a saved query in the Snippets tab as one line, then opening its file in vim with o and pasting a longer version, which the details panel then shows](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.gif)
 
-```sh
+```bash
 esql app :tables       # → psql … -c
 esql notes :tables     # → sqlite3 … (bare argument)
 ```
 
-![The Snippets tab listing three saved queries with the :name that runs each, and a details panel showing the SQL, the file it lives in and the command that runs it](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.png)
+![Running esql app :tables from the shell, printing the table list from the connection](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippet-run.png)
+
+The check you keep rewriting, kept as a `.sql` file and run against any
+connection. easysql hands each client the flag it wants, so the same word works
+on every engine, and `o` opens the file in your `$EDITOR` for a longer one.
 
 For Postgres they also become `\set` shortcuts in `~/.psqlrc`, so `:tables`
 expands at the psql prompt too. Your own lines in that file are left alone.
 
-![Running esql app :tables from the shell, printing the table list from the connection](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippet-run.png)
-
 ## Settings
+
+![The Settings tab showing nine settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
 Which program opens each engine, whether ports are checked, what order the list
 is in. `d` puts any of them back.
-
-![The Settings tab showing eight settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
 ## Commands
 
 The handful of things faster to type than to click. Everything else is in the
 toolbox, where `?` lists every key.
 
-```sh
+```bash
 esql                        # the toolbox
 esql prod                   # open a saved connection
 esql prod 'select 1'        # run one query and exit, like `ssh host 'cmd'`
 esql prod/reporting         # the same connection, another database
-esql prod :tables           # run a saved query against it
+esql prod -c 'select 1'     # anything starting with - goes to the client
 esql ls                     # list them, one name per line
 esql ls -v                  # ...and where each one points
 ```
 
-Rows go to stdout and easysql's own words to stderr, and the exit code is the
-client's, so a one-shot is safe to pipe. An argument starting with `-` goes
-straight to the client (`esql prod -c 'select 1'`), as does everything after
-`--`.
+`esql --help` and `esql <command> --help` have the rest.
 
-![esql ls -v printing seven connections with their engine, name and user@host:port/database](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)
+![esql ls -v printing seven connections with their engine, name and user@host:port/database, one marked read-only](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)
+
+## Keys
+
+| key | does |
+| --- | --- |
+| `↑` `↓` / `k` `j` | move in the list |
+| `←` `→` / `h` `l` / `Tab` | switch tab |
+| `/` | filter the list; `Enter` keeps it, `Esc` drops it |
+| `?` | every key this tab answers to |
+| `q` / `Ctrl-C` | quit |
+
+Each tab's own keys are on its bottom line, and `?` lists them all.
 
 ## What it edits
 
@@ -140,6 +160,11 @@ offers the step that would actually get you in:
   read and runs them, so uninstalling it costs you nothing.
 - apt, pacman, dnf, zypper and apk are recognised for the install offer. On
   anything else easysql names the program rather than guessing a package.
+- From a script: rows go to stdout and easysql's own words to stderr. Once the
+  client starts, the exit code is the client's; before that easysql exits 2 for
+  a name, snippet or `/db` it cannot use, 127 when there is no client to run,
+  and 1 when a tunnel it needs will not open or a read-only connection would
+  not be read-only.
 
 ## Compatibility
 

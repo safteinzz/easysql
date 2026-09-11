@@ -60,6 +60,7 @@ env_for_stage() {
        "TERM=${TERM:-xterm-256color}" \
        "COLORTERM=truecolor" \
        "LANG=C.UTF-8" \
+       "EDITOR=vim" \
        "PGCONNECT_TIMEOUT=5"
 }
 
@@ -71,7 +72,8 @@ write_pg() {
   # The file libpq itself reads. `app` is the live container, `warehouse` is
   # behind a tunnel that is not running, `analytics` is a documentation name
   # that will never resolve - so the list shows up, sleeping and down at once
-  # instead of a wall of one colour.
+  # instead of a wall of one colour. `analytics` is also the read-only one, the
+  # connection you would hand an agent.
   cat > "$STAGE/.pg_service.conf" <<EOF
 # ~/.pg_service.conf - read by psql, pgAdmin, DBeaver and every libpq driver.
 # easysql rewrites one [section] at a time and leaves the rest of the file alone.
@@ -100,16 +102,17 @@ port=5432
 dbname=metrics
 user=reader
 sslmode=verify-full
+options=-c default_transaction_read_only=on
 EOF
 }
 
 write_pgpass() {
   # host:port:database:user:password, with * as a wildcard. libpq refuses to
-  # read it at all unless it is 0600, which is why easysql chmods it.
+  # read it at all unless it is 0600, which is why easysql chmods it. `metrics`
+  # has none, so the Passwords GIF has one to save.
   cat > "$STAGE/.pgpass" <<EOF
 127.0.0.1:$PG_PORT:app:dev:devpass
 127.0.0.1:$TUN_PORT:reporting:analyst:devpass
-127.0.0.1:15432:metrics:grafana:devpass
 db.example.com:5432:*:reader:devpass
 EOF
   chmod 600 "$STAGE/.pgpass"
@@ -200,6 +203,63 @@ select relname, pg_size_pretty(pg_total_relation_size(c.oid)) as size
  order by pg_total_relation_size(c.oid) desc
  limit 10;
 EOF
+}
+
+write_ssh_shim() {
+  # The stage's ssh. easysql opens a forward as `ssh -N -L <spec> <host>` and
+  # trusts it only while /proc/<pid>/cmdline still carries that flag, spec and
+  # host, so this keeps them as its own arguments and really forwards <local>
+  # to the staged Postgres - which is what lets Enter on `warehouse` reopen its
+  # tunnel and land in a real session. It exits once the stage is gone, so no
+  # teardown can leave it listening.
+  mkdir -p "$BIN"
+  cat > "$BIN/ssh" <<EOF
+#!/bin/sh
+exec python3 -c '
+import os, socket, sys, threading, time
+local = int(sys.argv[sys.argv.index("-L") + 1].split(":")[0])
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", local))
+srv.listen(16)
+def pump(a, b):
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    for s in (a, b):
+        try:
+            s.close()
+        except OSError:
+            pass
+def serve():
+    while True:
+        near, _ = srv.accept()
+        far = socket.create_connection(("127.0.0.1", $PG_PORT))
+        threading.Thread(target=pump, args=(near, far), daemon=True).start()
+        threading.Thread(target=pump, args=(far, near), daemon=True).start()
+threading.Thread(target=serve, daemon=True).start()
+while os.path.exists("$STAGE/$MARKER"):
+    time.sleep(1)
+' "\$@"
+EOF
+  chmod +x "$BIN/ssh"
+}
+
+write_vim_shim() {
+  # The editor `o` opens. `-u DEFAULTS` skips this machine's vimrc, system one
+  # included, so the frame is the same on every machine that renders it; a word
+  # in EDITOR itself would be split apart by `env -i $(env_for_stage)`.
+  mkdir -p "$BIN"
+  cat > "$BIN/vim" <<'EOF'
+#!/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin exec vim -u DEFAULTS "$@"
+EOF
+  chmod +x "$BIN/vim"
 }
 
 write_ssh_config() {
@@ -330,6 +390,19 @@ insert into customer (name, email) values
   ('Alan Turing',     'alan@example.com'),
   ('Katherine Johnson','katherine@example.com');
 SQL
+  # `warehouse` is `analyst` on `reporting`, reached through the forward the
+  # stage's ssh opens, so its session has something of its own to show.
+  PGPASSWORD=devpass psql -h 127.0.0.1 -p "$PG_PORT" -U dev -d app -q \
+    -c "create role analyst login password 'devpass'" > /dev/null 2>&1 || true
+  PGPASSWORD=devpass psql -h 127.0.0.1 -p "$PG_PORT" -U dev -d app -q \
+    -c "create database reporting owner analyst" > /dev/null 2>&1 || true
+  PGPASSWORD=devpass psql -h 127.0.0.1 -p "$PG_PORT" -U analyst -d reporting -q <<'SQL' > /dev/null 2>&1 || true
+create table if not exists sales (region text not null, quarter text not null, total numeric not null);
+truncate sales;
+insert into sales values
+  ('north', 'Q1', 48210), ('south', 'Q1', 39875),
+  ('east',  'Q1', 51402), ('west',  'Q1', 27330);
+SQL
 }
 
 up() {
@@ -345,6 +418,8 @@ up() {
   write_easysql_conf
   write_snippets
   write_ssh_config
+  write_ssh_shim
+  write_vim_shim
   make_sqlite_db
   seed_history
   seed_tunnels
