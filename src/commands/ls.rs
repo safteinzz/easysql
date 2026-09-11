@@ -34,7 +34,7 @@ pub fn run(args: Args) {
             .max()
             .unwrap_or(0);
         for c in &conns {
-            // Words rather than the TUI's eye, because this is the line a
+            // Words rather than the TUI's colour, because this is the line a
             // script or an agent reads to pick the connection it may use.
             let ro = if c.read_only() { "  (read-only)" } else { "" };
             println!(

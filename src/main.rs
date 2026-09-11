@@ -36,11 +36,8 @@ use clap::{Parser, Subcommand};
 const TEMPLATE: &str =
     "{about-with-newline}\n{usage-heading} {usage}\n\n{before-help}{all-args}{after-help}\n";
 
-/// Shown under `esql --help`: the shapes clap cannot list, because most of this
-/// tool is not a subcommand, and then the contract a script needs. Read top to
-/// bottom by somebody - or something - looking for the one line that answers
-/// "how do I ask this database a question", so that line is in the block rather
-/// than in prose below it.
+/// Shown under `esql --help`, above the command list: the shapes clap cannot
+/// list, because most of this tool is not a subcommand.
 const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
   esql                       open the toolbox (TUI): connections, passwords, tunnels, saved queries
   esql <name>                open a saved connection (e.g. `esql prod`, or `esql pg:prod`)
@@ -52,10 +49,11 @@ const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
 /// The rest of the block: what a script can expect, then where to look next.
 const AFTER: &str = concat!(
     "\
-Rows go to stdout and easysql's own words to stderr, so a pipe carries only
-data, and the exit code is the client's own: a `psql` that refuses to connect
-exits 2 for its own reasons, not for easysql's. Everything after `--` reaches
-the client untouched.
+Rows go to stdout and easysql's own words to stderr. Once the client starts,
+the exit code is the client's; before that easysql exits 2 for a name, snippet
+or `/db` it cannot use, 127 when there is no client to run, and 1 when a tunnel
+it needs will not open or a read-only connection would not be read-only.
+Everything after `--` reaches the client untouched.
 Run `esql <command> --help` for a command's details.",
     "\n\n",
     env!("CARGO_PKG_REPOSITORY"),
@@ -83,8 +81,6 @@ const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about,
-    // The shapes come first: this is a bare-first binary, so the command list is
-    // the leftovers and burying them above it answers the wrong question first.
     help_template = TEMPLATE,
     before_help = WAYS,
     after_help = AFTER

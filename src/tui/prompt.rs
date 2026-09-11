@@ -101,6 +101,11 @@ impl Field {
     pub(super) fn display(&self) -> String {
         match &self.kind {
             Kind::Text => self.value.clone(),
+            // Two answers are a toggle, painted as chips; this is their plain
+            // text, so the box is measured against what is drawn.
+            Kind::Choice(options) if options.len() == 2 => {
+                format!(" {}    {} ", options[0], options[1])
+            }
             Kind::Choice(options) => format!("‹ {} ›", options[self.choice]),
             Kind::Secret => "•".repeat(self.value.chars().count()),
         }
@@ -175,14 +180,11 @@ pub(super) const SSLMODES: [&str; 6] = [
 /// What SQL Server's certificate answer can be. Validating is first because it
 /// is `sqlcmd`'s own default under ODBC driver 18, and silently waiving it would
 /// be easysql weakening somebody's connection for them.
-pub(super) const TRUST_CERT: [&str; 2] = [
-    "validate the certificate",
-    "trust it (-C, for a self-signed server)",
-];
+pub(super) const TRUST_CERT: [&str; 2] = ["validate", "trust it (-C)"];
 
 /// Whether every session on this connection refuses writes. "no" is first so a
 /// new connection is writable unless somebody decides otherwise.
-pub(super) const READ_ONLY: [&str; 2] = ["no", "yes - writes are refused"];
+pub(super) const READ_ONLY: [&str; 2] = ["no", "yes"];
 
 /// The read-only toggle, starting on what the file already says.
 fn read_only_field(from: Option<&Conn>) -> Field {
@@ -487,9 +489,9 @@ impl Prompt {
     }
 
     /// The connection this form would save, as far as what runs is concerned:
-    /// the typed fields plus the two choices that change the argv. Postgres's
-    /// read-only and encryption live in the service block, not the argv, so
-    /// they are left out rather than faked.
+    /// the typed fields plus the choices that change the argv or the
+    /// environment. Encryption lives only in the service block, so it is left
+    /// out rather than faked.
     fn draft_conn(&self) -> Option<Conn> {
         let (Action::AddConn { engine } | Action::EditConn { engine, .. }) = &self.action else {
             return None;
@@ -504,8 +506,12 @@ impl Prompt {
         if *engine == Engine::MsSql && chose("Certificate") {
             extra.push(("trust_cert".to_string(), "yes".to_string()));
         }
-        if *engine == Engine::Sqlite && chose("Read only") {
-            extra.push(("readonly".to_string(), "yes".to_string()));
+        if chose("Read only") {
+            match engine {
+                Engine::Pg => crate::engines::pg::set_read_only(&mut extra, true),
+                Engine::Sqlite => extra.push(("readonly".to_string(), "yes".to_string())),
+                Engine::MySql | Engine::MsSql => {}
+            }
         }
         let (host, port, database, user) = match engine {
             Engine::Sqlite => (String::new(), String::new(), v(1), String::new()),
@@ -533,7 +539,10 @@ impl Prompt {
                 Some(format!(
                     "esql {}   →   {}",
                     c.name,
-                    super::widgets::shell_join_display(&c.connect_argv(settings))
+                    super::widgets::with_env(
+                        &c.connect_env(settings),
+                        super::widgets::shell_join_display(&c.connect_argv(settings))
+                    )
                 ))
             }
             // The shape of the line, never its secret: the point is to teach the
@@ -627,7 +636,19 @@ pub(super) fn render_prompt(
             Span::styled(format!(":{pad}"), label_style),
         ];
         let value = field.display();
-        let tail = if field.is_choice() {
+        let tail = if let Kind::Choice(options) = &field.kind
+            && options.len() == 2
+        {
+            // A two-option toggle is the house buttons with the picked one
+            // filled; guillemets are kept for a one-of-many pick.
+            for (n, option) in options.iter().enumerate() {
+                if n > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(super::widgets::chip(option, n == field.choice));
+            }
+            String::new()
+        } else if field.is_choice() {
             // A cycled answer, in the colour a form uses for what it will
             // submit; the guillemets are what say it can be stepped.
             let mut style = Style::default().fg(Color::Cyan);
@@ -717,4 +738,43 @@ pub(super) fn render_prompt(
         .block(super::widgets::box_block(Color::Cyan, &p.title))
         .wrap(Wrap { trim: false });
     f.render_widget(para, rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    #[test]
+    fn the_form_preview_is_the_argv_enter_runs() {
+        let s = Settings::default();
+        let file = Conn {
+            engine: Engine::Sqlite,
+            name: "notes".into(),
+            host: String::new(),
+            port: String::new(),
+            database: "/tmp/notes.db".into(),
+            user: String::new(),
+            extra: vec![("readonly".into(), "yes".into())],
+        };
+        let server = Conn {
+            engine: Engine::MsSql,
+            name: "selfsigned".into(),
+            host: "db.example.com".into(),
+            port: String::new(),
+            database: "app".into(),
+            user: "sa".into(),
+            extra: vec![("trust_cert".into(), "yes".into())],
+        };
+        for c in [file, server] {
+            let enter = super::super::widgets::shell_join_display(&c.connect_argv(&s));
+            let preview = Prompt::edit_conn(&c)
+                .command_preview(&s)
+                .expect("a named connection has a preview");
+            assert!(
+                preview.ends_with(&enter),
+                "the preview must be what Enter runs\n preview: {preview}\n   enter: {enter}"
+            );
+        }
+    }
 }

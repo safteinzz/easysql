@@ -29,7 +29,11 @@ pub fn store_path() -> PathBuf {
 }
 
 pub fn list() -> Vec<Conn> {
-    ini::read(&store_path())
+    list_in(&store_path())
+}
+
+pub fn list_in(path: &std::path::Path) -> Vec<Conn> {
+    ini::read(path)
         .into_iter()
         .map(|s| Conn {
             engine: Engine::MsSql,
@@ -117,4 +121,38 @@ pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<
     argv.push("-Q".into());
     argv.push("select 1".into());
     (argv, vec![("SQLCMDPASSWORD".to_string(), String::new())])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_saved_trust_cert_reaches_the_sqlcmd_argv() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("easysql-mssql-{}-{stamp}.conf", std::process::id()));
+        std::fs::write(
+            &path,
+            "[selfsigned]\nhost=db.example.com\ndatabase=app\nuser=sa\ntrust_cert=yes\n\n[strict]\nhost=db.example.com\n",
+        )
+        .unwrap();
+        let conns = list_in(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let argv = |name: &str| {
+            let c = conns.iter().find(|c| c.name == name).expect(name);
+            flags(c, None)
+        };
+        assert!(
+            argv("selfsigned").contains(&"-C".to_string()),
+            "a certificate the file says to trust must be trusted when read back: {:?}",
+            argv("selfsigned")
+        );
+        assert!(!argv("strict").contains(&"-C".to_string()));
+    }
 }

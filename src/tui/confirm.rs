@@ -219,7 +219,7 @@ impl App {
             ConfirmAction::InstallClient { engine } => {
                 if let Some(argv) = engines::install_argv(engine) {
                     return Some(PendingRun {
-                        label: shell_join(&argv),
+                        label: super::widgets::shell_join_display(&argv),
                         argv,
                         connect: None,
                     });

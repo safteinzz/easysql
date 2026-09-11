@@ -46,13 +46,26 @@ fn read_only_values(options: &str) -> Vec<(usize, usize, String)> {
             _ => ("", 1),
         };
         if let Some((name, value)) = setting.split_once('=')
-            && name.replace('-', "_") == READ_ONLY
+            && name.replace('-', "_").eq_ignore_ascii_case(READ_ONLY)
         {
             hits.push((i, span, value.to_ascii_lowercase()));
         }
         i += span;
     }
     hits
+}
+
+/// `PGOPTIONS` for a read-only session: whatever the environment already had,
+/// with the read-only setting appended so it wins. pgcli builds its own
+/// connection from the service file and drops `options` (verified: a pgcli
+/// session showed `default_transaction_read_only = off` and took a write), but
+/// every libpq client reads this variable.
+pub fn read_only_pgoptions() -> String {
+    let ours = format!("-c {READ_ONLY}=on");
+    match std::env::var("PGOPTIONS") {
+        Ok(had) if !had.trim().is_empty() => format!("{} {ours}", had.trim()),
+        _ => ours,
+    }
 }
 
 /// Whether this block makes every session read-only, however that line got
@@ -62,7 +75,13 @@ pub fn read_only(extra: &[(String, String)]) -> bool {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("options"))
         .and_then(|(_, v)| read_only_values(v).pop())
-        .is_some_and(|(_, _, v)| matches!(v.as_str(), "on" | "true" | "yes" | "1"))
+        .is_some_and(|(_, _, v)| truthy(&v))
+}
+
+/// A Postgres boolean that means on: `on`, `1`, or any prefix of `true` or
+/// `yes`, which is how the server reads `t`, `y` and `tru` as well.
+fn truthy(v: &str) -> bool {
+    v == "on" || v == "1" || (!v.is_empty() && ("true".starts_with(v) || "yes".starts_with(v)))
 }
 
 /// Set or clear read-only in the block's `options`, keeping every other token
@@ -98,6 +117,82 @@ pub fn set_read_only(extra: &mut Vec<(String, String)>, on: bool) {
     }
 }
 
+/// What the server says, asked just before a read-only session, about whether
+/// that session will really refuse writes.
+pub enum ReadOnlyCheck {
+    Holds,
+    /// It answered `off`: something between here and the server dropped the
+    /// setting on the way in.
+    Writable,
+    /// The setting was refused outright, in the refuser's own words.
+    Refused(String),
+    /// No answer to go on - no psql, a password it would have to prompt for, a
+    /// timeout - in the client's own words.
+    Unknown(String),
+}
+
+impl ReadOnlyCheck {
+    /// What to say when this answer means not going in: a headline and what to
+    /// do about it. `None` for the answers that let the session go ahead.
+    pub fn refusal(&self, name: &str) -> Option<(String, String)> {
+        const FIX: &str = "a pooler's admin can let it through with \
+                           `track_extra_parameters = default_transaction_read_only` in pgbouncer";
+        match self {
+            ReadOnlyCheck::Holds | ReadOnlyCheck::Unknown(_) => None,
+            ReadOnlyCheck::Writable => Some((
+                format!(
+                    "`{name}` is marked read-only, but the server says this session could \
+                     write, so easysql will not go in."
+                ),
+                format!(
+                    "something between here and the server dropped the setting - pgbouncer does \
+                     with `options` in its `ignore_startup_parameters`; {FIX}."
+                ),
+            )),
+            ReadOnlyCheck::Refused(said) => Some((
+                format!("the read-only setting was refused on the way in: {said}"),
+                format!("that is a connection pooler, which refuses it by default; {FIX}."),
+            )),
+        }
+    }
+}
+
+/// Ask the server, the way the failure probe does - psql, `-w` so nothing can
+/// prompt, a deadline - whether a session on this read-only connection really
+/// refuses writes. The service's `options` are only a request: pgbouncer drops
+/// it silently when `options` is in `ignore_startup_parameters` (verified), so
+/// without asking, the blue name could be on a connection that writes.
+pub fn check_read_only(c: &Conn, db: Option<&str>, timeout: u64) -> ReadOnlyCheck {
+    let out = std::process::Command::new("psql")
+        .args([
+            conninfo(&c.name, db).as_str(),
+            "-X",
+            "-w",
+            "-tAc",
+            "show default_transaction_read_only",
+        ])
+        .env("PGCONNECT_TIMEOUT", timeout.to_string())
+        .env_remove("PGOPTIONS")
+        .output();
+    let Ok(out) = out else {
+        return ReadOnlyCheck::Unknown("`psql` is not installed to ask".to_string());
+    };
+    let said = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if out.status.success() {
+        return match said(&out.stdout).as_str() {
+            "on" => ReadOnlyCheck::Holds,
+            _ => ReadOnlyCheck::Writable,
+        };
+    }
+    let err = said(&out.stderr);
+    let line = err.lines().next().unwrap_or_default().to_string();
+    if err.contains("unsupported startup parameter in options") {
+        ReadOnlyCheck::Refused(line)
+    } else {
+        ReadOnlyCheck::Unknown(line)
+    }
+}
+
 /// The one argument psql is handed: the service block, plus an explicit
 /// `dbname` when another database on the same server was asked for. Keywords
 /// given here win over the service file's own, verified against a real server,
@@ -105,8 +200,8 @@ pub fn set_read_only(extra: &mut Vec<(String, String)>, on: bool) {
 /// positional land in libpq's dbname and username slots instead.
 pub fn conninfo(name: &str, db: Option<&str>) -> String {
     match db {
-        None => format!("service={name}"),
-        Some(db) => format!("service={name} dbname={}", quote(db)),
+        None => format!("service={}", quote(name)),
+        Some(db) => format!("service={} dbname={}", quote(name), quote(db)),
     }
 }
 
@@ -177,4 +272,83 @@ pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<
     argv.push("select 1".into());
     let env = vec![("PGCONNECT_TIMEOUT".to_string(), s.probe_timeout.to_string())];
     (argv, env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_options(options: &str) -> Vec<(String, String)> {
+        vec![
+            ("sslmode".to_string(), "require".to_string()),
+            ("options".to_string(), options.to_string()),
+        ]
+    }
+
+    fn options(extra: &[(String, String)]) -> Option<&str> {
+        extra
+            .iter()
+            .find(|(k, _)| k == "options")
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn read_only_keeps_every_other_option_and_drops_an_empty_key() {
+        let mut extra = with_options("-c statement_timeout=5000");
+        set_read_only(&mut extra, true);
+        assert!(read_only(&extra), "switching it on must read back as on");
+        assert!(
+            options(&extra).is_some_and(|o| o.contains("statement_timeout=5000")),
+            "a setting somebody wrote by hand survives: {extra:?}"
+        );
+
+        set_read_only(&mut extra, false);
+        assert!(!read_only(&extra));
+        assert_eq!(options(&extra), Some("-c statement_timeout=5000"));
+
+        let mut only = with_options("-c default_transaction_read_only=on");
+        set_read_only(&mut only, false);
+        assert_eq!(
+            options(&only),
+            None,
+            "an emptied `options` key goes: {only:?}"
+        );
+        assert_eq!(only.len(), 1, "and every other key stays: {only:?}");
+    }
+
+    #[test]
+    fn every_spelling_and_boolean_the_server_reads_as_on_counts_as_read_only() {
+        for on in [
+            "-c default_transaction_read_only=on",
+            "-cdefault_transaction_read_only=on",
+            "--default-transaction-read-only=on",
+            "-c DEFAULT_TRANSACTION_READ_ONLY=on",
+            "-c default_transaction_read_only=t",
+            "-c default_transaction_read_only=y",
+            "-c default_transaction_read_only=1",
+        ] {
+            assert!(read_only(&with_options(on)), "the server enforces `{on}`");
+        }
+        for off in [
+            "-c default_transaction_read_only=off",
+            "-c default_transaction_read_only=on -c default_transaction_read_only=off",
+            "-c statement_timeout=5000",
+        ] {
+            assert!(
+                !read_only(&with_options(off)),
+                "the server allows writes with `{off}`"
+            );
+        }
+    }
+
+    #[test]
+    fn service_and_database_names_are_quoted_the_way_libpq_reads_them() {
+        assert_eq!(conninfo("prod", None), "service=prod");
+        assert_eq!(conninfo("prod", Some("app")), "service=prod dbname=app");
+        assert_eq!(
+            conninfo("my db", Some("it's")),
+            r"service='my db' dbname='it\'s'",
+            "a space or a quote would otherwise split libpq's parse"
+        );
+    }
 }

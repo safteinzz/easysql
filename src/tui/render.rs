@@ -149,9 +149,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         ("", Style::default())
                     };
-                    // A colour rather than a glyph: rarer codepoints fall back
-                    // to the wrong character in some fonts, and the detail
-                    // panel says in words what the blue means.
+                    // The detail panel says in words what this colour means.
                     let name_style = if c.read_only() {
                         bold.fg(READ_ONLY_COLOR)
                     } else {

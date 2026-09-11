@@ -206,12 +206,12 @@ impl App {
         match action {
             Action::AddConn { engine } | Action::EditConn { engine, .. } => {
                 if v[0].is_empty() {
-                    self.set_status("a name is required");
+                    self.set_failed("a name is required");
                     self.prompt = Some(prompt);
                     return None;
                 }
                 if engine == Engine::Sqlite && v[1].is_empty() {
-                    self.set_status("a database file is required");
+                    self.set_failed("a database file is required");
                     self.prompt = Some(prompt);
                     return None;
                 }
@@ -311,7 +311,7 @@ impl App {
 
             Action::Snippet { original } => {
                 if v[0].is_empty() || v[1].is_empty() {
-                    self.set_status("a snippet needs a name and some SQL");
+                    self.set_failed("a snippet needs a name and some SQL");
                     self.prompt = Some(prompt);
                     return None;
                 }
@@ -323,6 +323,7 @@ impl App {
                         }
                         self.goto_view(View::Snippets);
                         self.refresh_snippets();
+                        self.select_snippet(&v[0]);
                         // psql is the one client that can also expand `:name`
                         // at its own prompt, so its rc file is kept in step.
                         let also = match crate::snippets::sync_psqlrc() {
@@ -352,7 +353,7 @@ impl App {
                 // value in this program that is never echoed back anywhere.
                 let password = v.last().cloned().unwrap_or_default();
                 if password.is_empty() {
-                    self.set_status("a password is required (Esc cancels)");
+                    self.set_failed("a password is required (Esc cancels)");
                     self.prompt = Some(prompt);
                     return None;
                 }
@@ -384,7 +385,7 @@ impl App {
                     (&db_port, "the database port"),
                 ] {
                     if value.is_empty() {
-                        self.set_status(format!("tunnel: {what} is required"));
+                        self.set_failed(format!("tunnel: {what} is required"));
                         self.prompt = Some(prompt);
                         return None;
                     }

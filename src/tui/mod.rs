@@ -108,6 +108,7 @@ const STATUS_TTL: Duration = Duration::from_secs(3);
 /// it can own the terminal - which here is only ever a database client.
 pub(super) struct PendingRun {
     pub(super) argv: Vec<String>,
+    /// What the status line says ran. For a reader, so a home path is `~`.
     pub(super) label: String,
     /// The connection, when this run is an interactive session. Carried whole
     /// rather than by name because a failed open is diagnosed against it.
@@ -498,6 +499,17 @@ impl App {
         }
     }
 
+    /// The same for a saved query, after adding or renaming one.
+    pub(super) fn select_snippet(&mut self, name: &str) {
+        let at = self
+            .snippet_rows()
+            .iter()
+            .position(|&r| self.snippets[r].name == name);
+        if let Some(i) = at {
+            self.snippet_state.select(Some(i));
+        }
+    }
+
     /// The same for a connection, after adding or renaming one.
     pub(super) fn select_conn(&mut self, key: &str) {
         let at = self
@@ -635,6 +647,18 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
         }
 
         if let Some(run) = app.on_key(key) {
+            // The same question the CLI asks before a read-only session, and
+            // the same refusal, as an alert rather than a session.
+            if let Some(c) = run.connect.as_ref()
+                && c.engine == crate::engines::Engine::Pg
+                && c.read_only()
+                && let Some((headline, fix)) =
+                    crate::engines::pg::check_read_only(c, None, app.settings.probe_timeout)
+                        .refusal(&c.name)
+            {
+                app.alert("not read-only", format!("{headline}\n\n{fix}"));
+                continue;
+            }
             // The same orientation line the CLI prints. It belongs here too, and
             // more so: Enter in the list is the usual way in, and the whole gap
             // it closes is "I am at a prompt and cannot remember this client's
@@ -644,7 +668,12 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 .as_ref()
                 .filter(|_| app.settings.hints)
                 .map(|c| crate::engines::hint_line(c.engine, &app.settings));
-            let status = run_suspended(terminal, &run.argv, hint)?;
+            let env = run
+                .connect
+                .as_ref()
+                .map(|c| c.connect_env(&app.settings))
+                .unwrap_or_default();
+            let status = run_suspended(terminal, &run.argv, &env, hint)?;
 
             if let Some(conn) = run.connect.clone() {
                 match status {
@@ -700,6 +729,12 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 }
             }
             app.refresh_all();
+            // The session just moved it to the top of the list, so the cursor
+            // follows it rather than staying on a row number that now names
+            // another connection.
+            if let Some(conn) = run.connect.as_ref() {
+                app.select_conn(&conn.key());
+            }
             // A dot learned before the session is a claim about a world we
             // stopped watching: the tunnel it went through may have died while
             // the client owned the terminal, and a `\c` inside psql can leave
@@ -716,6 +751,7 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
 fn run_suspended(
     terminal: &mut Term,
     argv: &[String],
+    env: &[(String, String)],
     hint: Option<String>,
 ) -> Result<Option<ExitStatus>> {
     disable_raw_mode()?;
@@ -743,6 +779,7 @@ fn run_suspended(
 
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
         cmd.pre_exec(|| {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGQUIT, libc::SIG_DFL);

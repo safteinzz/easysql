@@ -86,8 +86,7 @@ impl Engine {
         }
     }
 
-    /// The setting that names this engine's client, so a refusal can say which
-    /// line to change rather than "a setting".
+    /// The setting that names this engine's client.
     pub fn client_setting(self) -> &'static str {
         match self {
             Engine::Pg => "psql_command",
@@ -253,6 +252,20 @@ impl Conn {
         }
     }
 
+    /// What a session with this connection needs in its environment on top of
+    /// the argv, so every launcher applies the same thing. Only a read-only
+    /// Postgres connection opened in a client other than psql has any: psql
+    /// applies the service's `options` itself, but a client that reads the
+    /// service file on its own can drop them, as pgcli does.
+    pub fn connect_env(&self, s: &Settings) -> Vec<(String, String)> {
+        match self.engine {
+            Engine::Pg if self.read_only() && !speaks_client_flags(self.engine, s) => {
+                vec![("PGOPTIONS".to_string(), pg::read_only_pgoptions())]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub fn port_or_default(&self) -> String {
         if self.port.is_empty() {
             self.engine.default_port().to_string()
@@ -289,6 +302,12 @@ impl Conn {
             }
             Engine::Sqlite => {
                 if self.read_only() {
+                    // `-readonly` is sqlite3's own flag and litecli rejects it,
+                    // so a read-only connection runs with sqlite3 itself rather
+                    // than open writable or not at all.
+                    if !speaks_client_flags(self.engine, s) {
+                        argv = vec![self.engine.default_client().to_string()];
+                    }
                     argv.push("-readonly".into());
                 }
                 argv.push(
@@ -361,8 +380,7 @@ pub fn list() -> Vec<Conn> {
 
 /// Look a name up the way the CLI does: bare `prod`, or `pg:prod` when two
 /// engines both have one. An ambiguous bare name is an error, never a guess.
-pub fn find(needle: &str) -> Result<Conn> {
-    let all = list();
+fn find_among(all: Vec<Conn>, needle: &str) -> Result<Conn> {
     if let Some((slug, name)) = needle.split_once(':')
         && let Some(engine) = Engine::from_slug(slug)
     {
@@ -389,11 +407,18 @@ pub fn find(needle: &str) -> Result<Conn> {
 /// another database on the same server. The whole string is tried as a name
 /// first, so a connection whose own name contains a slash still resolves.
 pub fn find_target(needle: &str) -> Result<(Conn, Option<String>)> {
-    match find(needle) {
+    find_target_among(list(), needle)
+}
+
+fn find_target_among(all: Vec<Conn>, needle: &str) -> Result<(Conn, Option<String>)> {
+    match find_among(all.clone(), needle) {
         Ok(c) => Ok((c, None)),
+        // An ambiguous name is refused like any other, never reread as a
+        // different connection plus a database: that runs on the wrong host.
+        Err(e) if all.iter().any(|c| c.name == needle) => Err(e),
         Err(e) => match needle.rsplit_once('/') {
             Some((name, db)) if !name.is_empty() && !db.is_empty() => {
-                Ok((find(name)?, Some(db.to_string())))
+                Ok((find_among(all, name)?, Some(db.to_string())))
             }
             _ => Err(e),
         },
@@ -751,5 +776,101 @@ mod tests {
         assert_eq!(Engine::from_slug("pg"), Some(Engine::Pg));
         assert_eq!(Engine::from_slug("postgres"), Some(Engine::Pg));
         assert_eq!(Engine::from_slug("nope"), None);
+    }
+
+    fn read_only(mut c: Conn) -> Conn {
+        match c.engine {
+            Engine::Pg => pg::set_read_only(&mut c.extra, true),
+            _ => c.extra.push(("readonly".into(), "yes".into())),
+        }
+        c
+    }
+
+    fn client(engine: Engine, command: &str) -> Settings {
+        let mut s = Settings::default();
+        s.set(engine.client_setting(), command);
+        s
+    }
+
+    #[test]
+    fn a_wrapper_around_psql_speaks_its_flags_and_pgcli_does_not() {
+        for speaks in ["psql", "/usr/bin/psql", "docker exec -it db psql"] {
+            assert!(
+                speaks_client_flags(Engine::Pg, &client(Engine::Pg, speaks)),
+                "`{speaks}` takes psql's -c"
+            );
+        }
+        for foreign in ["pgcli", "usql"] {
+            assert!(
+                !speaks_client_flags(Engine::Pg, &client(Engine::Pg, foreign)),
+                "`{foreign}` would be handed a flag it rejects"
+            );
+        }
+    }
+
+    #[test]
+    fn pgoptions_goes_to_a_client_other_than_psql_and_only_on_read_only() {
+        let ro = read_only(conn(Engine::Pg, "prod"));
+        let env = ro.connect_env(&client(Engine::Pg, "pgcli"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "PGOPTIONS" && v.contains("default_transaction_read_only=on")),
+            "pgcli drops the service's options, so the setting must travel in PGOPTIONS: {env:?}"
+        );
+        assert!(
+            ro.connect_env(&client(Engine::Pg, "psql")).is_empty(),
+            "psql applies the service's options itself"
+        );
+        assert!(
+            conn(Engine::Pg, "prod")
+                .connect_env(&client(Engine::Pg, "pgcli"))
+                .is_empty(),
+            "a writable connection gets nothing"
+        );
+    }
+
+    #[test]
+    fn a_read_only_sqlite_connection_runs_sqlite3_whatever_client_is_set() {
+        let mut c = read_only(conn(Engine::Sqlite, "notes"));
+        c.database = "/tmp/notes.db".into();
+        let argv = c.connect_argv(&client(Engine::Sqlite, "litecli"));
+        assert_eq!(
+            argv,
+            vec!["sqlite3", "-readonly", "/tmp/notes.db"],
+            "litecli rejects -readonly, so it must not be the one handed it"
+        );
+        let mut writable = conn(Engine::Sqlite, "notes");
+        writable.database = "/tmp/notes.db".into();
+        assert_eq!(
+            writable.connect_argv(&client(Engine::Sqlite, "litecli"))[0],
+            "litecli",
+            "a writable connection still opens in the configured client"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_name_is_refused_rather_than_split() {
+        let named = |engine, name: &str, host: &str| Conn {
+            host: host.into(),
+            ..conn(engine, name)
+        };
+        let all = vec![
+            named(Engine::Pg, "team", "other.example"),
+            named(Engine::Pg, "team/app", "right.example"),
+            named(Engine::Sqlite, "team/app", ""),
+        ];
+        assert!(
+            find_target_among(all.clone(), "team/app").is_err(),
+            "two engines own `team/app`, so it must not become `team` plus database `app`"
+        );
+        let (c, db) = find_target_among(all, "pg:team/app").expect("the engine settles it");
+        assert_eq!((c.host.as_str(), db), ("right.example", None));
+
+        let (c, db) = find_target_among(vec![conn(Engine::Pg, "prod")], "prod/reporting")
+            .expect("an unambiguous name still takes a database");
+        assert_eq!(
+            (c.name.as_str(), db.as_deref()),
+            ("prod", Some("reporting"))
+        );
     }
 }

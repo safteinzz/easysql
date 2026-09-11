@@ -3,7 +3,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::confirm::ConfirmAction;
-use super::widgets::shell_join;
+use super::widgets::{shell_join, shell_join_display, with_env};
 use super::*;
 
 impl App {
@@ -175,7 +175,7 @@ impl App {
                 }
                 let argv = conn.connect_argv(&self.settings);
                 Some(PendingRun {
-                    label: shell_join(&argv),
+                    label: shell_join_display(&argv),
                     argv,
                     connect: Some(conn),
                 })
@@ -235,7 +235,11 @@ impl App {
             // Yank the command, since the reason to leave the toolbox for a
             // connection is almost always to paste it into a script.
             KeyCode::Char('y') => {
-                let cmd = shell_join(&self.selected_conn()?.connect_argv(&self.settings));
+                let c = self.selected_conn()?;
+                let cmd = with_env(
+                    &c.connect_env(&self.settings),
+                    shell_join(&c.connect_argv(&self.settings)),
+                );
                 self.set_status(match crate::clip::copy(&cmd) {
                     Ok(tool) => format!("copied '{cmd}' to the clipboard ({tool})"),
                     Err(e) => format!("clipboard: {e}"),
@@ -327,7 +331,7 @@ impl App {
                 let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
                 argv.push(path.to_string_lossy().into_owned());
                 Some(PendingRun {
-                    label: shell_join(&argv),
+                    label: shell_join_display(&argv),
                     argv,
                     connect: None,
                 })
@@ -366,7 +370,7 @@ impl App {
                 let mut argv: Vec<String> = editor.split_whitespace().map(str::to_string).collect();
                 argv.push(s.path.to_string_lossy().into_owned());
                 Some(PendingRun {
-                    label: shell_join(&argv),
+                    label: shell_join_display(&argv),
                     argv,
                     connect: None,
                 })

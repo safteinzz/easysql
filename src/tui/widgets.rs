@@ -86,6 +86,19 @@ fn needs_quoting(s: &str) -> bool {
             .any(|c| c.is_whitespace() || "\"'\\$`;&|<>()*?[]{}!#~".contains(c))
 }
 
+/// A connection's whole command as a shell would take it: its environment
+/// first, then the already-joined argv. Without the environment a copied line
+/// for a read-only Postgres connection opens a writable session in any client
+/// that drops the service's own `options`.
+pub(super) fn with_env(env: &[(String, String)], argv: String) -> String {
+    let mut parts: Vec<String> = env
+        .iter()
+        .map(|(k, v)| format!("{k}={}", shell_join(std::slice::from_ref(v))))
+        .collect();
+    parts.push(argv);
+    parts.join(" ")
+}
+
 pub(super) fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
@@ -186,6 +199,19 @@ pub(super) fn box_hint(keys: &str) -> Line<'static> {
 /// the hint line does not have to teach them twice, and the picked one is
 /// filled with the border colour rather than merely reversed: a reversed
 /// button reads as "selected", a filled one reads as "this is what Enter does".
+/// One answer of a two-option form toggle: the house button, filled when picked.
+pub(super) fn chip(label: &str, picked: bool) -> Span<'static> {
+    let style = if picked {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
 pub(super) fn box_buttons(colour: Color, yes: bool) -> Line<'static> {
     let button = |label: &str, picked: bool| {
         let style = if picked {

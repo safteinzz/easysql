@@ -62,14 +62,15 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             "read-only: writes are refused",
             Style::default().fg(READ_ONLY_COLOR),
         ));
-        // sqlite3 opens the file read-only, which nothing inside the session
-        // can undo; Postgres only sets a default a session may override.
-        if c.engine == Engine::Pg {
-            lines.push(Line::styled(
-                "a session can undo it; the role's grants are the real limit",
-                dim(),
-            ));
-        }
+        // Neither engine can make it binding: psql can `SET` the default back
+        // and sqlite3 can `.open` the same file again, writable.
+        lines.push(Line::styled(
+            match c.engine {
+                Engine::Pg => "a session can undo it; the role's grants are the real limit",
+                _ => "a session can .open the file writable; its permissions are the real limit",
+            },
+            dim(),
+        ));
     }
     lines.push(match app.history.get(&c.key()) {
         Some(e) => Line::styled(
@@ -93,6 +94,8 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::styled(
             if exists {
                 "● the file is there".to_string()
+            } else if c.read_only() {
+                "● no such file, and read-only will not create one".to_string()
             } else {
                 "● no such file yet (sqlite3 would create it)".to_string()
             },
@@ -113,8 +116,13 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
                 lines.push(row(label, value));
             }
         }
-        // Keys somebody wrote by hand that we carry through but never ask about.
-        for (k, v) in &c.extra {
+        // Keys somebody wrote by hand that we carry through but never ask about,
+        // less the read-only setting, which has its own line above.
+        let mut shown = c.extra.clone();
+        if c.engine == Engine::Pg && c.read_only() {
+            crate::engines::pg::set_read_only(&mut shown, false);
+        }
+        for (k, v) in &shown {
             lines.push(row(k, v.clone()));
         }
         lines.push(Line::raw(""));
@@ -197,7 +205,10 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
     ));
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        shell_join_display(&c.connect_argv(&app.settings)),
+        super::widgets::with_env(
+            &c.connect_env(&app.settings),
+            shell_join_display(&c.connect_argv(&app.settings)),
+        ),
         Style::default().fg(Color::Green),
     ));
     lines.push(Line::styled(format!("esql {}", c.name), dim()));
