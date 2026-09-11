@@ -26,6 +26,78 @@ pub fn service_path() -> PathBuf {
         .join(".pg_service.conf")
 }
 
+/// The server setting that makes a session refuse writes. It lives in the
+/// block's `options` - libpq hands those to the server for every session, so
+/// psql, pgAdmin and every driver reading this service get it too - alongside
+/// whatever other `-c` the user already put there.
+const READ_ONLY: &str = "default_transaction_read_only";
+
+/// The `options` tokens that set `READ_ONLY`, in the three spellings the server
+/// accepts: `-c name=v`, `-cname=v` and `--name=v` (dashes or underscores).
+fn read_only_values(options: &str) -> Vec<(usize, usize, String)> {
+    let words: Vec<&str> = options.split_whitespace().collect();
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let (setting, span) = match words[i] {
+            "-c" if i + 1 < words.len() => (words[i + 1], 2),
+            w if w.starts_with("-c") => (&w[2..], 1),
+            w if w.starts_with("--") => (&w[2..], 1),
+            _ => ("", 1),
+        };
+        if let Some((name, value)) = setting.split_once('=')
+            && name.replace('-', "_") == READ_ONLY
+        {
+            hits.push((i, span, value.to_ascii_lowercase()));
+        }
+        i += span;
+    }
+    hits
+}
+
+/// Whether this block makes every session read-only, however that line got
+/// there. The last setting wins, the way the server reads them.
+pub fn read_only(extra: &[(String, String)]) -> bool {
+    extra
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("options"))
+        .and_then(|(_, v)| read_only_values(v).pop())
+        .is_some_and(|(_, _, v)| matches!(v.as_str(), "on" | "true" | "yes" | "1"))
+}
+
+/// Set or clear read-only in the block's `options`, keeping every other token
+/// the user wrote there in order, and dropping the key when nothing is left.
+pub fn set_read_only(extra: &mut Vec<(String, String)>, on: bool) {
+    let at = extra
+        .iter()
+        .position(|(k, _)| k.eq_ignore_ascii_case("options"));
+    let old = at.map(|i| extra[i].1.clone()).unwrap_or_default();
+    let words: Vec<&str> = old.split_whitespace().collect();
+    let mut drop = vec![false; words.len()];
+    for (i, span, _) in read_only_values(&old) {
+        drop[i..i + span].iter_mut().for_each(|d| *d = true);
+    }
+    let mut kept: Vec<String> = words
+        .iter()
+        .zip(&drop)
+        .filter(|(_, d)| !**d)
+        .map(|(w, _)| w.to_string())
+        .collect();
+    if on {
+        kept.push("-c".into());
+        kept.push(format!("{READ_ONLY}=on"));
+    }
+    let new = kept.join(" ");
+    match (at, new.is_empty()) {
+        (Some(i), true) => {
+            extra.remove(i);
+        }
+        (Some(i), false) => extra[i].1 = new,
+        (None, false) => extra.push(("options".into(), new)),
+        (None, true) => {}
+    }
+}
+
 /// The one argument psql is handed: the service block, plus an explicit
 /// `dbname` when another database on the same server was asked for. Keywords
 /// given here win over the service file's own, verified against a real server,

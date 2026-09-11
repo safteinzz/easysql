@@ -174,6 +174,14 @@ impl Engine {
         self != Engine::Sqlite
     }
 
+    /// True when a connection can be made read-only from its form. MySQL is
+    /// not, yet: its client honours `init-command` in the `[clientNAME]` group,
+    /// but `mysqldump` reads that group too and refuses to start over the
+    /// unknown key, and SQL Server has no session setting that enforces it.
+    pub fn offers_read_only(self) -> bool {
+        matches!(self, Engine::Pg | Engine::Sqlite)
+    }
+
     /// True when easysql can save this engine's password into a file its client
     /// reads on its own. SQL Server has no such file - the modern `sqlcmd`
     /// keeps an obfuscated copy in its own YAML and the classic one reads
@@ -235,6 +243,16 @@ impl Conn {
         s
     }
 
+    /// Whether the block makes every session refuse writes, read from the file
+    /// rather than remembered, so a line written by hand counts too.
+    pub fn read_only(&self) -> bool {
+        match self.engine {
+            Engine::Pg => pg::read_only(&self.extra),
+            Engine::Sqlite => sqlite::read_only(&self.extra),
+            Engine::MySql | Engine::MsSql => false,
+        }
+    }
+
     pub fn port_or_default(&self) -> String {
         if self.port.is_empty() {
             self.engine.default_port().to_string()
@@ -269,11 +287,16 @@ impl Conn {
                     argv.push(format!("--database={db}"));
                 }
             }
-            Engine::Sqlite => argv.push(
-                crate::ini::expand_tilde(&self.database)
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            Engine::Sqlite => {
+                if self.read_only() {
+                    argv.push("-readonly".into());
+                }
+                argv.push(
+                    crate::ini::expand_tilde(&self.database)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
             Engine::MsSql => argv.extend(mssql::flags(self, db)),
         }
         argv

@@ -57,6 +57,20 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
     if c.engine.networked() {
         lines.push(reach_line(app.reach.get(&c.key()), sleeping_via(c)));
     }
+    if c.read_only() {
+        lines.push(Line::styled(
+            "read-only: writes are refused",
+            Style::default().fg(READ_ONLY_COLOR),
+        ));
+        // sqlite3 opens the file read-only, which nothing inside the session
+        // can undo; Postgres only sets a default a session may override.
+        if c.engine == Engine::Pg {
+            lines.push(Line::styled(
+                "a session can undo it; the role's grants are the real limit",
+                dim(),
+            ));
+        }
+    }
     lines.push(match app.history.get(&c.key()) {
         Some(e) => Line::styled(
             format!(

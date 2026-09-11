@@ -79,6 +79,10 @@ impl View {
     }
 }
 
+/// The colour a read-only connection's name wears in the list and in the
+/// detail panel, so the one word of explanation there names the colour here.
+const READ_ONLY_COLOR: ratatui::style::Color = ratatui::style::Color::Blue;
+
 const VIEWS: [View; 5] = [
     View::Connections,
     View::Passwords,

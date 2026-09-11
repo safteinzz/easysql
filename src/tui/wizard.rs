@@ -183,9 +183,18 @@ impl App {
             .map(|f| f.value.trim().to_string())
             .collect();
         // A cycled field holds no text, so its answer is an index rather than
-        // anything in `v`. Field 5 is whichever extra that engine owns, and it
-        // is read before the match, which moves the prompt.
-        let choice_at = prompt.fields.get(5).map(|f| f.choice).unwrap_or(0);
+        // anything in `v`. Found by label, since which choices a form carries
+        // depends on the engine, and read before the match moves the prompt.
+        let choice_of = |label: &str| {
+            prompt
+                .fields
+                .iter()
+                .find(|f| f.label == label)
+                .map_or(0, |f| f.choice)
+        };
+        let encryption = choice_of("Encryption");
+        let certificate = choice_of("Certificate");
+        let read_only = choice_of("Read only") > 0;
         let action = prompt.action.clone();
         // Bound before the match consumes `action`, so both arms below can share
         // one body: an edit is an add that knows which block it is replacing.
@@ -207,31 +216,44 @@ impl App {
                     return None;
                 }
                 // Anything the wizard did not ask about survives the rewrite.
-                let mut extra = original
-                    .as_deref()
-                    .and_then(|o| self.existing(engine, o))
-                    .map(|c| c.extra.clone())
-                    .unwrap_or_default();
+                let existing = original.as_deref().and_then(|o| self.existing(engine, o));
+                let was_read_only = existing.is_some_and(Conn::read_only);
+                let mut extra = existing.map(|c| c.extra.clone()).unwrap_or_default();
                 // These are extras this wizard *does* ask about, so the field's
                 // answer replaces whatever was in the block rather than being
                 // carried through. Index 0 means the key is removed entirely.
                 match engine {
                     Engine::Pg => {
                         extra.retain(|(k, _)| !k.eq_ignore_ascii_case("sslmode"));
-                        if choice_at > 0 {
+                        if encryption > 0 {
                             extra.push((
                                 "sslmode".to_string(),
-                                super::prompt::SSLMODES[choice_at].to_string(),
+                                super::prompt::SSLMODES[encryption].to_string(),
                             ));
                         }
                     }
                     Engine::MsSql => {
                         extra.retain(|(k, _)| !k.eq_ignore_ascii_case("trust_cert"));
-                        if choice_at > 0 {
+                        if certificate > 0 {
                             extra.push(("trust_cert".to_string(), "yes".to_string()));
                         }
                     }
                     _ => {}
+                }
+                // Only rewritten when the answer changed, so a read-only line
+                // somebody spelled their own way is not respelled by an edit
+                // that never touched this field.
+                if engine.offers_read_only() && read_only != was_read_only {
+                    match engine {
+                        Engine::Pg => crate::engines::pg::set_read_only(&mut extra, read_only),
+                        Engine::Sqlite => {
+                            extra.retain(|(k, _)| !k.eq_ignore_ascii_case("readonly"));
+                            if read_only {
+                                extra.push(("readonly".to_string(), "yes".to_string()));
+                            }
+                        }
+                        Engine::MySql | Engine::MsSql => {}
+                    }
                 }
                 let nc = match engine {
                     Engine::Sqlite => NewConn {

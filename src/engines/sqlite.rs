@@ -20,6 +20,14 @@ pub fn store_path() -> PathBuf {
         .join("sqlite.conf")
 }
 
+/// Whether this connection opens its file with `-readonly`, which sqlite3
+/// enforces itself: a write fails with "attempt to write a readonly database".
+pub fn read_only(extra: &[(String, String)]) -> bool {
+    extra
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("readonly") && v == "yes")
+}
+
 pub fn list() -> Vec<Conn> {
     ini::read(&store_path())
         .into_iter()

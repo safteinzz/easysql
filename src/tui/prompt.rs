@@ -180,6 +180,19 @@ pub(super) const TRUST_CERT: [&str; 2] = [
     "trust it (-C, for a self-signed server)",
 ];
 
+/// Whether every session on this connection refuses writes. "no" is first so a
+/// new connection is writable unless somebody decides otherwise.
+pub(super) const READ_ONLY: [&str; 2] = ["no", "yes - writes are refused"];
+
+/// The read-only toggle, starting on what the file already says.
+fn read_only_field(from: Option<&Conn>) -> Field {
+    Field::choice(
+        "Read only",
+        &READ_ONLY,
+        usize::from(from.is_some_and(Conn::read_only)),
+    )
+}
+
 /// The fields that describe a connection, which differ by engine because a
 /// SQLite database is a file with no host, port, user or transport to secure.
 fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
@@ -190,6 +203,7 @@ fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
                 .required()
                 .hint("what you type after esql"),
             Field::filled("Database file", &get(|c| &c.database)).required(),
+            read_only_field(from),
         ];
     }
     let port = Field {
@@ -219,6 +233,7 @@ fn conn_fields(engine: Engine, from: Option<&Conn>) -> Vec<Field> {
                 .position(|m| *m == extra("sslmode"))
                 .unwrap_or(0);
             fields.push(Field::choice("Encryption", &SSLMODES, at));
+            fields.push(read_only_field(from));
         }
         Engine::MsSql => {
             let at = usize::from(extra("trust_cert") == "yes");
@@ -471,34 +486,55 @@ impl Prompt {
         Some((out, port.to_string()))
     }
 
-    pub(super) fn command_preview(&self) -> Option<String> {
+    /// The connection this form would save, as far as what runs is concerned:
+    /// the typed fields plus the two choices that change the argv. Postgres's
+    /// read-only and encryption live in the service block, not the argv, so
+    /// they are left out rather than faked.
+    fn draft_conn(&self) -> Option<Conn> {
+        let (Action::AddConn { engine } | Action::EditConn { engine, .. }) = &self.action else {
+            return None;
+        };
+        let v = |i: usize| self.fields[i].value.trim().to_string();
+        let chose = |label: &str| self.fields.iter().any(|f| f.label == label && f.choice > 0);
+        let name = v(0);
+        if name.is_empty() {
+            return None;
+        }
+        let mut extra = Vec::new();
+        if *engine == Engine::MsSql && chose("Certificate") {
+            extra.push(("trust_cert".to_string(), "yes".to_string()));
+        }
+        if *engine == Engine::Sqlite && chose("Read only") {
+            extra.push(("readonly".to_string(), "yes".to_string()));
+        }
+        let (host, port, database, user) = match engine {
+            Engine::Sqlite => (String::new(), String::new(), v(1), String::new()),
+            _ => (v(1), v(2), v(3), v(4)),
+        };
+        Some(Conn {
+            engine: *engine,
+            name,
+            host,
+            port,
+            database,
+            user,
+            extra,
+        })
+    }
+
+    pub(super) fn command_preview(&self, settings: &crate::settings::Settings) -> Option<String> {
         let v = |i: usize| self.fields[i].value.trim();
         match &self.action {
             // What you will type afterwards is the point of saving it at all,
-            // so the preview is the connect command, not the file we write.
-            Action::AddConn { engine } | Action::EditConn { engine, .. } => {
-                let name = v(0);
-                if name.is_empty() {
-                    return None;
-                }
-                Some(match engine {
-                    Engine::Pg => format!("esql {name}   →   psql \"service={name}\""),
-                    Engine::MySql => {
-                        format!("esql {name}   →   mysql --defaults-group-suffix={name}")
-                    }
-                    Engine::Sqlite => format!("esql {name}   →   sqlite3 {}", v(1)),
-                    // SQL Server has no named block to point at, so the preview
-                    // is the flags themselves.
-                    Engine::MsSql => {
-                        let port = if v(2).is_empty() { "1433" } else { v(2) };
-                        let host = if v(1).is_empty() { "localhost" } else { v(1) };
-                        format!(
-                            "esql {name}   →   sqlcmd -S {host},{port} -d {} -U {}",
-                            v(3),
-                            v(4)
-                        )
-                    }
-                })
+            // so the preview is the connect command, not the file we write -
+            // built by `connect_argv`, the same call Enter makes.
+            Action::AddConn { .. } | Action::EditConn { .. } => {
+                let c = self.draft_conn()?;
+                Some(format!(
+                    "esql {}   →   {}",
+                    c.name,
+                    super::widgets::shell_join_display(&c.connect_argv(settings))
+                ))
             }
             // The shape of the line, never its secret: the point is to teach the
             // file's format so you can read and edit it yourself afterwards.
@@ -557,7 +593,13 @@ fn value_column(fields: &[Field]) -> usize {
 /// appears or disappears with the cursor. The key for a choice row used to be
 /// printed on whichever row was focused, which made every row grow and shrink
 /// as you moved through the form to repeat what the key line already says.
-pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[Entry]) {
+pub(super) fn render_prompt(
+    f: &mut Frame,
+    area: Rect,
+    p: &Prompt,
+    tunnels: &[Entry],
+    settings: &crate::settings::Settings,
+) {
     // No leading blank: the box's own top padding is that row.
     let mut lines: Vec<Line> = Vec::new();
     // Plain text of every line, kept alongside so the box can be sized against
@@ -624,7 +666,7 @@ pub(super) fn render_prompt(f: &mut Frame, area: Rect, p: &Prompt, tunnels: &[En
     }
     // Live command preview: shows the exact command being built as you type, so
     // the wizard teaches the underlying tool instead of hiding it.
-    if let Some(cmd) = p.command_preview() {
+    if let Some(cmd) = p.command_preview(settings) {
         lines.push(Line::raw(""));
         texts.push(String::new());
         texts.push(format!("  runs  {cmd}"));

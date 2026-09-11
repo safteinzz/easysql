@@ -42,7 +42,7 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
         render_help(f, area);
     }
     if let Some(p) = &app.prompt {
-        render_prompt(f, area, p, &app.tunnels);
+        render_prompt(f, area, p, &app.tunnels, &app.settings);
     }
     if let Some(p) = &app.picker {
         render_picker(f, area, p);
@@ -149,10 +149,18 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         ("", Style::default())
                     };
+                    // A colour rather than a glyph: rarer codepoints fall back
+                    // to the wrong character in some fonts, and the detail
+                    // panel says in words what the blue means.
+                    let name_style = if c.read_only() {
+                        bold.fg(READ_ONLY_COLOR)
+                    } else {
+                        bold
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(mark, style),
                         Span::raw(" "),
-                        Span::styled(format!("{:nw$}", c.name), bold),
+                        Span::styled(format!("{:nw$}", c.name), name_style),
                         Span::raw("  "),
                         Span::styled(
                             format!("{:ew$}", c.engine.label()),
