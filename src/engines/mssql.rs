@@ -19,7 +19,7 @@ use crate::ini;
 use anyhow::Result;
 use std::path::PathBuf;
 
-const KNOWN: [&str; 5] = ["host", "port", "database", "user", "trust_cert"];
+const KNOWN: [&str; 4] = ["host", "port", "database", "user"];
 
 pub fn store_path() -> PathBuf {
     dirs::config_dir()
@@ -37,8 +37,9 @@ pub fn list() -> Vec<Conn> {
             port: s.get("port").unwrap_or_default().to_string(),
             database: s.get("database").unwrap_or_default().to_string(),
             user: s.get("user").unwrap_or_default().to_string(),
-            // `trust_cert` is ours and is rebuilt from the wizard's choice on
-            // every save, so it must not come back as a leftover extra too.
+            // `trust_cert` stays in here, the way `sslmode` does for Postgres:
+            // `flags` and the form both read it from `extra`, and the wizard
+            // strips it before writing its own answer, so it is never doubled.
             extra: s.rest(&KNOWN),
             name: s.name,
         })
