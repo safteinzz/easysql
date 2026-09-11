@@ -161,8 +161,11 @@ impl Engine {
             Engine::Sqlite => {
                 ".databases · .tables · .schema <table> · .read <file> · .help · .quit"
             }
+            // GO leads because nothing typed at sqlcmd's prompt runs until it:
+            // a `select` just sits at `2>`, which reads as a hang to anyone who
+            // came from psql.
             Engine::MsSql => {
-                "select name from sys.databases; · use <db>; · select name from sys.tables; · :r <file> · exit"
+                "GO runs what you typed · sp_databases dbs · use <db> · sp_tables tables · sp_help <table> · :r <file> · exit"
             }
         }
     }
@@ -189,6 +192,13 @@ impl Engine {
     /// which is also Microsoft's own advice.
     pub fn stores_password(self) -> bool {
         matches!(self, Engine::Pg | Engine::MySql)
+    }
+
+    /// Whether a password for this engine can be saved at all under these
+    /// settings: always where the client has a file of its own, and for SQL
+    /// Server only once the user has allowed easysql to keep it.
+    pub fn keeps_password(self, s: &Settings) -> bool {
+        self.stores_password() || (self == Engine::MsSql && s.mssql_passwords)
     }
 }
 
@@ -262,6 +272,19 @@ impl Conn {
             Engine::Pg if self.read_only() && !speaks_client_flags(self.engine, s) => {
                 vec![("PGOPTIONS".to_string(), pg::read_only_pgoptions())]
             }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The part of a session's environment that is a secret: only a SQL Server
+    /// password easysql was allowed to keep. Applied by the two launchers and
+    /// the probe, and never by anything that shows or copies a command, which
+    /// is why it is not in `connect_env`.
+    pub fn secret_env(&self, s: &Settings) -> Vec<(String, String)> {
+        match self.engine {
+            Engine::MsSql if s.mssql_passwords => mssql::password(&self.name)
+                .map(|p| vec![("SQLCMDPASSWORD".to_string(), p)])
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }

@@ -75,6 +75,11 @@ Typed once into a hidden field, written straight to the file that engine's
 client reads, and never read back, never echoed, never put in an argv or an
 environment variable. easysql only ever shows you that one exists.
 
+SQL Server's `sqlcmd` has no such file, so it asks every time - and a script or
+an agent cannot answer. Turn on **sqlcmd passwords** in Settings (or accept
+the offer `p` makes) and easysql keeps one in `~/.esqlpass`
+(chmod 600), handed over in `SQLCMDPASSWORD`, never on the command line.
+
 ## Saved queries
 
 ![Making a saved query in the Snippets tab as one line, then opening its file in vim with o and pasting a longer version, which the details panel then shows](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.gif)
@@ -95,7 +100,7 @@ expands at the psql prompt too. Your own lines in that file are left alone.
 
 ## Settings
 
-![The Settings tab showing nine settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
+![The Settings tab showing ten settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
 Which program opens each engine, whether ports are checked, what order the list
 is in. `d` puts any of them back.
@@ -136,7 +141,7 @@ Each tab's own keys are on its bottom line, and `?` lists them all.
 | tab | what it is | the file it edits |
 | --- | --- | --- |
 | Connections | every saved connection, from every engine | `~/.pg_service.conf`, `~/.my.cnf`, `~/.config/easysql/{sqlite,mssql}.conf` |
-| Passwords | what unlocks them, written and never read back | `~/.pgpass`, `~/.my.cnf` (both chmod 600) |
+| Passwords | what unlocks them, written and never read back | `~/.pgpass`, `~/.my.cnf`, and `~/.esqlpass` once allowed (all chmod 600) |
 | Tunnels | the `ssh -L` between you and a database you cannot route to | on and off, remembered per connection |
 | Settings | the choices that are yours rather than a client's | `~/.config/easysql/settings` |
 
@@ -173,9 +178,10 @@ Four engines, each handed over to the client you already have: Postgres to
 `sqlcmd`. Any of them can be pointed somewhere else in Settings.
 
 SQL Server is the odd one out twice: no file both `sqlcmd` builds read, so
-easysql keeps that list itself and passes `-S host,port -d db -U user`, and it
-saves no password, because `sqlcmd` asking you is Microsoft's own advice over
-`-P`. It is in no distro's repos either, so there is no install to offer.
+easysql keeps that list itself and passes `-S host,port -d db -U user`, and by
+default it saves no password, because `sqlcmd` asking you is Microsoft's own
+advice over `-P`; Settings can let easysql keep one instead. It is in no
+distro's repos either, so there is no install to offer.
 
 Linux. Tunnel liveness is read from `/proc` and killing a forward shells out to
 `kill`, so macOS and BSD need a different implementation first.

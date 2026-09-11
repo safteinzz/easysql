@@ -344,7 +344,7 @@ impl App {
     /// of the engines whose client reads a password file of its own: SQLite has
     /// nothing to unlock, and sqlcmd prompts for itself.
     pub(super) fn has_password(&self, c: &Conn) -> bool {
-        c.engine.stores_password() && self.creds.iter().any(|cred| cred.covers(c))
+        c.engine.keeps_password(&self.settings) && self.creds.iter().any(|cred| cred.covers(c))
     }
 
     // --- reachability -----------------------------------------------------
@@ -668,10 +668,10 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 .as_ref()
                 .filter(|_| app.settings.hints)
                 .map(|c| crate::engines::hint_line(c.engine, &app.settings));
-            let env = run
+            let env: Vec<(String, String)> = run
                 .connect
                 .as_ref()
-                .map(|c| c.connect_env(&app.settings))
+                .map(|c| [c.connect_env(&app.settings), c.secret_env(&app.settings)].concat())
                 .unwrap_or_default();
             let status = run_suspended(terminal, &run.argv, &env, hint)?;
 

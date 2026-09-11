@@ -210,15 +210,16 @@ impl App {
             // place you already know which connection you mean.
             KeyCode::Char('p') => {
                 let conn = self.selected_conn()?.clone();
-                if !conn.engine.stores_password() {
-                    self.set_status(match conn.engine {
-                        Engine::Sqlite => "a sqlite file has no password".to_string(),
-                        _ => format!(
-                            "{} has no password file to write: it asks you when it opens",
-                            conn.engine.default_client()
-                        ),
-                    });
-                    return None;
+                match conn.engine {
+                    Engine::Sqlite => {
+                        self.set_status("a sqlite file has no password");
+                        return None;
+                    }
+                    Engine::MsSql if !self.settings.mssql_passwords => {
+                        self.offer_mssql_passwords(&conn);
+                        return None;
+                    }
+                    _ => {}
                 }
                 self.prompt = Some(Prompt::password(&conn));
                 None
@@ -303,6 +304,13 @@ impl App {
                             "this password lives in [client{name}]: edit the connection instead"
                         ));
                     }
+                    // Keyed on the connection's name alone, so there is nothing
+                    // to move: `p` on the connection replaces it.
+                    creds::Source::MsSql(ref name) => {
+                        self.set_status(format!(
+                            "this password belongs to '{name}': `p` on the connection replaces it"
+                        ));
+                    }
                 }
                 None
             }
@@ -314,6 +322,7 @@ impl App {
                 let path = match cred.source {
                     creds::Source::Pgpass(_) => creds::pgpass_path(),
                     creds::Source::MyCnf(_) => engines::mysql::cnf_path(),
+                    creds::Source::MsSql(_) => engines::mssql::pass_path(),
                 };
                 let editor = std::env::var("VISUAL")
                     .or_else(|_| std::env::var("EDITOR"))

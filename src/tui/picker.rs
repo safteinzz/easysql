@@ -223,14 +223,14 @@ impl App {
         ));
     }
 
-    /// Which connection a new password is for. Only the engines whose client
-    /// reads a password file of its own can appear here: a SQLite file has
-    /// nothing to unlock, and sqlcmd asks for itself.
+    /// Which connection a new password is for. Only the engines a password can
+    /// be kept for appear here: a SQLite file has nothing to unlock, and SQL
+    /// Server only once the setting lets easysql keep it.
     pub(super) fn pick_password_target(&mut self) {
         let rows: Vec<(String, String)> = self
             .conns
             .iter()
-            .filter(|c| c.engine.stores_password())
+            .filter(|c| c.engine.keeps_password(&self.settings))
             .map(|c| {
                 (
                     format!("{:<9} {:<16} {}", c.engine.label(), c.name, c.target()),

@@ -126,14 +126,21 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(row(k, v.clone()));
         }
         lines.push(Line::raw(""));
-        lines.push(if !c.engine.stores_password() {
+        lines.push(if !c.engine.keeps_password(&app.settings) {
             Line::styled(
-                format!("{} asks for the password itself", c.engine.default_client()),
+                format!(
+                    "{} asks for the password itself (p offers to keep it)",
+                    c.engine.default_client()
+                ),
                 dim(),
             )
         } else if app.has_password(c) {
             Line::styled(
-                "password on file (the client reads it itself)",
+                if c.engine.stores_password() {
+                    "password on file (the client reads it itself)"
+                } else {
+                    "password kept by easysql, handed to sqlcmd"
+                },
                 Style::default().fg(Color::Green),
             )
         } else {
@@ -281,7 +288,12 @@ fn cred_lines(app: &App) -> Vec<Line<'static>> {
 
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "the password itself is never read back, only written",
+        match c.source {
+            crate::creds::Source::MsSql(_) => {
+                "never shown: easysql reads it back only to hand it to sqlcmd in SQLCMDPASSWORD"
+            }
+            _ => "the password itself is never read back, only written",
+        },
         dim(),
     ));
     lines

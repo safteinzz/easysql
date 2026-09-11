@@ -5,7 +5,8 @@
 //! connection's own `[clientNAME]` group. easysql writes those files and then
 //! forgets: no password is ever held in the app, put in an environment variable
 //! or passed on a command line, because `ps` shows a command line to every user
-//! on the machine.
+//! on the machine. SQL Server is the exception the user has to switch on: its
+//! client has no file, so `engines::mssql` keeps one when allowed.
 //!
 //! Nothing here ever reads a password back out. A row shows which connection it
 //! answers for; the secret itself is only ever written.
@@ -23,6 +24,8 @@ pub enum Source {
     Pgpass(usize),
     /// The `password` key of `[clientNAME]` in `~/.my.cnf`.
     MyCnf(String),
+    /// The `password` key of `[NAME]` in easysql's own `~/.esqlpass`.
+    MsSql(String),
 }
 
 /// One stored password, described by what it unlocks rather than by its value.
@@ -57,6 +60,10 @@ impl Cred {
                 ini::collapse_tilde(&engines::mysql::cnf_path().to_string_lossy()),
                 engines::mysql::group_of(name)
             ),
+            Source::MsSql(name) => format!(
+                "{} [{name}]",
+                ini::collapse_tilde(&engines::mssql::pass_path().to_string_lossy())
+            ),
         }
     }
 
@@ -67,7 +74,7 @@ impl Cred {
             return false;
         }
         match &self.source {
-            Source::MyCnf(name) => name == &c.name,
+            Source::MyCnf(name) | Source::MsSql(name) => name == &c.name,
             Source::Pgpass(_) => {
                 let host = if c.host.is_empty() {
                     "localhost"
@@ -114,6 +121,20 @@ pub fn list() -> Vec<Cred> {
                 database: c.database.clone(),
                 user: c.user.clone(),
                 source: Source::MyCnf(c.name),
+            });
+        }
+    }
+    // Listed whatever the setting says, so a password kept while it was on can
+    // still be seen and forgotten after it is switched off.
+    for c in engines::mssql::list() {
+        if engines::mssql::has_password(&c.name) {
+            out.push(Cred {
+                engine: Engine::MsSql,
+                host: c.host.clone(),
+                port: c.port_or_default(),
+                database: c.database.clone(),
+                user: c.user.clone(),
+                source: Source::MsSql(c.name),
             });
         }
     }
@@ -272,6 +293,7 @@ pub fn rekey_pg_in(
 pub fn delete(cred: &Cred) -> Result<()> {
     match &cred.source {
         Source::MyCnf(name) => engines::mysql::set_password(name, None),
+        Source::MsSql(name) => engines::mssql::set_password(name, None),
         Source::Pgpass(idx) => {
             let path = pgpass_path();
             let text =

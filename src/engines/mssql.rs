@@ -8,11 +8,12 @@
 //! rest, and turned into plain `-S/-d/-U` flags that *both* builds understand.
 //!
 //! And there is no password file. `sqlconfig` stores an obfuscated copy that
-//! only go-sqlcmd reads, and the alternative, `SQLCMDPASSWORD`, would mean
-//! holding a secret and handing it to a child process, which this crate does
-//! not do. Omitting `-P` makes sqlcmd prompt for the password itself, on the
-//! terminal we already hand over, which is also Microsoft's own advice: "Using
-//! -P is insecure. Avoid giving the password on the command line."
+//! only go-sqlcmd reads, so by default easysql keeps nothing and sqlcmd prompts
+//! on the terminal we already hand over - Microsoft's own advice over `-P`:
+//! "Using -P is insecure. Avoid giving the password on the command line." The
+//! `mssql_passwords` setting lets easysql keep one in `~/.esqlpass` instead and
+//! hand it over in `SQLCMDPASSWORD`, the one place this crate holds a secret,
+//! so it is off until the user turns it on.
 
 use super::{Conn, Engine, NewConn};
 use crate::ini;
@@ -30,6 +31,70 @@ pub fn store_path() -> PathBuf {
 
 pub fn list() -> Vec<Conn> {
     list_in(&store_path())
+}
+
+/// Where SQL Server passwords live when the setting allows it: one `[name]`
+/// with a `password` key per connection, written through `ini`, which makes
+/// every file it writes 0600. In the home folder beside `~/.pgpass` and
+/// `~/.my.cnf`, where anyone who knows those looks for it, and deliberately not
+/// in `~/.config`, which is what people sync, back up and commit.
+pub fn pass_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".esqlpass")
+}
+
+/// Whether nobody but the owner can read the password file - the same test
+/// libpq applies to `.pgpass` before it will use it. easysql writes it 0600;
+/// this is for a copy somebody made or loosened by hand.
+pub fn pass_is_private() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(pass_path()).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+/// The one read of a stored password anywhere in this crate, for the
+/// environment of the child that needs it and nothing else. A file others can
+/// read is not used at all, so sqlcmd asks instead.
+pub fn password(name: &str) -> Option<String> {
+    if !pass_is_private() {
+        return None;
+    }
+    ini::read(&pass_path())
+        .into_iter()
+        .find(|s| s.name == name)
+        .and_then(|s| s.get("password").map(str::to_string))
+        .filter(|p| !p.is_empty())
+}
+
+pub fn has_password(name: &str) -> bool {
+    ini::read(&pass_path())
+        .iter()
+        .any(|s| s.name == name && s.get("password").is_some())
+}
+
+/// Save it, or with `None` forget it.
+pub fn set_password(name: &str, password: Option<&str>) -> Result<()> {
+    match password {
+        Some(p) => ini::upsert(
+            &pass_path(),
+            None,
+            name,
+            &[("password".to_string(), p.to_string())],
+        ),
+        None if has_password(name) => ini::remove(&pass_path(), name),
+        None => Ok(()),
+    }
+}
+
+/// A rename moves the password with the connection, since it is keyed on the name.
+pub fn rename_password(from: &str, to: &str) -> Result<()> {
+    match password(from) {
+        Some(p) => ini::upsert(&pass_path(), Some(from), to, &[("password".to_string(), p)]),
+        None => Ok(()),
+    }
 }
 
 pub fn list_in(path: &std::path::Path) -> Vec<Conn> {
@@ -111,16 +176,21 @@ pub fn delete(name: &str) -> Result<()> {
 
 /// The non-interactive question after a failed open. `-l` is the login timeout
 /// in seconds, and there is no "never prompt" flag to add: omitting `-P` with
-/// no `SQLCMDPASSWORD` set makes sqlcmd ask, so the probe supplies an empty one
-/// through the environment purely to stop it blocking on a prompt nobody can
-/// answer. That empty value is not a stored password and is never read back.
+/// no `SQLCMDPASSWORD` set makes sqlcmd ask, so the probe hands over the stored
+/// password when the setting allows one, and an empty one otherwise purely to
+/// stop sqlcmd blocking on a prompt nobody can answer.
 pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<(String, String)>) {
     let mut argv = c.connect_argv(s);
     argv.push("-l".into());
     argv.push(s.probe_timeout.to_string());
     argv.push("-Q".into());
     argv.push("select 1".into());
-    (argv, vec![("SQLCMDPASSWORD".to_string(), String::new())])
+    let env = c
+        .secret_env(s)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ("SQLCMDPASSWORD".to_string(), String::new()));
+    (argv, vec![env])
 }
 
 #[cfg(test)]

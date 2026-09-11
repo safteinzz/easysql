@@ -87,6 +87,11 @@ pub(crate) enum ConfirmAction {
     InstallClient {
         engine: Engine,
     },
+    /// Offered when a SQL Server password is asked for and easysql is not yet
+    /// allowed to keep one: switch the setting on, then open the password form.
+    AllowMssqlPasswords {
+        key: String,
+    },
 }
 
 pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
@@ -158,6 +163,13 @@ impl App {
                         if let Some(key) = key {
                             let _ = crate::vias::remove(&key);
                         }
+                        // A kept SQL Server password is keyed on the name, so it
+                        // goes with the connection rather than waiting for a new
+                        // one that happens to reuse the name.
+                        if engine == Engine::MsSql {
+                            let _ = engines::mssql::set_password(&name, None);
+                            self.refresh_creds();
+                        }
                         self.refresh_conns();
                         self.set_status(format!("deleted '{name}' (file backed up first)"));
                     }
@@ -185,6 +197,16 @@ impl App {
             // The three offered fixes all end the same way: open the wizard that
             // fixes the thing, with every field already filled in.
             ConfirmAction::SavePassword { key } => {
+                if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
+                    self.prompt = Some(Prompt::password(&conn));
+                }
+            }
+            ConfirmAction::AllowMssqlPasswords { key } => {
+                self.settings.set("mssql_passwords", "on");
+                if let Err(e) = self.settings.save() {
+                    self.set_failed(format!("could not save the setting: {e}"));
+                    return None;
+                }
                 if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
                     self.prompt = Some(Prompt::password(&conn));
                 }
@@ -238,6 +260,23 @@ impl App {
     /// could never have brought it: the clients are not Rust. So rather than
     /// failing at the moment you press Enter, work out the one command this
     /// machine needs and offer to run it.
+    /// SQL Server has no password file, so keeping one is a choice the user
+    /// makes once: say what easysql would do, and do it on Yes.
+    pub(super) fn offer_mssql_passwords(&mut self, conn: &Conn) {
+        self.confirm = Some(Confirm::offer(
+            "keep sqlcmd passwords?",
+            format!(
+                "sqlcmd has no password file, so it asks every time it opens. easysql can keep \
+                 one in {} (chmod 600) and hand it over in SQLCMDPASSWORD, never on the command \
+                 line where `ps` would show it. That is the one secret easysql would hold. Allow \
+                 it and save a password for '{}'?",
+                crate::ini::collapse_tilde(&engines::mssql::pass_path().to_string_lossy()),
+                conn.name
+            ),
+            ConfirmAction::AllowMssqlPasswords { key: conn.key() },
+        ));
+    }
+
     pub(super) fn offer_install(&mut self, engine: Engine) {
         let configured = engine.client_argv(&self.settings)[0].clone();
         // Only offer to install the *default* client. Somebody who pointed the
@@ -277,13 +316,17 @@ impl App {
         let key = conn.key();
         let said = failure.said;
         self.confirm = Some(match failure.fix {
+            Fix::Password if conn.engine == Engine::MsSql && !self.settings.mssql_passwords => {
+                return self.offer_mssql_passwords(conn);
+            }
             Fix::Password => Confirm::offer(
                 "the server wants a password",
                 format!(
-                    "{said}. easysql can save one where {} looks for it, so this never asks again. Save a password now?",
+                    "{said}. easysql can save one {}, so this never asks again. Save a password now?",
                     match conn.engine {
-                        Engine::Pg => "~/.pgpass",
-                        _ => "~/.my.cnf",
+                        Engine::Pg => "where psql looks for it, in ~/.pgpass",
+                        Engine::MsSql => "and hand it to sqlcmd itself",
+                        _ => "where mysql looks for it, in ~/.my.cnf",
                     }
                 ),
                 ConfirmAction::SavePassword { key },

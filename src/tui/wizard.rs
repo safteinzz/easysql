@@ -294,6 +294,13 @@ impl App {
                                 ));
                             }
                             crate::history::rename(&old_key, &key);
+                            if engine == Engine::MsSql
+                                && let Err(e) = engines::mssql::rename_password(was, &v[0])
+                            {
+                                self.set_failed(format!(
+                                    "saved, but its password did not move: {e}"
+                                ));
+                            }
                         }
                         self.refresh_conns();
                         self.start_probes();
@@ -359,7 +366,10 @@ impl App {
                 }
                 let result = match engine {
                     Engine::Pg => creds::set_pg(&v[0], &v[1], &v[2], &v[3], &password),
-                    _ => engines::mysql::set_password(&name, Some(&password)),
+                    Engine::MsSql => engines::mssql::set_password(&name, Some(&password)),
+                    Engine::MySql => engines::mysql::set_password(&name, Some(&password)),
+                    // `p` refuses a SQLite file before any form opens.
+                    Engine::Sqlite => Ok(()),
                 };
                 match result {
                     Ok(_) => {
@@ -368,6 +378,12 @@ impl App {
                             Engine::Pg => format!(
                                 "saved to {} (chmod 600)",
                                 crate::ini::collapse_tilde(&creds::pgpass_path().to_string_lossy())
+                            ),
+                            Engine::MsSql => format!(
+                                "saved into [{name}] in {} (chmod 600)",
+                                crate::ini::collapse_tilde(
+                                    &engines::mssql::pass_path().to_string_lossy()
+                                )
                             ),
                             _ => format!("saved into [client{name}] in ~/.my.cnf (chmod 600)"),
                         });

@@ -39,6 +39,10 @@ pub struct Settings {
     pub sqlite_command: String,
     pub sqlcmd_command: String,
     pub hints: bool,
+    /// Whether easysql may keep SQL Server passwords itself. Off by default:
+    /// sqlcmd has no password file, so this is the one place easysql would
+    /// hold a secret, and that is the user's call rather than ours.
+    pub mssql_passwords: bool,
     /// The ssh host a tunnel wizard offers first, for the bastion you always use.
     pub tunnel_host: String,
 }
@@ -54,6 +58,7 @@ impl Default for Settings {
             sqlite_command: "sqlite3".into(),
             sqlcmd_command: "sqlcmd".into(),
             hints: true,
+            mssql_passwords: false,
             tunnel_host: String::new(),
         }
     }
@@ -159,6 +164,7 @@ impl Settings {
             "sqlite_command" => self.sqlite_command = non_empty(value, "sqlite3"),
             "sqlcmd_command" => self.sqlcmd_command = non_empty(value, "sqlcmd"),
             "hints" => self.hints = value != "off",
+            "mssql_passwords" => self.mssql_passwords = value == "on",
             "tunnel_host" => self.tunnel_host = value.to_string(),
             _ => {}
         }
@@ -272,6 +278,15 @@ impl Settings {
                 help: "print how to list tables in that client before handing the terminal over",
                 value: on_off(self.hints).into(),
                 default: on_off(d.hints).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "mssql_passwords",
+                group: Group::Behaviour,
+                label: "sqlcmd passwords",
+                help: "off: sqlcmd asks every time · on: easysql keeps them (0600) and hands them over in SQLCMDPASSWORD",
+                value: on_off(self.mssql_passwords).into(),
+                default: on_off(d.mssql_passwords).into(),
                 choices: Some(&["on", "off"]),
             },
             Row {

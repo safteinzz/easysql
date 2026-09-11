@@ -130,6 +130,21 @@ pub fn run(args: Vec<String>) {
         use_default_client_for_one_shot(&conn, &mut settings);
     }
 
+    if conn.engine == crate::engines::Engine::MsSql
+        && settings.mssql_passwords
+        && crate::engines::mssql::has_password(&conn.name)
+        && !crate::engines::mssql::pass_is_private()
+    {
+        eprintln!(
+            "{}",
+            format!(
+                "esql: `{}` can be read by others, so its password is not used: `chmod 600` it.",
+                crate::ini::collapse_tilde(&crate::engines::mssql::pass_path().to_string_lossy())
+            )
+            .dimmed()
+        );
+    }
+
     if conn.engine == crate::engines::Engine::Sqlite
         && conn.read_only()
         && !crate::engines::speaks_client_flags(conn.engine, &settings)
@@ -262,6 +277,7 @@ pub fn run(args: Vec<String>) {
         let err = std::process::Command::new(&program)
             .args(&rest)
             .envs(conn.connect_env(&settings))
+            .envs(conn.secret_env(&settings))
             .exec();
         eprintln!("{}", format!("esql: could not run {program}: {err}").red());
         eprintln!(
@@ -276,6 +292,7 @@ pub fn run(args: Vec<String>) {
         match std::process::Command::new(&program)
             .args(&rest)
             .envs(conn.connect_env(&settings))
+            .envs(conn.secret_env(&settings))
             .status()
         {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
