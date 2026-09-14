@@ -244,6 +244,7 @@ impl App {
     pub(super) fn new() -> Self {
         let mut app = Self::empty();
         app.settings = settings::load();
+        crate::ini::set_backups(app.settings.backups);
         app.history = history::load();
         app.refresh_all();
         app.start_probes();

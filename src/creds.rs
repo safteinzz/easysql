@@ -321,14 +321,11 @@ pub fn delete(cred: &Cred) -> Result<()> {
 }
 
 fn write_pgpass(path: &std::path::Path, lines: &[String]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
     let mut body = lines.join("\n");
     if !body.is_empty() {
         body.push('\n');
     }
-    fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    ini::write_atomic(path, &body)?;
     // libpq flatly refuses a .pgpass that anyone else can read, so this is not
     // hygiene, it is whether the file works at all.
     ini::harden(path);
@@ -340,7 +337,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// A throwaway `.pgpass` that deletes itself and its backups. The real one
+    /// A throwaway `.pgpass` that deletes itself. The real one
     /// is never opened by this suite.
     struct Temp(PathBuf);
 
@@ -368,16 +365,6 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
-            if let Some(dir) = self.0.parent() {
-                let stem = format!("{}.bak.", self.0.file_name().unwrap().to_string_lossy());
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for e in entries.flatten() {
-                        if e.file_name().to_string_lossy().starts_with(&stem) {
-                            let _ = fs::remove_file(e.path());
-                        }
-                    }
-                }
-            }
         }
     }
 

@@ -148,15 +148,15 @@ pub fn sync_psqlrc() -> Result<PathBuf> {
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let body = splice(&existing, &block);
     // Nothing to do is the common case, and it has to cost nothing: this runs on
-    // the way into every postgres session, so writing unconditionally would drop
-    // a `.psqlrc.bak.<epoch>` beside it on every single connect.
+    // the way into every postgres session, so writing unconditionally would
+    // rewrite the file, and take a backup when those are on, on every connect.
     if body == existing {
         return Ok(path);
     }
     if path.exists() {
         crate::ini::backup(&path)?;
     }
-    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    crate::ini::write_atomic(&path, &body)?;
     Ok(path)
 }
 

@@ -186,6 +186,7 @@ pub fn run(args: Vec<String>, md: bool) {
     // client leaves nothing behind. A flag the user typed themselves is theirs,
     // so a passthrough is not a one-shot here, unless `--md` has to add its own.
     let mut settings = crate::settings::load();
+    crate::ini::set_backups(settings.backups);
     if db.is_some() || snippet.is_some() || adhoc || table.is_some() {
         use_default_client_for_one_shot(&conn, &mut settings);
     }

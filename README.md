@@ -54,8 +54,7 @@ esql ls -v                                     # marks it (read-only)
 ```
 
 `e` opens the form with the command it builds and what that command resolves
-to, updated as you type. Keys you added by hand are carried through untouched,
-and the file is backed up before every write.
+to, updated as you type. Keys you added by hand are carried through untouched.
 
 **Read only** makes every session on it refuse writes: a Postgres connection
 gets `default_transaction_read_only` in its service block, so pgAdmin and every
@@ -100,7 +99,7 @@ expands at the psql prompt too. Your own lines in that file are left alone.
 
 ## Settings
 
-![The Settings tab showing ten settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
+![The Settings tab showing eleven settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
 Which program opens each engine, whether ports are checked, what order the list
 is in. `d` puts any of them back.
@@ -146,8 +145,10 @@ Each tab's own keys are on its bottom line, and `?` lists them all.
 | Tunnels | the `ssh -L` between you and a database you cannot route to | on and off, remembered per connection |
 | Settings | the choices that are yours rather than a client's | `~/.config/easysql/settings` |
 
-Every write backs the file up first and rewrites only the one section, so your
-own comments, ordering and extra keys survive.
+Every write rewrites only the one section, so your own comments, ordering and
+extra keys survive. Set **Backups** in Settings to keep the last 1, 3, 5 or 10
+copies of each file from before it was changed, in
+`~/.local/state/easysql/backups`.
 
 ## When it fails
 

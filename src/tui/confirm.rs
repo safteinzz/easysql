@@ -171,7 +171,7 @@ impl App {
                             self.refresh_creds();
                         }
                         self.refresh_conns();
-                        self.set_status(format!("deleted '{name}' (file backed up first)"));
+                        self.set_status(format!("deleted '{name}'{}", crate::ini::backup_note()));
                     }
                     Some(Err(e)) => self.set_failed(format!("delete failed: {e}")),
                     None => self.set_status(format!("'{name}' is already gone")),
@@ -189,7 +189,10 @@ impl App {
                 match creds::delete(&cred) {
                     Ok(_) => {
                         self.refresh_creds();
-                        self.set_status(format!("forgotten from {where_stored} (backed up first)"));
+                        self.set_status(format!(
+                            "forgotten from {where_stored}{}",
+                            crate::ini::backup_note()
+                        ));
                     }
                     Err(e) => self.set_failed(format!("could not forget it: {e}")),
                 }

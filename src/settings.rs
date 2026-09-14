@@ -43,6 +43,9 @@ pub struct Settings {
     /// sqlcmd has no password file, so this is the one place easysql would
     /// hold a secret, and that is the user's call rather than ours.
     pub mssql_passwords: bool,
+    /// How many copies of a file easysql rewrites are kept in
+    /// `ini::backup_dir()`, 0 meaning none are taken.
+    pub backups: usize,
     /// The ssh host a tunnel wizard offers first, for the bastion you always use.
     pub tunnel_host: String,
 }
@@ -59,6 +62,7 @@ impl Default for Settings {
             sqlcmd_command: "sqlcmd".into(),
             hints: true,
             mssql_passwords: false,
+            backups: 0,
             tunnel_host: String::new(),
         }
     }
@@ -106,6 +110,7 @@ impl Row {
 const PROBE_CHOICES: &[&str] = &["on", "off"];
 const TIMEOUT_CHOICES: &[&str] = &["1", "2", "3", "5", "10"];
 const ORDER_CHOICES: &[&str] = &["recent", "engine", "name"];
+const BACKUP_CHOICES: &[&str] = &["off", "1", "3", "5", "10"];
 
 pub fn path() -> PathBuf {
     dirs::config_dir()
@@ -165,6 +170,7 @@ impl Settings {
             "sqlcmd_command" => self.sqlcmd_command = non_empty(value, "sqlcmd"),
             "hints" => self.hints = value != "off",
             "mssql_passwords" => self.mssql_passwords = value == "on",
+            "backups" => self.backups = value.parse().unwrap_or(0),
             "tunnel_host" => self.tunnel_host = value.to_string(),
             _ => {}
         }
@@ -290,6 +296,15 @@ impl Settings {
                 choices: Some(&["on", "off"]),
             },
             Row {
+                key: "backups",
+                group: Group::Behaviour,
+                label: "Backups",
+                help: "copies kept of each file from before easysql rewrote it, in ~/.local/state/easysql/backups",
+                value: backups_value(self.backups),
+                default: backups_value(d.backups),
+                choices: Some(BACKUP_CHOICES),
+            },
+            Row {
                 key: "tunnel_host",
                 group: Group::Default,
                 label: "Tunnel through",
@@ -323,6 +338,13 @@ impl Settings {
 
 fn on_off(v: bool) -> &'static str {
     if v { "on" } else { "off" }
+}
+
+fn backups_value(keep: usize) -> String {
+    match keep {
+        0 => "off".into(),
+        n => n.to_string(),
+    }
 }
 
 fn non_empty(value: &str, fallback: &str) -> String {

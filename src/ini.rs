@@ -4,12 +4,13 @@
 //!
 //! The same promise `~/.ssh/config` gets from easyssh: we parse just enough to
 //! list and to rewrite the one section we are touching. Every other line, your
-//! comments and your ordering included, is copied through untouched, and any
-//! write backs the file up first.
+//! comments and your ordering included, is copied through untouched, and the
+//! file is replaced whole, so a crash mid-write never leaves half of it.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One `[name]` block and the keys under it, plus where it sits in the file so
@@ -195,32 +196,117 @@ fn render(name: &str, keys: &[(String, String)]) -> Vec<String> {
 }
 
 fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
     let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
-    fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(path, &out)?;
     harden(path);
     Ok(())
 }
 
-/// Copy the file aside as `<name>.bak.<epoch>` before any in-place edit, so a
-/// wrong answer in a wizard is never the last copy of your connection list.
+/// Replace a file's contents in one step: a temp file beside it, renamed over
+/// it, so a crash mid-write leaves the old file rather than a truncated one. A
+/// symlink is written through rather than replaced, since a dotfiles manager's
+/// link is how that file reaches this machine, and the old file's mode carries
+/// over to the new one.
+pub fn write_atomic(path: &Path, body: &str) -> Result<()> {
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".esql-tmp.{}", std::process::id()));
+    let tmp = target.with_file_name(name);
+    let written = fs::write(&tmp, body).and_then(|_| {
+        if let Ok(meta) = fs::metadata(&target) {
+            fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        fs::rename(&tmp, &target)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))
+}
+
+/// How many copies of one file `backup` keeps, 0 meaning it copies nothing.
+/// Zero until whoever loaded the settings says otherwise, so a test run never
+/// leaves a copy behind.
+static BACKUPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Apply the `backups` setting. Called wherever the settings are loaded or
+/// changed, since the writes that back up never see the settings themselves.
+pub fn set_backups(keep: usize) {
+    BACKUPS.store(keep, Ordering::Relaxed);
+}
+
+pub fn backups_on() -> bool {
+    BACKUPS.load(Ordering::Relaxed) > 0
+}
+
+/// The tail a status line gets after a rewrite, which is nothing when no copy
+/// was taken.
+pub fn backup_note() -> &'static str {
+    if backups_on() {
+        " (backed up first)"
+    } else {
+        ""
+    }
+}
+
+/// `~/.local/state/easysql/backups`, out of the home folder where the files
+/// themselves live.
+pub fn backup_dir() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"))
+        .join("easysql")
+        .join("backups")
+}
+
+/// Copy the file into `backup_dir()` as `<name>.<epoch>` before an in-place
+/// edit and keep only the newest copies of it, as many as the `backups`
+/// setting says. With it off, do nothing.
 pub fn backup(path: &Path) -> Result<()> {
-    if !path.exists() {
+    let keep = BACKUPS.load(Ordering::Relaxed);
+    if keep == 0 || !path.exists() {
         return Ok(());
     }
+    backup_into(path, &backup_dir(), keep)
+}
+
+fn backup_into(path: &Path, dir: &Path, keep: usize) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    // `.pgpass` is kept as `pgpass.<epoch>`, so the folder lists without `-a`.
+    let stem = path.file_name().unwrap_or_default().to_string_lossy();
+    let stem = stem.trim_start_matches('.');
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".bak.{secs}"));
-    let dest: PathBuf = path.with_file_name(name);
+    let dest = dir.join(format!("{stem}.{secs}"));
     fs::copy(path, &dest).with_context(|| format!("backing up to {}", dest.display()))?;
+
+    let prefix = format!("{stem}.");
+    let mut copies: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let secs = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
+            Some((secs, e.path()))
+        })
+        .collect();
+    copies.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old) in copies.into_iter().skip(keep) {
+        let _ = fs::remove_file(old);
+    }
     Ok(())
 }
 
@@ -289,17 +375,6 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
-            // Every write leaves a `<name>.bak.<epoch>` beside it.
-            if let Some(dir) = self.0.parent() {
-                let stem = format!("{}.bak.", self.0.file_name().unwrap().to_string_lossy());
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for e in entries.flatten() {
-                        if e.file_name().to_string_lossy().starts_with(&stem) {
-                            let _ = fs::remove_file(e.path());
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -429,5 +504,88 @@ host=old.example.com
             "~/db.sqlite"
         );
         assert_eq!(collapse_tilde("/srv/db.sqlite"), "/srv/db.sqlite");
+    }
+
+    /// A throwaway directory under the temp dir that deletes itself and
+    /// everything in it.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("easysql-{tag}-{}-{stamp}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn backups_keep_only_the_newest_n_copies_of_a_file() {
+        let tmp = TempDir::new("backups");
+        let file = tmp.0.join(".pgpass");
+        fs::write(&file, "now").unwrap();
+        let dir = tmp.0.join("backups");
+        fs::create_dir_all(&dir).unwrap();
+        for old in ["pgpass.100", "pgpass.200", "pgpass.300", "psqlrc.100"] {
+            fs::write(dir.join(old), "old").unwrap();
+        }
+
+        backup_into(&file, &dir, 2).unwrap();
+
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let pgpass: Vec<&String> = left.iter().filter(|n| n.starts_with("pgpass.")).collect();
+        assert_eq!(
+            pgpass.len(),
+            2,
+            "the copy just taken and the newest old one, got {left:?}"
+        );
+        assert!(
+            pgpass.iter().any(|n| *n == "pgpass.300"),
+            "the newest old copy should survive, got {left:?}"
+        );
+        assert!(
+            left.iter().any(|n| n == "psqlrc.100"),
+            "another file's copies are not this file's to prune, got {left:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_through_a_symlink_keeps_the_link() {
+        let tmp = TempDir::new("symlink");
+        let target = tmp.0.join("dotfiles-psqlrc");
+        let link = tmp.0.join(".psqlrc");
+        fs::write(&target, "old\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic(&link, "new\n").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link a dotfiles manager made should still be a link"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "new\n",
+            "the write should land in the file the link points at"
+        );
     }
 }

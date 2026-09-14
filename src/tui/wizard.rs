@@ -157,6 +157,7 @@ impl App {
     /// Re-do whatever a changed setting decides, so a new value is visible in
     /// the same frame rather than at the next launch.
     pub(super) fn apply_settings(&mut self) {
+        crate::ini::set_backups(self.settings.backups);
         self.sort_conns();
         self.start_probes();
         let n = self.conn_rows().len();
@@ -306,9 +307,10 @@ impl App {
                         self.start_probes();
                         self.select_conn(&key);
                         self.set_status(format!(
-                            "{verb} '{}' in {} (backed up first)",
+                            "{verb} '{}' in {}{}",
                             v[0],
-                            crate::ini::collapse_tilde(&engine.store().to_string_lossy())
+                            crate::ini::collapse_tilde(&engine.store().to_string_lossy()),
+                            crate::ini::backup_note()
                         ));
                     }
                     Err(e) => self.set_failed(format!("{verb} failed: {e}")),
