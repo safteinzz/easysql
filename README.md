@@ -169,9 +169,9 @@ offers the step that would actually get you in:
   anything else easysql names the program rather than guessing a package.
 - From a script: rows go to stdout and easysql's own words to stderr. Once the
   client starts, the exit code is the client's; before that easysql exits 2 for
-  a name, snippet or `/db` it cannot use, 127 when there is no client to run,
-  and 1 when a tunnel it needs will not open or a read-only connection would
-  not be read-only.
+  a name, snippet, `/db` or `--md` it cannot use, 127 when there is no client to
+  run, and 1 when a tunnel it needs will not open or a read-only connection
+  would not be read-only.
 
 ## Compatibility
 

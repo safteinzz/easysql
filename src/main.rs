@@ -46,16 +46,15 @@ const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
   esql <name> 'select 1'     run one query and exit, the way `ssh host 'cmd'` does
   esql <name> :<query>       run a saved query (see the Snippets tab)
   esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)
-  esql --md <name> ...       any of the above that prints rows, as markdown tables
-                             (`esql --md prod -f report.sql`; not for SQL Server)";
+  esql --md <name> ...       any of the above, its rows printed as markdown tables";
 
 /// The rest of the block: what a script can expect, then where to look next.
 const AFTER: &str = concat!(
     "\
 Rows go to stdout and easysql's own words to stderr. Once the client starts,
-the exit code is the client's; before that easysql exits 2 for a name, snippet
-or `/db` it cannot use, 127 when there is no client to run, and 1 when a tunnel
-it needs will not open or a read-only connection would not be read-only.
+the exit code is the client's; before that easysql exits 2 for a name, snippet,
+`/db` or `--md` it cannot use, 127 when there is no client to run, and 1 when a
+tunnel it needs will not open or a read-only connection would not be read-only.
 Everything after `--` reaches the client untouched.
 Run `esql <command> --help` for a command's details.",
     "\n\n",
@@ -89,7 +88,7 @@ const LONG_VERSION: &str = concat!(
     after_help = AFTER
 )]
 struct Cli {
-    /// Print the rows as markdown tables; goes before the connection name
+    /// Print the rows as markdown tables, not for SQL Server; goes before the connection name
     #[arg(long)]
     md: bool,
     #[command(subcommand)]
