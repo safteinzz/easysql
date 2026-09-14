@@ -20,6 +20,7 @@ mod creds;
 mod engines;
 mod history;
 mod ini;
+mod markdown;
 mod reach;
 mod settings;
 mod snippets;
@@ -44,7 +45,9 @@ const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
   esql <name>/<db>           the same connection, another database on that server
   esql <name> 'select 1'     run one query and exit, the way `ssh host 'cmd'` does
   esql <name> :<query>       run a saved query (see the Snippets tab)
-  esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)";
+  esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)
+  esql --md <name> ...       any of the above that prints rows, as markdown tables
+                             (`esql --md prod -f report.sql`; not for SQL Server)";
 
 /// The rest of the block: what a script can expect, then where to look next.
 const AFTER: &str = concat!(
@@ -86,6 +89,9 @@ const LONG_VERSION: &str = concat!(
     after_help = AFTER
 )]
 struct Cli {
+    /// Print the rows as markdown tables; goes before the connection name
+    #[arg(long)]
+    md: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -107,6 +113,13 @@ enum Cmd {
 fn main() {
     let cli = Cli::parse();
 
+    if cli.md && !matches!(cli.command, Some(Cmd::Connect(_))) {
+        eprintln!(
+            "esql: `--md` formats a query's rows, so it needs a connection: `esql --md <name> 'select 1'`."
+        );
+        std::process::exit(2);
+    }
+
     match cli.command {
         // Bare `esql` → the toolbox.
         None => {
@@ -117,6 +130,6 @@ fn main() {
         }
         Some(Cmd::Ls(args)) => commands::ls::run(args),
         Some(Cmd::Selfie(cmd)) => commands::selfcmd::run(cmd),
-        Some(Cmd::Connect(args)) => commands::connect::run(args),
+        Some(Cmd::Connect(args)) => commands::connect::run(args, cli.md),
     }
 }

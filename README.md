@@ -116,6 +116,7 @@ esql prod                   # open a saved connection
 esql prod 'select 1'        # run one query and exit, like `ssh host 'cmd'`
 esql prod/reporting         # the same connection, another database
 esql prod -c 'select 1'     # anything starting with - goes to the client
+esql --md prod -f q.sql     # the rows as markdown tables, ready to paste
 esql ls                     # list them, one name per line
 esql ls -v                  # ...and where each one points
 ```

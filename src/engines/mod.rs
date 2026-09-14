@@ -139,6 +139,21 @@ impl Engine {
         }
     }
 
+    /// What `esql --md` appends to the argv so the client prints rows that can
+    /// be read back, and the shape they come in. psql's is a `-c` rather than
+    /// `--csv` because `~/.psqlrc` runs after the flags and a `\pset format`
+    /// there beats them; `-q` keeps a script's `SET` tags out of the rows.
+    /// sqlcmd has none: its `-s,` does not quote a comma inside a value.
+    pub fn table_output(self) -> Option<(&'static [&'static str], crate::markdown::Rows)> {
+        use crate::markdown::Rows;
+        match self {
+            Engine::Pg => Some((&["-q", "-c", "\\pset format csv"], Rows::Csv)),
+            Engine::MySql => Some((&["--batch"], Rows::Tsv)),
+            Engine::Sqlite => Some((&["-csv", "-header"], Rows::Csv)),
+            Engine::MsSql => None,
+        }
+    }
+
     /// The one line of orientation printed before the terminal is handed over.
     ///
     /// Ordered the way you actually move through a server - databases, then

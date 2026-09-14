@@ -8,7 +8,9 @@
 //! exit (`ssh host 'cmd'`, for databases), and anything else is the client's.
 //! `<name>/<db>` picks another database on the same server first.
 //!
-//! We `exec` (replace this process) so the client owns the terminal cleanly.
+//! We `exec` (replace this process) so the client owns the terminal cleanly,
+//! except under `--md`, where the client runs as a child so its rows can be
+//! redrawn as markdown.
 
 use colored::Colorize;
 
@@ -64,7 +66,41 @@ fn push_query(argv: &mut Vec<String>, conn: &crate::engines::Conn, sql: String) 
     argv.push(sql);
 }
 
-pub fn run(args: Vec<String>) {
+/// Run the client with its stdout captured and print the rows as markdown.
+/// stdin and stderr stay the terminal's, so a password prompt and the client's
+/// own errors reach the user as they would without `--md`, and the exit status
+/// is still the client's.
+fn print_markdown(
+    program: &str,
+    args: &[String],
+    conn: &crate::engines::Conn,
+    settings: &crate::settings::Settings,
+    rows: crate::markdown::Rows,
+) -> ! {
+    use std::process::{Command, Stdio};
+    let out = Command::new(program)
+        .args(args)
+        .envs(conn.connect_env(settings))
+        .envs(conn.secret_env(settings))
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output();
+    match out {
+        Ok(out) => {
+            print!(
+                "{}",
+                crate::markdown::render(&String::from_utf8_lossy(&out.stdout), rows)
+            );
+            std::process::exit(out.status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!("{}", format!("esql: could not run {program}: {e}").red());
+            std::process::exit(127);
+        }
+    }
+}
+
+pub fn run(args: Vec<String>, md: bool) {
     if args.is_empty() {
         eprintln!(
             "{}",
@@ -122,11 +158,35 @@ pub fn run(args: Vec<String>) {
     };
     let adhoc = !session && first != "--" && snippet.is_none() && !first.starts_with('-');
 
+    let table = match (md, conn.engine.table_output()) {
+        (false, _) => None,
+        (true, None) => {
+            eprintln!(
+                "{}",
+                format!(
+                    "esql: `--md` cannot read `{}`'s rows back, since it has no quoted output.",
+                    conn.engine.default_client()
+                )
+                .red()
+            );
+            std::process::exit(2);
+        }
+        (true, Some(_)) if session => {
+            eprintln!(
+                "{}",
+                "esql: `--md` formats a query's rows, so give it one: `esql --md <name> 'select 1'`."
+                    .red()
+            );
+            std::process::exit(2);
+        }
+        (true, Some(t)) => Some(t),
+    };
+
     // Before the tunnel and the history stamp, so a run refused for want of a
     // client leaves nothing behind. A flag the user typed themselves is theirs,
-    // so a passthrough is not a one-shot here.
+    // so a passthrough is not a one-shot here, unless `--md` has to add its own.
     let mut settings = crate::settings::load();
-    if db.is_some() || snippet.is_some() || adhoc {
+    if db.is_some() || snippet.is_some() || adhoc || table.is_some() {
         use_default_client_for_one_shot(&conn, &mut settings);
     }
 
@@ -234,6 +294,9 @@ pub fn run(args: Vec<String>) {
     // The same argv the TUI and the wizard preview build, so both ways in
     // behave identically and the preview can never lie about what runs.
     let mut argv = conn.connect_argv_db(&settings, db.as_deref());
+    if let Some((flags, _)) = table {
+        argv.extend(flags.iter().map(|f| f.to_string()));
+    }
 
     if let Some(sql) = snippet.clone() {
         push_query(&mut argv, &conn, sql);
@@ -269,6 +332,10 @@ pub fn run(args: Vec<String>) {
     let (program, rest) = argv.split_first().expect("connect_argv is never empty");
     let program = program.clone();
     let rest: Vec<String> = rest.to_vec();
+
+    if let Some((_, rows)) = table {
+        print_markdown(&program, &rest, &conn, &settings, rows);
+    }
 
     #[cfg(unix)]
     {
