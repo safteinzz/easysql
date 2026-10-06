@@ -5,6 +5,7 @@
 # ~/.config/easysql - every path is redirected into ./home, XDG included.
 #
 #   ./stage.sh up     build the fixtures, start the servers and the listeners
+#   ./stage.sh servers  only start the two database servers (render.sh does)
 #   ./stage.sh run    launch esql against them (this is what you screenshot)
 #   ./stage.sh shell  a shell where `esql` is this build, for the CLI shots
 #   ./stage.sh down   stop everything, then delete the stage
@@ -251,13 +252,14 @@ EOF
 }
 
 write_vim_shim() {
-  # The editor `o` opens. `-u DEFAULTS` skips this machine's vimrc, system one
-  # included, so the frame is the same on every machine that renders it; a word
-  # in EDITOR itself would be split apart by `env -i $(env_for_stage)`.
+  # The editor `o` opens. `--clean` skips this machine's vimrc, system one
+  # included, so the frame is the same on every machine that renders it, and
+  # unlike `-u DEFAULTS` Neovim takes it too, where `vim` is Neovim. A word in
+  # EDITOR itself would be split apart by `env -i $(env_for_stage)`.
   mkdir -p "$BIN"
   cat > "$BIN/vim" <<'EOF'
 #!/bin/sh
-PATH=/usr/local/bin:/usr/bin:/bin exec vim -u DEFAULTS "$@"
+PATH=/usr/local/bin:/usr/bin:/bin exec vim --clean "$@"
 EOF
   chmod +x "$BIN/vim"
 }
@@ -354,7 +356,20 @@ s.bind(('127.0.0.1', 15432)); s.listen(16); time.sleep(86400)" > /dev/null 2>&1 
 }
 
 start_servers() {
-  [ -n "$CENGINE" ] || { echo "no podman or docker: the sessions will not open" >&2; return 0; }
+  # Inside render.sh's container the servers already run on the host, which
+  # started them with `servers`: seed them, and start nothing.
+  if [ "${DEMO_SERVERS:-}" = external ]; then
+    seed_app_data
+    return 0
+  fi
+  run_servers || return 0
+  seed_app_data
+}
+
+# The two throwaway databases, on the high ports above. Seeding is separate,
+# because it needs psql, which render.sh's host does not have to carry.
+run_servers() {
+  [ -n "$CENGINE" ] || { echo "no podman or docker: the sessions will not open" >&2; return 1; }
   "$CENGINE" rm -f easysql-demo-pg easysql-demo-my > /dev/null 2>&1 || true
   "$CENGINE" run -d --name easysql-demo-pg \
     -e POSTGRES_PASSWORD=devpass -e POSTGRES_USER=dev -e POSTGRES_DB=app \
@@ -363,7 +378,6 @@ start_servers() {
     -e MARIADB_ROOT_PASSWORD=devpass -e MARIADB_DATABASE=shop \
     -p "127.0.0.1:$MY_PORT:3306" docker.io/library/mariadb:11 > /dev/null
   echo "waiting for the servers to accept connections..."
-  seed_app_data
 }
 
 seed_app_data() {
@@ -526,10 +540,11 @@ open_shell() {
 }
 
 case "${1:-up}" in
-  up)    up ;;
+  up)      up ;;
+  servers) run_servers ;;
   run)   (cd "$STAGE" && env -i $(env_for_stage) "$ESQL") ;;
   shell) open_shell ;;
   ls)    (cd "$STAGE" && env -i $(env_for_stage) "$ESQL" ls -v) ;;
   down)  down_quiet; echo "torn down" ;;
-  *)     echo "usage: $0 [up|run|shell|ls|down]" >&2; exit 2 ;;
+  *)     echo "usage: $0 [up|servers|run|shell|ls|down]" >&2; exit 2 ;;
 esac

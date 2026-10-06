@@ -5,6 +5,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
+use super::widgets::PICKER_KEYS;
 use super::*;
 
 /// A modal list picker. Anything the app already knows must be picked, never
@@ -101,10 +102,15 @@ pub(super) fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
     let mut state = ListState::default();
     state.select(Some(p.idx));
     f.render_stateful_widget(list, list_area, &mut state);
+    super::widgets::vscrollbar(
+        f,
+        rect,
+        p.items.len(),
+        state.offset(),
+        list_area.height as usize,
+    );
     f.render_widget(
-        Paragraph::new(super::widgets::box_hint(
-            "j/k ↑↓ move · enter pick · esc cancel",
-        )),
+        Paragraph::new(super::widgets::box_hint(PICKER_KEYS)),
         hint_area,
     );
 }
@@ -161,6 +167,7 @@ impl App {
                 let p = self.prompt.as_mut()?;
                 if let Some(f) = p.fields.get_mut(field) {
                     f.value = choice.clone();
+                    f.back = 0;
                 }
                 // Picking the ssh host decides what the far end of the forward
                 // means, so the target field is recomputed rather than left on
@@ -217,7 +224,7 @@ impl App {
             })
             .collect();
         self.picker = Some(Picker::keyed(
-            "Which database?",
+            "which database?",
             rows,
             PickerAction::NewConnEngine,
         ));
@@ -243,7 +250,7 @@ impl App {
             return;
         }
         self.picker = Some(Picker::keyed(
-            "Which connection is this password for?",
+            "which connection is this password for?",
             rows,
             PickerAction::PasswordFor,
         ));

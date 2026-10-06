@@ -128,11 +128,13 @@ esql ls -v                  # ...and where each one points
 
 | key | does |
 | --- | --- |
-| `↑` `↓` / `k` `j` | move in the list |
-| `←` `→` / `h` `l` / `Tab` | switch tab |
-| `/` | filter the list; `Enter` keeps it, `Esc` drops it |
-| `?` | every key this tab answers to |
-| `q` / `Ctrl-C` | quit |
+| `j` `k` / `↑` `↓` | move in the list |
+| `h` `l` / `←` `→` / `tab` `shift-tab` | switch tab |
+| `/` | filter the list; `↵` keeps it, `esc` drops it |
+| `r` | read the tab's data again |
+| `esc` | cancel a form or a question, close help or an alert |
+| `?` | every key, on every tab |
+| `q` / `ctrl-c` | quit; in a form or a box, `ctrl-c` is `esc` |
 
 Each tab's own keys are on its bottom line, and `?` lists them all.
 

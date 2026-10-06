@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
+use super::widgets::{BOX_CHROME_H, READER_KEYS, vscrollbar};
 use super::*;
 
 pub(crate) struct Alert {
@@ -44,6 +45,10 @@ impl App {
     pub(super) fn alert_key(&mut self, key: KeyEvent) {
         use KeyCode::*;
         let Some(a) = &mut self.alert else { return };
+        if super::input::is_ctrl_c(key) {
+            self.alert = None;
+            return;
+        }
         match key.code {
             Down | Char('j') | PageDown => a.scroll = a.scroll.saturating_add(1),
             Up | Char('k') | PageUp => a.scroll = a.scroll.saturating_sub(1),
@@ -62,11 +67,13 @@ pub(super) fn render_alert(f: &mut Frame, area: Rect, a: &Alert) {
 
     let mut lines: Vec<Line> = a.body.lines().map(|l| Line::raw(l.to_string())).collect();
     lines.push(Line::raw(""));
-    lines.push(box_hint("j/k ↑↓ scroll · esc dismiss"));
+    lines.push(box_hint(READER_KEYS));
 
     let para = Paragraph::new(lines)
         .block(box_block(Color::Yellow, &a.title))
         .wrap(Wrap { trim: false })
         .scroll((a.scroll, 0));
     f.render_widget(para, rect);
+    let view = rect.height.saturating_sub(BOX_CHROME_H) as usize;
+    vscrollbar(f, rect, rows as usize + 2, a.scroll as usize, view);
 }

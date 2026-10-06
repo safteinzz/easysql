@@ -6,14 +6,37 @@ use super::confirm::ConfirmAction;
 use super::widgets::{shell_join, shell_join_display, with_env};
 use super::*;
 
+/// Ctrl-C, which does what Esc does under a box or in a form and quits from a view.
+pub(super) fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+}
+
 impl App {
     pub(super) fn on_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
         if self.show_help {
-            if matches!(
-                key.code,
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
-            ) {
-                self.show_help = false;
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let half = 10;
+            match key.code {
+                _ if is_ctrl_c(key) => self.show_help = false,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => self.show_help = false,
+                KeyCode::Char('d') if ctrl => {
+                    self.help_scroll = self.help_scroll.saturating_add(half)
+                }
+                KeyCode::Char('u') if ctrl => {
+                    self.help_scroll = self.help_scroll.saturating_sub(half)
+                }
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(half),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(half),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Char('g') | KeyCode::Home => self.help_scroll = 0,
+                // `render_help` clamps this to the last screenful.
+                KeyCode::Char('G') | KeyCode::End => self.help_scroll = usize::MAX,
+                _ => {}
             }
             return None;
         }
@@ -25,6 +48,9 @@ impl App {
         }
         if self.confirm.is_some() {
             return self.confirm_key(key);
+        }
+        if self.typed.is_some() {
+            return self.typed_key(key);
         }
         if self.picker.is_some() {
             return self.picker_key(key);
@@ -42,31 +68,25 @@ impl App {
     /// has to run before the per-view letters; the list keeps updating under it
     /// and the arrows still move, which is what makes "type then Enter" work.
     pub(super) fn search_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+        // Esc drops the filter entirely, and Ctrl-C with it, so a reflex Ctrl-C
+        // steps out of the query before it can quit; Enter keeps it and hands
+        // the keys back to the list, so you can search then act on what you found.
+        if key.code == KeyCode::Esc || is_ctrl_c(key) {
+            self.query.clear();
+            self.query_back = 0;
+            self.searching = false;
+            self.requery();
             return None;
         }
         match key.code {
-            // Esc drops the filter entirely; Enter keeps it and hands the keys
-            // back to the list, so you can search then act on what you found.
-            KeyCode::Esc => {
-                self.query.clear();
-                self.searching = false;
-                self.requery();
-            }
             KeyCode::Enter => self.searching = false,
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.requery();
-            }
             KeyCode::Down => self.move_sel(1),
             KeyCode::Up => self.move_sel(-1),
-            KeyCode::Char(c) if !ctrl => {
-                self.query.push(c);
-                self.requery();
+            _ => {
+                if line_edit::edit(&mut self.query, &mut self.query_back, key) {
+                    self.requery();
+                }
             }
-            _ => {}
         }
         None
     }
@@ -74,8 +94,8 @@ impl App {
     pub(super) fn nav_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Ctrl-C always quits, even while a per-view letter (like `c` create) is bound.
-        if ctrl && key.code == KeyCode::Char('c') {
+        // On a view Ctrl-C quits, even though `c` alone is create.
+        if is_ctrl_c(key) {
             self.should_quit = true;
             return None;
         }
@@ -90,11 +110,13 @@ impl App {
             }
             KeyCode::Char('?') if !ctrl => {
                 self.show_help = true;
+                self.help_scroll = 0;
                 return None;
             }
             // `/` is the filter, the same key it is in vim, less and man.
             KeyCode::Char('/') if !ctrl => {
                 self.query.clear();
+                self.query_back = 0;
                 self.searching = true;
                 self.requery();
                 return None;
@@ -261,7 +283,7 @@ impl App {
                 self.refresh_conns();
                 self.refresh_creds();
                 self.start_probes();
-                self.set_status("reloaded every connection file, re-checking ports");
+                self.set_status("refreshed every connection file, re-checking ports");
                 None
             }
             _ => None,
@@ -276,7 +298,7 @@ impl App {
             }
             // Deleting a stored password is not undoable (we never held the
             // secret to put back), so it is gated.
-            KeyCode::Char('d') | KeyCode::Char('x') => {
+            KeyCode::Char('d') => {
                 let cred = self.selected_cred()?.clone();
                 self.confirm = Some(Confirm::new(
                     "forget password",
@@ -347,7 +369,7 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.refresh_creds();
-                self.set_status("reloaded ~/.pgpass and ~/.my.cnf");
+                self.set_status("refreshed ~/.pgpass and ~/.my.cnf");
                 None
             }
             _ => None,
@@ -384,11 +406,17 @@ impl App {
                     connect: None,
                 })
             }
-            KeyCode::Char('d') | KeyCode::Char('x') => {
+            // The `.sql` file is the only copy of what was written, so the
+            // delete takes its typed name rather than a Yes.
+            KeyCode::Char('d') => {
                 let s = self.selected_snippet()?.clone();
-                self.confirm = Some(Confirm::new(
+                self.typed = Some(typed::Typed::new(
                     "delete snippet",
-                    format!("Delete '{}'? The file goes with it.", s.name),
+                    format!(
+                        "Delete '{}'? Its file goes with it, and it is the only copy.",
+                        s.name
+                    ),
+                    s.name.clone(),
                     ConfirmAction::DeleteSnippet { name: s.name },
                 ));
                 None
@@ -397,10 +425,10 @@ impl App {
                 self.refresh_snippets();
                 match crate::snippets::sync_psqlrc() {
                     Ok(p) => self.set_status(format!(
-                        "reloaded · rewrote the easysql block in {}",
+                        "refreshed · rewrote the easysql block in {}",
                         crate::ini::collapse_tilde(&p.to_string_lossy())
                     )),
-                    Err(e) => self.set_status(format!("reloaded, but ~/.psqlrc: {e}")),
+                    Err(e) => self.set_failed(format!("refreshed, but ~/.psqlrc: {e}")),
                 }
                 None
             }
@@ -418,19 +446,37 @@ impl App {
                 self.toggle_tunnel();
                 None
             }
-            KeyCode::Char('d') | KeyCode::Char('x') => {
-                let (host, pid) = {
-                    let t = self.selected_tunnel()?;
-                    (t.host.clone(), t.pid())
+            // Stopping is Enter's; `d` forgets the row, stopping it first.
+            KeyCode::Char('d') => {
+                let t = self.selected_tunnel()?;
+                let named =
+                    t.owner
+                        .as_ref()
+                        .map(|key| match self.conns.iter().find(|c| &c.key() == key) {
+                            Some(c) => format!("'{}'", c.name),
+                            None => "the connection that asked for it".to_string(),
+                        });
+                let after = match (named, t.on()) {
+                    (Some(name), true) => {
+                        format!(
+                            "It is stopped first, and {name} no longer reopens it on the way in."
+                        )
+                    }
+                    (Some(name), false) => format!("{name} no longer reopens it on the way in."),
+                    (None, _) => "Nothing remembers it, so stopping it is what deletes it.".into(),
                 };
-                let Some(pid) = pid else {
-                    self.set_failed("not running - ↵ opens it");
-                    return None;
-                };
-                let _ = tunnels::kill(pid);
-                self.refresh_tunnels();
-                self.start_probes();
-                self.set_status(format!("stopped the tunnel through {host}"));
+                self.confirm = Some(Confirm::new(
+                    "delete tunnel",
+                    format!(
+                        "Delete the forward -{} {} through {}? {after}",
+                        t.kind, t.spec, t.host
+                    ),
+                    ConfirmAction::DeleteTunnel {
+                        owner: t.owner.clone(),
+                        pid: t.pid(),
+                        host: t.host.clone(),
+                    },
+                ));
                 None
             }
             KeyCode::Char('r') => {
@@ -517,7 +563,10 @@ impl App {
             KeyCode::Char('r') => {
                 self.settings = crate::settings::load();
                 self.apply_settings();
-                self.set_status(format!("reloaded {}", crate::settings::path().display()));
+                self.set_status(format!(
+                    "refreshed {}",
+                    crate::ini::collapse_tilde(&crate::settings::path().to_string_lossy())
+                ));
                 None
             }
             _ => None,

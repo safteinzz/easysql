@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs};
 use super::confirm::render_confirm;
 use super::detail::{DETAIL_PCT, detail_fits};
 use super::picker::render_picker;
+use super::widgets::{BACK, READER_KEYS, SEP, key_footer, vscrollbar};
 use super::*;
 
 pub(super) fn ui(f: &mut Frame, app: &mut App) {
@@ -39,7 +40,7 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
     render_status(f, chunks[2], app);
 
     if app.show_help {
-        render_help(f, area);
+        render_help(f, area, app);
     }
     if let Some(p) = &app.prompt {
         render_prompt(f, area, p, &app.tunnels, &app.settings);
@@ -49,6 +50,9 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(c) = &app.confirm {
         render_confirm(f, area, c);
+    }
+    if let Some(t) = &app.typed {
+        super::typed::render_typed(f, area, t);
     }
     // Last, so a failure is never drawn under the thing that caused it.
     if let Some(a) = &app.alert {
@@ -177,6 +181,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .highlight_style(sel)
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut app.conn_state);
+            list_bar(f, area, rows.len(), app.conn_state.offset());
         }
 
         View::Passwords => {
@@ -207,6 +212,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .highlight_style(sel)
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut app.cred_state);
+            list_bar(f, area, rows.len(), app.cred_state.offset());
         }
 
         View::Tunnels => {
@@ -251,6 +257,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .highlight_style(sel)
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut app.tunnel_state);
+            list_bar(f, area, rows.len(), app.tunnel_state.offset());
         }
 
         View::Snippets => {
@@ -292,6 +299,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .highlight_style(sel)
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut app.snippet_state);
+            list_bar(f, area, rows.len(), app.snippet_state.offset());
         }
 
         View::Settings => {
@@ -357,8 +365,21 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                 .highlight_style(sel)
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut app.settings_state);
+            list_bar(f, area, rows.len(), app.settings_state.offset());
         }
     }
+}
+
+/// The scrollbar of a bordered list pane, after the list is drawn so its
+/// `offset` is the one on screen.
+fn list_bar(f: &mut Frame, area: Rect, total: usize, offset: usize) {
+    vscrollbar(
+        f,
+        area,
+        total,
+        offset,
+        area.height.saturating_sub(2) as usize,
+    );
 }
 
 /// The message for an empty pane, or `None` when there are rows to draw. An
@@ -439,110 +460,228 @@ pub(super) fn render_status(f: &mut Frame, area: Rect, app: &App) {
     // While `/` is being typed the line belongs to the query: it is the only
     // place what you typed is visible.
     if app.searching {
-        let spans = vec![
-            Span::styled(
-                " /",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                app.query.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("█"),
-            Span::styled(
-                format!("   {} match   ↵ keep · Esc clear", app.row_count()),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ];
+        let mut spans = vec![Span::styled(
+            " /",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(line_edit::with_cursor(
+            &app.query,
+            app.query_back,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        // Every letter goes into the query here, so only keys that are not
+        // letters are offered.
+        spans.push(Span::styled(
+            format!("   {} match   ↵ keep{SEP}{BACK}", app.row_count()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
 
-    // Show the last action's result while it is fresh; otherwise the key hints,
-    // so a stale message never masquerades as the current state.
-    let (text, style) = match app.live_status() {
+    // Show the last action's result while it is fresh; otherwise the keys, so a
+    // stale message never masquerades as the current state.
+    let line = match app.live_status() {
         // Green for what worked, yellow for what did not, and never red: red
         // means a gate in front of something you are about to lose.
-        Some(msg) => (
-            msg.to_string(),
+        Some(msg) => Line::from(Span::styled(
+            format!(" {msg}"),
             Style::default().fg(if app.status_failed {
                 Color::Yellow
             } else {
                 Color::Green
             }),
-        ),
+        )),
         None => {
-            let hints = match app.view {
-                View::Connections => CONN_HINTS,
-                View::Passwords => PASS_HINTS,
-                View::Tunnels => TUNNELS_HINTS,
-                View::Snippets => SNIP_HINTS,
-                View::Settings => SETTINGS_HINTS,
+            let keys = match app.view {
+                View::Connections => CONN_KEYS,
+                View::Passwords => PASS_KEYS,
+                View::Tunnels => TUNNELS_KEYS,
+                View::Snippets => SNIP_KEYS,
+                View::Settings => SETTINGS_KEYS,
             };
-            // A committed filter stays visible in front of the hints: rows are
+            // A committed filter stays visible in front of the keys: rows are
             // hidden, and nothing else on screen would say why.
-            let text = if app.query.is_empty() {
-                hints.to_string()
-            } else {
-                format!("/{}  (Esc clears) · {hints}", app.query)
+            let lead = match app.query.is_empty() {
+                true => Vec::new(),
+                false => vec![format!("/{}", app.query), BACK.to_string()],
             };
-            (text, Style::default().add_modifier(Modifier::DIM))
+            key_footer(&lead, keys, area.width)
         }
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(format!(" {text}"), style))),
-        area,
-    );
+    f.render_widget(Paragraph::new(line), area);
 }
 
-pub(super) fn render_help(f: &mut Frame, area: Rect) {
-    // Sized like every other box: the widest line plus the chrome, capped at
-    // four fifths of the screen. A hardcoded height is how the last two rows
-    // got clipped the last time this pane grew.
+/// One group of the help panel: a heading, then `(keys, what they do)` rows,
+/// where a row with no keys is a note about the group.
+type HelpSection = (&'static str, &'static [(&'static str, &'static str)]);
+
+/// Every key the app answers to, grouped by where it works. The panel scrolls,
+/// so a new row costs nothing but its line.
+const HELP: &[HelpSection] = &[
+    (
+        "moving",
+        &[
+            ("j/k ↑↓", "move in the list"),
+            ("h/l ←→", "the previous, next tab"),
+            ("tab shift-tab", "the next, previous tab"),
+            ("ctrl-j/k/h/l", "the same, from anywhere"),
+        ],
+    ),
+    (
+        "every tab",
+        &[
+            ("/", "find in the list, esc drops it"),
+            ("r", "refresh what the tab shows"),
+            ("?", "this help"),
+            ("q ctrl-c", "quit"),
+        ],
+    ),
+    (
+        "connections",
+        &[
+            ("↵", "open it in its own client (\\q comes back here)"),
+            ("c", "create a connection"),
+            ("e", "edit it"),
+            ("d", "delete it"),
+            ("y", "yank the command"),
+            ("Y", "yank the url"),
+            ("p", "save its password"),
+            ("t", "reach it through ssh (ssh -L)"),
+            (
+                "",
+                "● up · ● down · ● tunnel closed · ○ checking · pw saved",
+            ),
+        ],
+    ),
+    (
+        "passwords",
+        &[
+            ("c", "create a password"),
+            ("e", "edit it"),
+            ("d", "delete it"),
+            ("o", "open the file in $EDITOR"),
+        ],
+    ),
+    (
+        "tunnels",
+        &[
+            ("↵", "on/off (ssh -N)"),
+            ("d", "delete it, stopping it first"),
+        ],
+    ),
+    (
+        "snippets",
+        &[
+            ("c", "create a snippet"),
+            ("e", "edit it"),
+            ("d", "delete it"),
+            ("o", "open the file in $EDITOR"),
+        ],
+    ),
+    (
+        "settings",
+        &[("↵ e", "change it"), ("d", "put it back to its default")],
+    ),
+    (
+        "in a form",
+        &[
+            ("type", "fill the field, h/j/k/l included"),
+            ("ctrl-j/k ↑↓", "the previous, next field"),
+            ("tab shift-tab", "the next, previous field"),
+            ("h/l ←→", "step a ‹ choice ›"),
+            ("ctrl-o", "pick the ssh host for a tunnel"),
+            ("↵", "the next field, and submit on the last"),
+            ("esc", "cancel"),
+        ],
+    ),
+    (
+        "in a box",
+        &[
+            ("y n", "answer"),
+            ("h/l ←→ tab", "move between the buttons"),
+            ("↵", "select, or pick from a list"),
+            ("j/k ↑↓", "move in a list, scroll an alert"),
+            ("esc", "cancel or close"),
+        ],
+    ),
+    (
+        "in this help",
+        &[
+            ("j/k ↑↓", "scroll"),
+            ("ctrl-d ctrl-u", "half a page down, up"),
+            ("g G", "the top, the bottom"),
+            ("esc q ?", "close"),
+        ],
+    ),
+];
+
+/// The width of the key column, so every description starts in one place.
+const HELP_KEYS: usize = 16;
+
+pub(super) fn help_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (section, entries) in HELP {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            *section,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for (keys, what) in *entries {
+            if keys.is_empty() {
+                lines.push(Line::styled(
+                    format!("  {what}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {keys:<HELP_KEYS$}"),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(*what),
+            ]));
+        }
+    }
+    lines
+}
+
+/// The help reader: the body scrolls under a key row that never moves, with a
+/// scrollbar on the right border once it is taller than the box.
+pub(super) fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
+    let lines = help_lines();
     let width = box_width(area.width);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "easysql - saved connections, their passwords and their tunnels",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::raw("Move        j/k or ↑↓ list     h/l or ←→ switch view     (Ctrl+ works too)"),
-        Line::raw("Global      / filter this list   ? help   q or Ctrl-c quit"),
-        Line::raw(""),
-        Line::raw("Connections ↵ open it in psql / mysql / sqlite3 (\\q comes back here)"),
-        Line::raw("            c new / e edit / d delete   the block in the client's own file"),
-        Line::raw("            p save its password (~/.pgpass · ~/.my.cnf, chmod 600)"),
-        Line::raw("            t reach it through an ssh host (ssh -L)"),
-        Line::raw("            y yank the command · Y yank the URL (never the password)"),
-        Line::raw("            r reload · ● up · ● down · ● tunnel closed · ○ checking"),
-        Line::raw("            pw = a password is saved for it"),
-        Line::raw(""),
-        Line::raw(
-            "Passwords   c save one for a connection · e re-point it · d forget it · r reload",
-        ),
-        Line::raw(
-            "            o open the file in $EDITOR, which is the only way to reorder entries",
-        ),
-        Line::raw("            easysql writes these files and never reads a password back"),
-        Line::raw("Tunnels     ↵ on/off · d stop it (the background ssh -N)   r refresh"),
-        Line::raw("Snippets    c new · e edit the SQL · o open the file · d delete · r reload"),
-        Line::raw("            run one with `esql <connection> :<name>`; psql expands it too"),
-        Line::raw("Settings    ↵ change it · d back to default · r reload the file"),
-        Line::raw(""),
-        Line::raw("In a form   type to fill (h/j/k/l are text!)"),
-        Line::raw("            Ctrl-j/k · Ctrl-↑↓ · Tab move between fields · Esc cancel"),
-        Line::raw("            Ctrl-o picks an ssh host on a tunnel's first field"),
-        Line::raw("In a yes/no y confirm · n or Esc cancel · ←/→ then Enter"),
-        Line::raw(""),
-        Line::raw("Connections live in ~/.pg_service.conf, ~/.my.cnf and"),
-        Line::raw("~/.config/easysql/sqlite.conf - the files your clients already read."),
-    ];
-    lines.push(Line::raw(""));
-    lines.push(super::widgets::box_hint("? esc close"));
-    let rect = box_area(area, width, box_height(lines.len() as u16, area.height));
+    // The body, then a blank and the key row.
+    let rect = box_area(area, width, box_height(lines.len() as u16 + 2, area.height));
     f.render_widget(Clear, rect);
-    let para = Paragraph::new(lines).block(super::widgets::box_block(Color::Cyan, "help"));
-    f.render_widget(para, rect);
+    let block = box_block(Color::Cyan, "help");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let shown = inner.height.saturating_sub(2) as usize;
+    // Clamped here, where the height is known, so scrolling past the end never
+    // piles up presses that then take as many to undo.
+    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(shown));
+    let top = app.help_scroll;
+    let body = Rect {
+        height: shown as u16,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(lines[top..].to_vec()), body);
+    let keys = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(box_hint(READER_KEYS)), keys);
+    if lines.len() > shown {
+        vscrollbar(f, rect, lines.len(), top, shown);
+    }
 }

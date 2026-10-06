@@ -56,7 +56,7 @@ impl App {
                     self.set_failed("no hosts in ~/.ssh/config to tunnel through");
                 } else {
                     self.picker = Some(Picker::plain(
-                        "Which ssh host does the tunnel go through?",
+                        "which ssh host does the tunnel go through?",
                         items,
                         PickerAction::FillField { field: idx },
                     ));
@@ -66,7 +66,7 @@ impl App {
         }
 
         // A choice field types nothing, so the horizontal keys are free to switch
-        // its answer: h/l, the arrows, and the Ctrl-chords all cycle it. You leave
+        // its answer: h/l, the arrows, and the Ctrl-chords all move it. You leave
         // it with Tab, Enter or the vertical keys.
         {
             let p = self.prompt.as_mut().unwrap();
@@ -76,13 +76,16 @@ impl App {
                     Kind::Choice(options) => options.len(),
                     _ => unreachable!(),
                 };
+                // Two options are drawn as buttons, where an arrow points at one
+                // and stops at the edge; a longer list cycles.
+                let buttons = n == 2;
                 match key.code {
                     KeyCode::Right | KeyCode::Char('l') => {
-                        f.choice = (f.choice + 1) % n;
+                        f.choice = if buttons { 1 } else { (f.choice + 1) % n };
                         return None;
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        f.choice = (f.choice + n - 1) % n;
+                        f.choice = if buttons { 0 } else { (f.choice + n - 1) % n };
                         return None;
                     }
                     _ => {}
@@ -134,22 +137,14 @@ impl App {
                 let p = self.prompt.as_mut().unwrap();
                 p.idx = p.step(1);
             }
-            KeyCode::Backspace => {
+            // Everything else is typing or editing, h/j/k/l included. A choice
+            // field holds no text, so stray keys must not accumulate in it.
+            _ => {
                 let f = self.prompt.as_mut().unwrap().cur_mut();
                 if !f.is_choice() {
-                    f.value.pop();
+                    line_edit::edit(&mut f.value, &mut f.back, key);
                 }
             }
-            // Everything else with no Ctrl held is literal text - including
-            // h/j/k/l. A choice field holds no text, so stray keys must not
-            // accumulate in it.
-            KeyCode::Char(c) if !ctrl => {
-                let f = self.prompt.as_mut().unwrap().cur_mut();
-                if !f.is_choice() {
-                    f.value.push(c);
-                }
-            }
-            _ => {}
         }
         None
     }

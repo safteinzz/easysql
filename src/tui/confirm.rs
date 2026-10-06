@@ -11,7 +11,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::probe::{self, Fix};
-use super::widgets::shell_join;
+use super::widgets::{GATE_KEYS, shell_join};
 use super::*;
 
 pub(crate) struct Confirm {
@@ -65,6 +65,13 @@ pub(crate) enum ConfirmAction {
     DeleteSnippet {
         name: String,
     },
+    /// Forget a forward: stop it when it runs, and drop the via that would
+    /// reopen it for its connection.
+    DeleteTunnel {
+        owner: Option<String>,
+        pid: Option<u32>,
+        host: String,
+    },
     /// Offered after an authentication failure: open the password wizard.
     SavePassword {
         key: String,
@@ -111,7 +118,7 @@ pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
         Line::raw(""),
         box_buttons(accent, c.yes),
         Line::raw(""),
-        box_hint("h/l ←/→ move · enter select · y/n"),
+        box_hint(GATE_KEYS),
     ];
     let para = Paragraph::new(lines)
         .block(box_block(accent, &c.title))
@@ -120,11 +127,17 @@ pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
 }
 
 impl App {
-    /// Resolve a pending yes/no. `y` proceeds and `n`/`Esc` cancels outright, or
-    /// move between the buttons (`h`/`l`, the arrows, Tab) and press Enter. Any
-    /// other key is ignored so a stray keypress cannot dismiss the modal.
+    /// Resolve a pending yes/no. `y` proceeds and `n`/`Esc`/Ctrl-C cancels
+    /// outright, or move between the buttons (`h`/`l`, the arrows, Tab) and
+    /// press Enter. Any other key is ignored so a stray keypress cannot dismiss
+    /// the modal.
     pub(super) fn confirm_key(&mut self, key: KeyEvent) -> Option<PendingRun> {
         use KeyCode::*;
+        if super::input::is_ctrl_c(key) {
+            self.confirm = None;
+            self.set_status("cancelled");
+            return None;
+        }
         match key.code {
             Left | Right | Char('h') | Char('l') | Tab | BackTab => {
                 if let Some(c) = self.confirm.as_mut() {
@@ -148,7 +161,12 @@ impl App {
             _ => return None,
         }
         let c = self.confirm.take()?;
-        match c.action {
+        self.run_confirmed(c.action)
+    }
+
+    /// Carry out an answered gate, typed or not, or an accepted offer.
+    pub(super) fn run_confirmed(&mut self, action: ConfirmAction) -> Option<PendingRun> {
+        match action {
             ConfirmAction::DeleteConn { engine, name } => {
                 let conn = self
                     .conns
@@ -175,6 +193,19 @@ impl App {
                     }
                     Some(Err(e)) => self.set_failed(format!("delete failed: {e}")),
                     None => self.set_status(format!("'{name}' is already gone")),
+                }
+            }
+            ConfirmAction::DeleteTunnel { owner, pid, host } => {
+                if let Some(pid) = pid {
+                    let _ = tunnels::kill(pid);
+                }
+                let forgot = owner.as_deref().map(crate::vias::remove);
+                self.refresh_tunnels();
+                // Whatever was reachable through it is not any more.
+                self.start_probes();
+                match forgot {
+                    Some(Err(e)) => self.set_failed(format!("could not forget it: {e}")),
+                    _ => self.set_status(format!("deleted the tunnel through {host}")),
                 }
             }
             ConfirmAction::DeleteSnippet { name } => match crate::snippets::delete(&name) {

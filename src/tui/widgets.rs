@@ -3,11 +3,19 @@
 //! overlay is built from, and rendering an argv the way a shell would read it.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 /// Rough count of how many rows `text` needs when word-wrapped to `width`,
-/// matching how ratatui's `Wrap` breaks on spaces. Used to size modal boxes.
+/// matching how ratatui's `Wrap` breaks on spaces. Each `\n` starts a new row.
+/// Used to size modal boxes.
 pub(super) fn wrapped_line_count(text: &str, width: usize) -> usize {
+    text.split('\n').map(|l| wrapped_rows(l, width)).sum()
+}
+
+/// `wrapped_line_count` for one line with no breaks in it.
+fn wrapped_rows(text: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
@@ -178,6 +186,33 @@ pub(super) fn box_block(colour: Color, title: &str) -> Block<'static> {
         .title(format!(" {} ", title.trim()))
 }
 
+// The words every footer and key row is built from, so the same key reads the
+// same on every screen and a hand-typed legend stands out.
+pub(super) const CREATE: &str = "c create";
+pub(super) const EDIT: &str = "e edit";
+pub(super) const DEL: &str = "d del";
+pub(super) const DEFAULT: &str = "d default";
+pub(super) const YANK: &str = "y yank";
+pub(super) const FIND: &str = "/ find";
+pub(super) const REFRESH: &str = "r refresh";
+pub(super) const QUIT: &str = "q quit";
+pub(super) const HELP: &str = "? help";
+pub(super) const SELECT: &str = "↵ select";
+pub(super) const PICK: &str = "↵ pick";
+pub(super) const NEXT_SUBMIT: &str = "↵ next/submit";
+pub(super) const BACK: &str = "esc back";
+pub(super) const CANCEL: &str = "esc cancel";
+pub(super) const CLOSE: &str = "esc close";
+pub(super) const REQUIRED: &str = "* required";
+pub(super) const SEP: &str = " · ";
+
+/// The key rows of the box kinds, each drawn by that kind's render function.
+pub(super) const GATE_KEYS: &[&str] = &[SELECT, CANCEL];
+pub(super) const TYPED_DEL_KEYS: &[&str] = &["↵ del", CANCEL];
+pub(super) const PICKER_KEYS: &[&str] = &[PICK, CANCEL];
+pub(super) const FORM_KEYS: &[&str] = &[NEXT_SUBMIT, CANCEL];
+pub(super) const READER_KEYS: &[&str] = &[CLOSE];
+
 /// The line of keys a box ends with, as the last row of its body. Every kind
 /// puts it in the same place, so it is where the eye already is.
 ///
@@ -186,19 +221,46 @@ pub(super) fn box_block(colour: Color, title: &str) -> Block<'static> {
 /// `DarkGray` dimmed again. Separation is the blank row above it and its fixed
 /// place at the bottom, not brightness. Colouring it only made a guideline look
 /// like something worth reading.
-pub(super) fn box_hint(keys: &str) -> Line<'static> {
+pub(super) fn box_hint(keys: &[&str]) -> Line<'static> {
     Line::from(Span::styled(
-        keys.to_string(),
+        keys.join(SEP),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     ))
 }
 
-/// The Yes/No row a gate and an offer share. The labels carry their keys, so
-/// the hint line does not have to teach them twice, and the picked one is
-/// filled with the border colour rather than merely reversed: a reversed
-/// button reads as "selected", a filled one reads as "this is what Enter does".
+/// The row under a view: `lead` (what a committed filter is, say) and then as
+/// many of `keys` as fit in `width`, whole and in order, with `? help` pinned
+/// at the right edge however narrow it gets, since help is the way to every key
+/// that fell off.
+pub(super) fn key_footer(lead: &[String], keys: &[&str], width: u16) -> Line<'static> {
+    let width = width as usize;
+    // One column of margin at each end, and a gap before `? help` as wide as a
+    // separator, so it never reads as part of the last key.
+    let room = width.saturating_sub(HELP.chars().count() + 2 + SEP.chars().count());
+    let mut left = String::new();
+    let entries = lead.iter().map(String::as_str).chain(keys.iter().copied());
+    for entry in entries {
+        let next = if left.is_empty() {
+            entry.to_string()
+        } else {
+            format!("{left}{SEP}{entry}")
+        };
+        if next.chars().count() > room {
+            break;
+        }
+        left = next;
+    }
+    let pad = width.saturating_sub(left.chars().count() + HELP.chars().count() + 2);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        Span::styled(format!(" {left}"), dim),
+        Span::raw(" ".repeat(pad.max(1))),
+        Span::styled(format!("{HELP} "), dim),
+    ])
+}
+
 /// One answer of a two-option form toggle: the house button, filled when picked.
 pub(super) fn chip(label: &str, picked: bool) -> Span<'static> {
     let style = if picked {
@@ -212,6 +274,10 @@ pub(super) fn chip(label: &str, picked: bool) -> Span<'static> {
     Span::styled(format!(" {label} "), style)
 }
 
+/// The Yes/No row a gate and an offer share. The labels carry their keys, so
+/// the hint line does not have to teach them twice, and the picked one is
+/// filled with the border colour rather than merely reversed: a reversed
+/// button reads as "selected", a filled one reads as "this is what Enter does".
 pub(super) fn box_buttons(colour: Color, yes: bool) -> Line<'static> {
     let button = |label: &str, picked: bool| {
         let style = if picked {
@@ -229,4 +295,18 @@ pub(super) fn box_buttons(colour: Color, yes: bool) -> Line<'static> {
         Span::raw("  "),
         button("No (n)", !yes),
     ])
+}
+
+/// A scrollbar on `area`'s right border for `total` rows, `view` of them on
+/// screen from `top`, where `area` is the bordered rect it sits on. Nothing is
+/// drawn when every row fits.
+pub(super) fn vscrollbar(f: &mut Frame, area: Rect, total: usize, top: usize, view: usize) {
+    if total <= view {
+        return;
+    }
+    let mut state = ScrollbarState::new(total - view).position(top);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None);
+    f.render_stateful_widget(bar, area.inner(Margin::new(0, 1)), &mut state);
 }

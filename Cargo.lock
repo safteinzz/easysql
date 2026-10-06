@@ -250,8 +250,8 @@ dependencies = [
  "colored",
  "crossterm",
  "dirs",
- "libc",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]

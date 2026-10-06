@@ -290,7 +290,7 @@ mod tests {
         assert!(rows[0].on());
 
         // A forward nothing recorded is still a row, just one with no owner to
-        // name: it is running, and `d` on it has to mean something.
+        // name: it is running, and Enter and `d` on it have to mean something.
         let rows = rows_from(&[running("9000:127.0.0.1:80")], Vec::new());
         assert_eq!(rows.len(), 1);
         assert!(rows[0].owner.is_none());

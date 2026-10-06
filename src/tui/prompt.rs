@@ -5,6 +5,7 @@ use crate::tunnels::Entry;
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
+use super::widgets::{FORM_KEYS, REQUIRED, SEP};
 use super::*;
 
 /// One editable line in a wizard: a label in the left column, a value in the
@@ -18,6 +19,8 @@ pub(crate) struct Field {
     /// label so every label stays one short noun and the values line up.
     pub(crate) hint: String,
     pub(crate) value: String,
+    /// The cursor in `value`, as characters after it (`line_edit::edit`).
+    pub(crate) back: usize,
     pub(crate) kind: Kind,
     /// Which option a `Choice` field has selected. Unused by the other kinds.
     pub(crate) choice: usize,
@@ -45,6 +48,7 @@ impl Field {
             default: default.into(),
             hint: String::new(),
             value: String::new(),
+            back: 0,
             kind: Kind::Text,
             choice: 0,
             required: false,
@@ -254,7 +258,7 @@ impl Prompt {
     pub(super) fn add_conn(engine: Engine) -> Self {
         Self {
             title: format!(
-                "Add a {} connection to {}",
+                "add a {} connection to {}",
                 engine.label(),
                 crate::ini::collapse_tilde(&engine.store().to_string_lossy())
             ),
@@ -337,7 +341,7 @@ impl Prompt {
             fields: vec![
                 Field::filled("Tunnel through", &via)
                     .required()
-                    .hint("an ssh host"),
+                    .hint("ctrl-o to pick · or type an ssh host"),
                 Field::filled("Database host", &db_host).required(),
                 Field::filled("Database port", &c.port_or_default()).required(),
                 Field::new("Local port", "= database port").hint("where you'll reach it"),
@@ -386,8 +390,8 @@ impl Prompt {
     pub(super) fn snippet(from: Option<&crate::snippets::Snippet>) -> Self {
         Self {
             title: match from {
-                Some(s) => format!("Edit the snippet '{}'", s.name),
-                None => "New saved query".to_string(),
+                Some(s) => format!("edit the snippet '{}'", s.name),
+                None => "new saved query".to_string(),
             },
             idx: 0,
             action: Action::Snippet {
@@ -662,9 +666,11 @@ pub(super) fn render_prompt(
             spans.push(Span::raw(if active { "█ " } else { "" }));
             spans.push(Span::styled(example.clone(), dim));
             example
+        } else if active {
+            spans.extend(line_edit::with_cursor(&value, field.back, Style::default()));
+            String::new()
         } else {
             spans.push(Span::raw(value.clone()));
-            spans.push(Span::raw(if active { "█" } else { "" }));
             String::new()
         };
         texts.push(format!(
@@ -714,14 +720,14 @@ pub(super) fn render_prompt(
         texts.push(line.clone());
         lines.push(Line::from(Span::styled(line, dim)));
     }
-    let mut hint = "↑↓ tab move · ←→ choose · enter next/submit · esc cancel".to_string();
+    let mut keys = FORM_KEYS.to_vec();
     if p.fields.iter().any(|f| f.required) {
-        hint.push_str(" · * required");
+        keys.push(REQUIRED);
     }
     lines.push(Line::raw(""));
-    lines.push(box_hint(&hint));
     texts.push(String::new());
-    texts.push(hint.clone());
+    texts.push(keys.join(SEP));
+    lines.push(box_hint(&keys));
 
     // Size to the *wrapped* content: a preview can be far wider than the box,
     // and counting lines instead of rows pushes the keys out through the

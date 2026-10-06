@@ -303,7 +303,7 @@ fn backup_into(path: &Path, dir: &Path, keep: usize) -> Result<()> {
             Some((secs, e.path()))
         })
         .collect();
-    copies.sort_by(|a, b| b.0.cmp(&a.0));
+    copies.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, old) in copies.into_iter().skip(keep) {
         let _ = fs::remove_file(old);
     }

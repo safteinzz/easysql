@@ -144,7 +144,7 @@ impl Tunnel {
     /// A tunnel is alive while its PID is still running *this* forward. The
     /// argv is checked rather than only `/proc/<pid>`: the state file outlives a
     /// reboot, and a pid the kernel has since handed to something else would
-    /// otherwise read as up and be what `d` kills.
+    /// otherwise read as up and be what Enter or `d` kills.
     pub fn alive(&self) -> bool {
         proc_is_ours(self.pid, self.kind, &self.spec, &self.host)
     }

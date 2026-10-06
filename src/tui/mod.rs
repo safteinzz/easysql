@@ -25,7 +25,6 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::{ListState, Padding};
 use std::collections::HashMap;
 use std::io::{self, Stdout};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -37,10 +36,12 @@ mod confirm;
 mod detail;
 mod filter;
 mod input;
+mod line_edit;
 mod picker;
 mod probe;
 mod prompt;
 mod render;
+mod typed;
 mod widgets;
 mod wizard;
 
@@ -50,8 +51,8 @@ use picker::Picker;
 use prompt::{Action, Kind, Prompt, render_prompt};
 use render::ui;
 use widgets::{
-    box_area, box_block, box_buttons, box_height, box_hint, box_inner_width, box_width, empty,
-    titled, wrapped_line_count,
+    CREATE, DEFAULT, DEL, EDIT, FIND, QUIT, REFRESH, YANK, box_area, box_block, box_buttons,
+    box_height, box_hint, box_inner_width, box_width, empty, titled, wrapped_line_count,
 };
 
 /// The tabs. Order here is the left-to-right / Tab-cycle order.
@@ -91,15 +92,25 @@ const VIEWS: [View; 5] = [
     View::Settings,
 ];
 
-// The bottom bar is a terse reminder of this view's actions only; `?` opens the
-// full cheat-sheet (navigation keys and the real command behind each action), so
-// the bar stays short instead of restating everything and overflowing.
-const CONN_HINTS: &str = "↵ open · c new · e edit · d del · p password · t tunnel · y yank · Y url · r refresh · / find · ? help";
-const SNIP_HINTS: &str = "c new · e edit · o open the file · d delete · r reload · / find · ? help";
-const PASS_HINTS: &str =
-    "c new · e edit · o open the file · d forget · r refresh · / find · ? help";
-const TUNNELS_HINTS: &str = "↵ on/off · d stop · r refresh · / find · ? help";
-const SETTINGS_HINTS: &str = "↵ change · d back to default · r reload · ? help";
+// The bottom bar names this view's actions only, in the house order; `?` opens
+// every key, motions included, so the bar stays short instead of overflowing.
+const CONN_KEYS: &[&str] = &[
+    "↵ open",
+    "p password",
+    "t tunnel",
+    YANK,
+    "Y yank url",
+    CREATE,
+    EDIT,
+    DEL,
+    FIND,
+    REFRESH,
+    QUIT,
+];
+const PASS_KEYS: &[&str] = &["o open file", CREATE, EDIT, DEL, FIND, REFRESH, QUIT];
+const TUNNELS_KEYS: &[&str] = &["↵ on/off", DEL, FIND, REFRESH, QUIT];
+const SNIP_KEYS: &[&str] = &["o open file", CREATE, EDIT, DEL, FIND, REFRESH, QUIT];
+const SETTINGS_KEYS: &[&str] = &["↵ change", DEFAULT, FIND, REFRESH, QUIT];
 
 /// How long a status message stays on screen before the hints return.
 const STATUS_TTL: Duration = Duration::from_secs(3);
@@ -127,6 +138,8 @@ pub(super) struct App {
     pub(super) prompt: Option<Prompt>,
     pub(super) picker: Option<Picker>,
     pub(super) confirm: Option<Confirm>,
+    /// A delete waiting for its name to be typed.
+    pub(super) typed: Option<typed::Typed>,
     pub(super) status: String,
     /// Whether the message on screen is a failure, which is all that decides
     /// its colour.
@@ -135,9 +148,13 @@ pub(super) struct App {
     /// message never sits there looking like it is still current.
     pub(super) status_at: Option<Instant>,
     pub(super) show_help: bool,
+    /// The help reader's first shown row, clamped by `render_help`.
+    pub(super) help_scroll: usize,
     pub(super) should_quit: bool,
     /// What `/` is filtering the current list by. Empty means "show all".
     pub(super) query: String,
+    /// The cursor in `query`, as characters after it (`line_edit::edit`).
+    pub(super) query_back: usize,
     /// True while the query is being typed, so keys go into it instead of
     /// triggering actions.
     pub(super) searching: bool,
@@ -177,13 +194,16 @@ impl App {
             prompt: None,
             picker: None,
             confirm: None,
+            typed: None,
             alert: None,
             status: String::new(),
             status_failed: false,
             status_at: None,
             show_help: false,
+            help_scroll: 0,
             should_quit: false,
             query: String::new(),
+            query_back: 0,
             searching: false,
             history: history::History::default(),
             reach: HashMap::new(),
@@ -769,27 +789,15 @@ fn run_suspended(
         println!("\x1b[2m  {hint}\x1b[0m");
     }
 
-    // Ctrl-C reaches every process in the foreground group, so without this it
-    // kills easysql mid-suspend and the shell comes back in raw mode. Do what
-    // `system(3)` does and ignore it while the child runs; SIG_IGN survives exec,
-    // so the child restores SIG_DFL itself.
-    let status;
-    unsafe {
-        let prev_int = libc::signal(libc::SIGINT, libc::SIG_IGN);
-        let prev_quit = libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]);
-        cmd.envs(env.iter().map(|(k, v)| (k, v)));
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            Ok(())
-        });
-        status = cmd.status().ok();
-
-        libc::signal(libc::SIGINT, prev_int);
-        libc::signal(libc::SIGQUIT, prev_quit);
+    // A Ctrl-C at the client's prompt is meant for the client, and would
+    // otherwise end the toolbox and leave the shell in raw mode.
+    let caught = swallow_interrupts();
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
+    let status = cmd.status().ok();
+    for id in caught {
+        signal_hook::low_level::unregister(id);
     }
 
     enable_raw_mode()?;
@@ -797,6 +805,19 @@ fn run_suspended(
     terminal.hide_cursor()?;
     terminal.clear()?;
     Ok(status)
+}
+
+/// Catch Ctrl-C and Ctrl-\ and do nothing with them, while a child that owns
+/// the terminal acts on them. A caught signal is reset to the default in an
+/// exec'd child, so this never reaches it, unlike `SIG_IGN`, which it would
+/// inherit. Hand the ids to `signal_hook::low_level::unregister` to stop.
+fn swallow_interrupts() -> Vec<signal_hook::SigId> {
+    use signal_hook::consts::{SIGINT, SIGQUIT};
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    [SIGINT, SIGQUIT]
+        .into_iter()
+        .filter_map(|signal| signal_hook::flag::register(signal, seen.clone()).ok())
+        .collect()
 }
 
 fn setup() -> Result<Term> {
