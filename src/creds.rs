@@ -206,6 +206,7 @@ pub fn set_pg_in(
     user: &str,
     password: &str,
 ) -> Result<()> {
+    let [host, port, database, user] = [host, port, database, user].map(widen);
     let text = fs::read_to_string(path).unwrap_or_default();
     let entry = [host, port, database, user, password]
         .iter()
@@ -234,6 +235,12 @@ pub fn set_pg_in(
     write_pgpass(path, &out)
 }
 
+/// A blank matching field as `*`: libpq always has a user, a host and a port,
+/// so an empty field would match nothing and the password would never be used.
+fn widen(field: &str) -> &str {
+    if field.is_empty() { "*" } else { field }
+}
+
 /// Move an entry to a different host, port, database or user, keeping whatever
 /// password it already holds.
 ///
@@ -258,6 +265,7 @@ pub fn rekey_pg_in(
     database: &str,
     user: &str,
 ) -> Result<()> {
+    let [host, port, database, user] = [host, port, database, user].map(widen);
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut out: Vec<String> = Vec::new();
     let mut seen = 0usize;
@@ -366,6 +374,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn a_blank_pgpass_field_is_written_as_a_wildcard() {
+        // libpq always has a user, so an empty field would match nothing and
+        // the password would never be used.
+        let f = Temp::new("");
+        set_pg_in(&f.0, "db.example.com", "5432", "*", "", "pw").unwrap();
+        assert_eq!(f.lines(), vec!["db.example.com:5432:*:*:pw".to_string()]);
     }
 
     #[test]

@@ -29,15 +29,98 @@ pub struct Snippet {
 impl Snippet {
     /// The first line worth showing in a list, collapsed to one line.
     pub fn summary(&self) -> String {
-        let one: String = self
-            .sql
+        let one: String = without_line_comments(&self.sql)
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with("--"))
+            .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
         one
     }
+}
+
+/// `sql` with every `--` comment cut to the end of its line, except inside a
+/// '…' string, a "…" identifier, a $tag$ body or a `/* … */` block, which is
+/// kept whole (and nests, as the server reads it). Joined onto one line, a
+/// trailing comment would swallow everything after it: `:name` in psql then
+/// runs `select count(*) -- n from t` as `select count(*)`.
+fn without_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("--") {
+            rest = &rest[rest.find('\n').unwrap_or(rest.len())..];
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let len = block_comment_len(rest);
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+            continue;
+        }
+        let quoted = match c {
+            '\'' | '"' => Some(c.to_string()),
+            '$' => dollar_tag(rest),
+            _ => None,
+        };
+        let Some(close) = quoted else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        };
+        // A doubled quote inside '…' or "…" closes and reopens it, which this
+        // reads the same as one string.
+        let body = &rest[close.len()..];
+        let len = body
+            .find(&close)
+            .map_or(rest.len(), |i| close.len() * 2 + i);
+        out.push_str(&rest[..len]);
+        rest = &rest[len..];
+    }
+    out
+}
+
+/// How long the `/* … */` at the start of `s` is, nested ones included, or all
+/// of `s` when it is never closed.
+fn block_comment_len(s: &str) -> usize {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < s.len() {
+        if s[i..].starts_with("/*") {
+            depth += 1;
+            i += 2;
+        } else if s[i..].starts_with("*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+        } else {
+            i += s[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    s.len()
+}
+
+/// Whether psql takes `name` as a variable, so `:name` can expand at its
+/// prompt: letters, digits, `_` and any non-ASCII character. A snippet named
+/// otherwise still runs as `esql <conn> :name`, but gets no `\set`.
+pub fn psql_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c == '_' || c.is_ascii_alphanumeric() || !c.is_ascii())
+}
+
+/// The `$tag$` opening a dollar-quoted string at the start of `s`, if one does;
+/// `$1` is a parameter, since a tag cannot start with a digit.
+fn dollar_tag(s: &str) -> Option<String> {
+    let inner = &s[1..];
+    let len = inner.find('$')?;
+    let tag = &inner[..len];
+    let valid = tag.chars().next().is_none_or(|c| !c.is_ascii_digit())
+        && tag.chars().all(|c| c.is_alphanumeric() || c == '_');
+    valid.then(|| format!("${tag}$"))
 }
 
 pub fn dir() -> PathBuf {
@@ -83,9 +166,14 @@ pub fn save(name: &str, sql: &str) -> Result<PathBuf> {
     save_in(&dir(), name, sql)
 }
 
+/// Whether `name` can be a snippet's file stem without escaping the directory.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\']) && !name.starts_with('.')
+}
+
 pub fn save_in(dir: &std::path::Path, name: &str, sql: &str) -> Result<PathBuf> {
     let name = name.trim();
-    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+    if !valid_name(name) {
         anyhow::bail!("a snippet name cannot be empty, contain a slash, or start with a dot");
     }
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -128,7 +216,7 @@ pub fn psqlrc_block(snips: &[Snippet]) -> String {
     out.push('\n');
     for s in snips {
         let one = s.summary();
-        if one.is_empty() {
+        if one.is_empty() || !psql_name(&s.name) {
             continue;
         }
         // psql's own escaping inside a single-quoted \set value.
@@ -310,5 +398,20 @@ mod tests {
             }]),
         );
         assert_eq!(again, second);
+    }
+
+    #[test]
+    fn flattening_never_cuts_inside_a_block_comment() {
+        // A `--` inside `/* */` is not a comment to the server, so cutting
+        // there would drop the rest of the query from the `\set` line.
+        let block = psqlrc_block(&[Snippet {
+            name: "cnt".into(),
+            sql: "select count(*) -- n\nfrom t /* a -- b */ where x = 1\n".into(),
+            path: PathBuf::new(),
+        }]);
+        assert!(
+            block.contains("\\set cnt 'select count(*) from t /* a -- b */ where x = 1'"),
+            "{block}"
+        );
     }
 }

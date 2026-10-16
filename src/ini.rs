@@ -2,10 +2,10 @@
 //! Postgres' `~/.pg_service.conf` and MySQL's `~/.my.cnf`. One reader and one
 //! set of block surgeons serve both.
 //!
-//! The same promise `~/.ssh/config` gets from easyssh: we parse just enough to
-//! list and to rewrite the one section we are touching. Every other line, your
-//! comments and your ordering included, is copied through untouched, and the
-//! file is replaced whole, so a crash mid-write never leaves half of it.
+//! We parse just enough to list and to rewrite the one section we are
+//! touching. Every other line, your comments and your ordering included, is
+//! copied through untouched, and the file is replaced whole, so a crash
+//! mid-write never leaves half of it.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -155,9 +155,15 @@ pub fn remove(path: &Path, name: &str) -> Result<()> {
     if start > 0 && lines[start - 1].trim().is_empty() {
         start -= 1;
     }
+    // At the top of the file there is no blank before it to take, so take the
+    // one after it, or the next section starts the file with an empty line.
+    let mut end = sec.end;
+    while start == 0 && end < lines.len() && lines[end].trim().is_empty() {
+        end += 1;
+    }
     let out: Vec<String> = lines[..start]
         .iter()
-        .chain(lines[sec.end..].iter())
+        .chain(lines[end..].iter())
         .map(|l| l.to_string())
         .collect();
     write_lines(path, &out)

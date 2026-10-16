@@ -47,7 +47,7 @@ esql ls -v                                     # marks it (read-only)
 
 ![Saving a password for the one connection without one, typed as dots, then the Passwords tab listing it among the others, never shown](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/passwords.gif)
 
-Typed once, written straight to the file that engine's client reads, and never read back, echoed, or put in an argv or the environment.
+Typed once, written straight to the file that engine's client reads, and never shown, echoed or put in an argv.
 
 ## Saved queries
 
@@ -64,23 +64,54 @@ The check you keep rewriting, kept as a `.sql` file: the same `:name` runs on ev
 
 ## Your defaults, not mine
 
-![The Settings tab showing eleven settings grouped into behaviour and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
+![The Settings tab showing seventeen settings grouped into behaviour, usql and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
 
 Which program opens each engine, whether ports are checked, what order the list is in. `d` puts any of them back.
+
+## Tables you can read on SQL Server
+
+`sqlcmd` pads every column to its declared width and has no pager, so [usql](https://github.com/xo/usql) can open your connections instead, with tables sized to the data and paged by `less`.
+
+```bash
+esql set usql_tui on     # Enter in the toolbox opens usql
+esql set usql_cli on     # and `esql <name>` too, if no script reads its output
+esql set usql_pg on      # SQL Server and SQLite are on, Postgres and MySQL are yours to add
+```
+
+`\c <db>` reaches every database on the server by name, and your saved password goes along in a file that lasts one run. Take usql's static build, since a distro's may lack the SQL Server driver.
 
 ## Commands
 
 ```bash
-esql prod 'select 1'        # run one query and exit, like `ssh host 'cmd'`
-esql prod/reporting         # the same connection, another database
-esql prod -c 'select 1'     # anything starting with - goes to the client
-esql --md prod -f q.sql     # the rows as markdown tables, ready to paste
-esql ls                     # list them, one name per line
+esql prod 'select 1'                         # run one query and exit, like `ssh host 'cmd'`
+esql prod/reporting                          # the same connection, another database
+esql prod -c 'select 1'                      # anything starting with - goes to the client
+esql --md prod -f q.sql                      # the rows as markdown tables, ready to paste
+esql --dump prod > prod.sql                  # back it up with pg_dump, mysqldump or sqlite3
+esql ls                                      # list them, one name per line
+esql conn add pg prod --host db.example.com  # save one where psql reads it
+esql conn edit prod --read-only              # change only what you name
+esql conn rm prod                            # delete it
+esql pw set prod                             # save its password, typed without echo
+esql tunnel up prod --via bastion            # open the forward and point prod at it
+esql tunnel down prod                        # stop it, and the next connect reopens it
+esql snippet add tables 'select ...'         # save a query for `esql <name> :tables`
+esql set backups 5                           # change a setting, and `esql set` lists them
 ```
 
 `esql <command> --help` has the details, and `?` in the toolbox lists every key.
 
-Rows go to stdout and easysql's own words to stderr. Once the client starts the exit code is the client's, and `esql --help` lists the codes easysql exits with before that.
+A script never has to edit a file by hand. Nothing asks without a terminal: a delete takes `-y`, `pw set --stdin` reads the password from a pipe, `-n` prints the steps without taking them, and `esql ls --json` has fixed field names.
+
+Rows, or the dump, go to stdout and easysql's own words to stderr. Once the client starts the exit code is the client's, and `esql --help` lists the codes easysql exits with before that.
+
+## Tab completion
+
+```bash
+esql completions bash --add   # or zsh, fish
+```
+
+Open a new shell and Tab completes commands, connection names, saved queries and setting keys.
 
 ## Where it keeps things
 
@@ -96,6 +127,7 @@ Rows go to stdout and easysql's own words to stderr. Once the client starts the 
 ~/.config/easysql/vias               the forward each connection needs
 ~/.config/easysql/settings           your settings
 ~/.local/state/easysql/              running tunnels, history and backups
+$XDG_RUNTIME_DIR/easysql/pass/       what usql is handed for one run, gone when it ends
 ```
 
 Password files are chmod 600, and every write rewrites only its own section, so your comments and extra keys survive.
@@ -127,6 +159,7 @@ Postgres           psql
 MySQL, MariaDB     mysql
 SQLite             sqlite3
 SQL Server         sqlcmd
+any of the four    usql, with `esql set usql_tui on` or `usql_cli on`
 ```
 
 SQL Server is in no distro's repos, so there is no install to offer, and `sqlcmd` shares no file easysql could write, so easysql keeps that list itself.

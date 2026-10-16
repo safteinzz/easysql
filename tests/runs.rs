@@ -65,6 +65,54 @@ impl Stage {
             .unwrap()
     }
 
+    fn esql_fed(&self, args: &[&str], stdin: &str) -> Output {
+        use std::io::Write;
+        let home = &self.0;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_esql"))
+            .args(args)
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("PATH", home.join("bin"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// Every file under the stage's HOME with what it holds, for comparing
+    /// before and after.
+    fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.0, &mut out);
+        out.sort();
+        out
+    }
+
     fn history(&self) -> Option<String> {
         fs::read_to_string(self.0.join(".local/state/easysql/history")).ok()
     }
@@ -185,4 +233,61 @@ fn a_password_file_others_can_read_is_not_used() {
         "a group- or world-readable password file is refused, as libpq refuses .pgpass: {}",
         loose.log("sqlcmd")
     );
+}
+
+#[test]
+fn a_dry_run_changes_no_file() {
+    let s = Stage::new();
+    for setup in [
+        &[
+            "conn",
+            "add",
+            "pg",
+            "app",
+            "--host",
+            "db.example.com",
+            "--user",
+            "alice",
+        ][..],
+        &["snippet", "add", "q", "select 1"],
+    ] {
+        let out = s.esql(setup);
+        assert!(out.status.success(), "setup {setup:?}: {out:?}");
+    }
+    let before = s.files();
+
+    for (args, stdin) in [
+        (
+            &[
+                "conn",
+                "add",
+                "pg",
+                "other",
+                "--host",
+                "db.example.com",
+                "-n",
+            ][..],
+            "",
+        ),
+        (
+            &[
+                "conn", "edit", "app", "--port", "6543", "--rename", "app2", "-n",
+            ],
+            "",
+        ),
+        (&["conn", "rm", "app", "-y", "-n"], ""),
+        (&["pw", "set", "app", "--stdin", "-n"], "s3cret\n"),
+        (&["snippet", "add", "q2", "select 2", "-n"], ""),
+        (&["snippet", "rm", "q", "-y", "-n"], ""),
+        (&["set", "backups", "3", "-n"], ""),
+        (&["set", "hints", "--default", "-n"], ""),
+    ] {
+        let out = s.esql_fed(args, stdin);
+        assert!(out.status.success(), "{args:?} should succeed: {out:?}");
+        assert!(
+            !out.stdout.is_empty(),
+            "{args:?} should print the steps it would take"
+        );
+        assert!(s.files() == before, "{args:?} with -n changed a file");
+    }
 }

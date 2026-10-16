@@ -38,10 +38,20 @@ pub(super) fn why_failed(c: &Conn, s: &Settings) -> Option<Failure> {
     if !c.engine.networked() {
         return None;
     }
-    let (argv, env) = match c.engine {
-        Engine::Pg => engines::pg::probe_argv(c, s),
-        Engine::MySql => engines::mysql::probe_argv(c, s),
-        Engine::MsSql => engines::mssql::probe_argv(c, s),
+    // `_secret` holds a usql passfile until the probe has exited.
+    let (argv, env, _secret) = match c.engine {
+        Engine::Pg => {
+            let (argv, env) = engines::pg::probe_argv(c, s);
+            (argv, env, None)
+        }
+        Engine::MySql => {
+            let (argv, env) = engines::mysql::probe_argv(c, s);
+            (argv, env, None)
+        }
+        Engine::MsSql => {
+            let (argv, secret) = engines::mssql::probe_argv(c, s);
+            (argv, secret.env.clone(), Some(secret))
+        }
         Engine::Sqlite => return None,
     };
     let mut cmd = Command::new(&argv[0]);
@@ -85,10 +95,10 @@ fn classify(text: &str) -> Option<Fix> {
         "password authentication failed",
         "Access denied for user",
         "authentication method 10 not supported",
-        // sqlcmd's wording, via the ODBC driver.
+        // SQL Server's own wording, through sqlcmd and usql alike.
         "Login failed for user",
     ];
-    const TUNNEL: [&str; 11] = [
+    const TUNNEL: [&str; 12] = [
         "Connection refused",
         "Connection timed out",
         "No route to host",
@@ -103,22 +113,27 @@ fn classify(text: &str) -> Option<Fix> {
         // sqlcmd's wording when nothing is listening or the name is wrong.
         "TCP Provider",
         "Login timeout expired",
+        // usql's, for a port nothing answers on.
+        "unable to open tcp connection with host",
     ];
     const NAME: [&str; 3] = [
         "does not exist",
         "Unknown database",
-        // sqlcmd's wording for a database that is not there.
+        // SQL Server's wording for a database that is not there.
         "Cannot open database",
     ];
 
+    // A name first: SQL Server follows "Cannot open database" with "Login
+    // failed for user", so a missing database would otherwise read as a bad
+    // password.
+    if NAME.iter().any(|p| text.contains(p)) {
+        return Some(Fix::Name);
+    }
     if PASSWORD.iter().any(|p| text.contains(p)) {
         return Some(Fix::Password);
     }
     if TUNNEL.iter().any(|p| text.contains(p)) {
         return Some(Fix::Tunnel);
-    }
-    if NAME.iter().any(|p| text.contains(p)) {
-        return Some(Fix::Name);
     }
     None
 }

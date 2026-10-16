@@ -28,6 +28,28 @@ pub fn read_only(extra: &[(String, String)]) -> bool {
         .any(|(k, v)| k.eq_ignore_ascii_case("readonly") && v == "yes")
 }
 
+/// The file as a usql URL. A `file:` URI is the one form whose `mode` the
+/// driver honours: `ro` refuses every write, and `rw` refuses a missing file
+/// where a bare path would create an empty one. The path is percent-encoded,
+/// or a `#` or `?` in it would end the path.
+pub fn usql_url(path: &str, read_only: bool) -> String {
+    let path = ini::expand_tilde(path).to_string_lossy().into_owned();
+    let mode = if read_only { "ro" } else { "rw" };
+    format!(
+        "sqlite3:file:{}?mode={mode}",
+        super::percent_encode(&path, "/")
+    )
+}
+
+/// One argument of a dot-command, which sqlite3 splits on spaces unless it is
+/// quoted.
+pub fn dot_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains(|c: char| c.is_whitespace() || c == '"') {
+        return a.to_string();
+    }
+    format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 pub fn list() -> Vec<Conn> {
     ini::read(&store_path())
         .into_iter()
@@ -41,6 +63,21 @@ pub fn list() -> Vec<Conn> {
             name: s.name,
         })
         .collect()
+}
+
+/// A typed path as it should be saved: relative to where it was typed, since
+/// the client is later started from wherever `esql` happens to run, and
+/// sqlite3 creates an empty database at a path that does not exist. `~` and
+/// absolute paths are kept as written.
+pub fn absolute(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() || path.starts_with('~') || std::path::Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(dir) => dir.join(path).to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
 }
 
 pub fn save(original: Option<&str>, nc: &NewConn) -> Result<()> {

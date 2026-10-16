@@ -6,7 +6,7 @@
 //! the same registry `cargo install` would pull from.
 
 use colored::Colorize;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 
 const CRATE: &str = "easysql";
@@ -17,7 +17,7 @@ pub enum Cmd {
     ///   -y   skip the confirmation prompt
     #[command(verbatim_doc_comment)]
     Update(UpdateArgs),
-    /// Ask crates.io whether a newer release exists, without installing anything
+    /// Ask crates.io whether a newer release exists: exits 0 when this is the newest, 1 when one is out, 2 when it could not ask
     Check,
 }
 
@@ -36,6 +36,13 @@ pub fn run(cmd: Cmd) {
 }
 
 fn update(args: UpdateArgs) {
+    if !args.yes && !io::stdin().is_terminal() {
+        eprintln!(
+            "{}",
+            "esql: updating needs a yes, and there is no terminal to ask on: pass `-y`".red()
+        );
+        std::process::exit(1);
+    }
     if !args.yes && !confirm() {
         println!("{}", "Aborted.".dimmed());
         return;
@@ -83,6 +90,7 @@ fn check() {
                 current.bold()
             );
             println!("{} {}", "run".dimmed(), "esql self update".bold());
+            std::process::exit(1);
         }
         Ok(_) => println!(
             "{} {}",
@@ -91,7 +99,7 @@ fn check() {
         ),
         Err(e) => {
             eprintln!("{} {e}", "esql: could not reach crates.io:".red());
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }

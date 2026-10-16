@@ -168,18 +168,7 @@ pub(crate) struct Prompt {
     pub(crate) action: Action,
 }
 
-/// What `sslmode` can be, in libpq's own words, with "leave it alone" first so
-/// a connection that never mentioned SSL does not silently gain an opinion.
-/// This is exactly the kind of value nobody remembers the spelling of, which is
-/// why it is picked rather than typed.
-pub(super) const SSLMODES: [&str; 6] = [
-    "(unset)",
-    "prefer",
-    "require",
-    "verify-ca",
-    "verify-full",
-    "disable",
-];
+pub(super) use crate::engines::pg::SSLMODES;
 
 /// What SQL Server's certificate answer can be. Validating is first because it
 /// is `sqlcmd`'s own default under ODBC driver 18, and silently waiving it would
@@ -333,7 +322,7 @@ impl Prompt {
             true => crate::vias::default_host(&c.key()).unwrap_or_default(),
             false => s.tunnel_host.clone(),
         };
-        let db_host = forward_target(&via, &c.host);
+        let db_host = crate::vias::forward_target(&via, &c.host);
         Self {
             title: format!("reach {} through an ssh host (ssh -L)", c.name),
             idx: 0,
@@ -348,22 +337,6 @@ impl Prompt {
             ],
         }
     }
-}
-
-/// What the far end of a `-L` should say, which is *not* always the address you
-/// use from here. The host in the spec is resolved by the ssh host, so when the
-/// database sits on that very machine the answer is its loopback: a server bound
-/// to `127.0.0.1`, the usual reason a connection was refused in the first place,
-/// will not answer on its own LAN address even from itself. Anywhere else the
-/// address stays as it was, because then the ssh host really is a hop.
-pub(super) fn forward_target(via: &str, db_host: &str) -> String {
-    if db_host.is_empty() {
-        return "localhost".to_string();
-    }
-    if crate::sshhosts::is_same_machine(via, db_host) {
-        return "127.0.0.1".to_string();
-    }
-    db_host.to_string()
 }
 
 impl Prompt {

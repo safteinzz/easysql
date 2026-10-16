@@ -255,6 +255,16 @@ pub fn carrying(local: &str) -> Option<Tunnel> {
         .find(|t| t.kind == 'L' && t.ports().is_some_and(|(open, _, _)| open == local))
 }
 
+/// Is this very forward running: the same spec through the same host? Two
+/// connections may remember the same local port for different servers, and
+/// `carrying` alone would let one use, report and stop the other's.
+pub fn carrying_via(via: &crate::vias::Via) -> Option<Tunnel> {
+    let spec = via.spec();
+    list()
+        .into_iter()
+        .find(|t| t.kind == 'L' && t.spec == spec && t.host == via.host)
+}
+
 /// Open a forward: spawn `ssh -N -{L|R} <spec> <host>` fully detached (its own
 /// process group, stderr to a log file) so it outlives us, wait ~1s to confirm
 /// it connected, then record it. If ssh bailed (bad port, auth, DNS) the captured

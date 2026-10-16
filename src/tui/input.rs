@@ -303,7 +303,7 @@ impl App {
                 self.confirm = Some(Confirm::new(
                     "forget password",
                     format!(
-                        "Remove the password for {} from {}? easysql never read it and cannot put it back.",
+                        "Remove the password for {} from {}? easysql cannot show it or put it back.",
                         cred.user,
                         cred.where_stored()
                     ),
@@ -562,6 +562,7 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.settings = crate::settings::load();
+                self.settings.in_tui = true;
                 self.apply_settings();
                 self.set_status(format!(
                     "refreshed {}",

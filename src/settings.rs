@@ -43,6 +43,21 @@ pub struct Settings {
     /// sqlcmd has no password file, so this is the one place easysql would
     /// hold a secret, and that is the user's call rather than ours.
     pub mssql_passwords: bool,
+    /// Whether the engines the `usql_*` answers below name open in usql when
+    /// the TUI runs them, which wins over their `*_command` there.
+    pub usql_tui: bool,
+    /// The same for the CLI: `esql <name>`, its one-shots, snippets and `--md`.
+    /// Apart from `usql_tui` because a script or an agent reads sqlcmd's output
+    /// as well as usql's, while a person at the toolbox wants the pager.
+    pub usql_cli: bool,
+    /// Which engines the two above apply to.
+    pub usql_mssql: bool,
+    pub usql_sqlite: bool,
+    pub usql_pg: bool,
+    pub usql_mysql: bool,
+    /// Which of the two applies, never written to the file: the TUI sets it
+    /// after every load, so a Settings left alone is the CLI's.
+    pub in_tui: bool,
     /// How many copies of a file easysql rewrites are kept in
     /// `ini::backup_dir()`, 0 meaning none are taken.
     pub backups: usize,
@@ -62,6 +77,13 @@ impl Default for Settings {
             sqlcmd_command: "sqlcmd".into(),
             hints: true,
             mssql_passwords: false,
+            usql_tui: false,
+            usql_cli: false,
+            usql_mssql: true,
+            usql_sqlite: true,
+            usql_pg: false,
+            usql_mysql: false,
+            in_tui: false,
             backups: 0,
             tunnel_host: String::new(),
         }
@@ -77,6 +99,8 @@ pub enum Group {
     Behaviour,
     /// Pre-fills a wizard field; every use can still say otherwise.
     Default,
+    /// Where usql applies, and to which engines.
+    Usql,
 }
 
 impl Group {
@@ -84,6 +108,7 @@ impl Group {
         match self {
             Group::Behaviour => "behaviour",
             Group::Default => "defaults",
+            Group::Usql => "usql",
         }
     }
 }
@@ -170,6 +195,12 @@ impl Settings {
             "sqlcmd_command" => self.sqlcmd_command = non_empty(value, "sqlcmd"),
             "hints" => self.hints = value != "off",
             "mssql_passwords" => self.mssql_passwords = value == "on",
+            "usql_tui" => self.usql_tui = value == "on",
+            "usql_cli" => self.usql_cli = value == "on",
+            "usql_mssql" => self.usql_mssql = value == "on",
+            "usql_sqlite" => self.usql_sqlite = value == "on",
+            "usql_pg" => self.usql_pg = value == "on",
+            "usql_mysql" => self.usql_mysql = value == "on",
             "backups" => self.backups = value.parse().unwrap_or(0),
             "tunnel_host" => self.tunnel_host = value.to_string(),
             _ => {}
@@ -290,7 +321,7 @@ impl Settings {
                 key: "mssql_passwords",
                 group: Group::Behaviour,
                 label: "sqlcmd passwords",
-                help: "off: sqlcmd asks every time · on: easysql keeps them (0600) and hands them over in SQLCMDPASSWORD",
+                help: "off: asked for every time · on: easysql keeps them (0600), handed to sqlcmd in SQLCMDPASSWORD or to usql in a passfile",
                 value: on_off(self.mssql_passwords).into(),
                 default: on_off(d.mssql_passwords).into(),
                 choices: Some(&["on", "off"]),
@@ -303,6 +334,60 @@ impl Settings {
                 value: backups_value(self.backups),
                 default: backups_value(d.backups),
                 choices: Some(BACKUP_CHOICES),
+            },
+            Row {
+                key: "usql_tui",
+                group: Group::Usql,
+                label: "In the TUI",
+                help: "open the engines below in usql when you press Enter: aligned tables and a pager",
+                value: on_off(self.usql_tui).into(),
+                default: on_off(d.usql_tui).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "usql_cli",
+                group: Group::Usql,
+                label: "In the CLI",
+                help: "the same for `esql <name>` and its one-shots, which scripts and agents read",
+                value: on_off(self.usql_cli).into(),
+                default: on_off(d.usql_cli).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "usql_mssql",
+                group: Group::Usql,
+                label: "SQL Server",
+                help: "apply usql to sql server, whose sqlcmd pads every column and has no pager",
+                value: on_off(self.usql_mssql).into(),
+                default: on_off(d.usql_mssql).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "usql_sqlite",
+                group: Group::Usql,
+                label: "SQLite",
+                help: "apply usql to sqlite files",
+                value: on_off(self.usql_sqlite).into(),
+                default: on_off(d.usql_sqlite).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "usql_pg",
+                group: Group::Usql,
+                label: "Postgres",
+                help: "apply usql to postgres, which psql already aligns and pages",
+                value: on_off(self.usql_pg).into(),
+                default: on_off(d.usql_pg).into(),
+                choices: Some(&["on", "off"]),
+            },
+            Row {
+                key: "usql_mysql",
+                group: Group::Usql,
+                label: "MySQL",
+                help: "apply usql to mysql, handing it the group's password from ~/.my.cnf in a passfile that lasts one run",
+                value: on_off(self.usql_mysql).into(),
+                default: on_off(d.usql_mysql).into(),
+                choices: Some(&["on", "off"]),
             },
             Row {
                 key: "tunnel_host",

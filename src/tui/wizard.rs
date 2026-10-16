@@ -28,7 +28,7 @@ impl App {
             return;
         };
         let was = p.fields[i].value.clone();
-        let now = super::prompt::forward_target(&via, &was);
+        let now = crate::vias::forward_target(&via, &was);
         if now != was {
             p.fields[i].value = now;
             self.set_status(format!(
@@ -153,6 +153,9 @@ impl App {
     /// the same frame rather than at the next launch.
     pub(super) fn apply_settings(&mut self) {
         crate::ini::set_backups(self.settings.backups);
+        for e in engines::ENGINES {
+            self.installed[e.idx()] = engines::client_installed(e, &self.settings);
+        }
         self.sort_conns();
         self.start_probes();
         let n = self.conn_rows().len();
@@ -219,37 +222,18 @@ impl App {
                 // answer replaces whatever was in the block rather than being
                 // carried through. Index 0 means the key is removed entirely.
                 match engine {
-                    Engine::Pg => {
-                        extra.retain(|(k, _)| !k.eq_ignore_ascii_case("sslmode"));
-                        if encryption > 0 {
-                            extra.push((
-                                "sslmode".to_string(),
-                                super::prompt::SSLMODES[encryption].to_string(),
-                            ));
-                        }
-                    }
-                    Engine::MsSql => {
-                        extra.retain(|(k, _)| !k.eq_ignore_ascii_case("trust_cert"));
-                        if certificate > 0 {
-                            extra.push(("trust_cert".to_string(), "yes".to_string()));
-                        }
-                    }
+                    Engine::Pg => engines::set_sslmode(
+                        &mut extra,
+                        (encryption > 0).then(|| super::prompt::SSLMODES[encryption]),
+                    ),
+                    Engine::MsSql => engines::set_trust_cert(&mut extra, certificate > 0),
                     _ => {}
                 }
                 // Only rewritten when the answer changed, so a read-only line
                 // somebody spelled their own way is not respelled by an edit
                 // that never touched this field.
                 if engine.offers_read_only() && read_only != was_read_only {
-                    match engine {
-                        Engine::Pg => crate::engines::pg::set_read_only(&mut extra, read_only),
-                        Engine::Sqlite => {
-                            extra.retain(|(k, _)| !k.eq_ignore_ascii_case("readonly"));
-                            if read_only {
-                                extra.push(("readonly".to_string(), "yes".to_string()));
-                            }
-                        }
-                        Engine::MySql | Engine::MsSql => {}
-                    }
+                    engines::set_read_only(engine, &mut extra, read_only);
                 }
                 let nc = match engine {
                     Engine::Sqlite => NewConn {
@@ -257,7 +241,7 @@ impl App {
                         name: v[0].clone(),
                         host: String::new(),
                         port: String::new(),
-                        database: v[1].clone(),
+                        database: engines::sqlite::absolute(&v[1]),
                         user: String::new(),
                         extra,
                     },
@@ -282,31 +266,29 @@ impl App {
                         // A rename changes the connection's identity, so
                         // everything keyed on it has to move too, or the tunnel
                         // it depends on is stranded under a name nothing uses.
-                        if let Some(was) = original.as_deref() {
-                            let old_key = format!("{}:{}", engine.slug(), was);
-                            if let Err(e) = crate::vias::rename(&old_key, &key) {
-                                self.set_status(format!(
-                                    "saved, but the tunnel note did not move: {e}"
-                                ));
-                            }
-                            crate::history::rename(&old_key, &key);
-                            if engine == Engine::MsSql
-                                && let Err(e) = engines::mssql::rename_password(was, &v[0])
-                            {
-                                self.set_failed(format!(
-                                    "saved, but its password did not move: {e}"
-                                ));
-                            }
+                        let carried = match original.as_deref() {
+                            Some(was) => engines::carry_rename(engine, was, &v[0]),
+                            None => Ok(()),
+                        };
+                        if engine == Engine::MsSql {
+                            self.refresh_creds();
                         }
                         self.refresh_conns();
                         self.start_probes();
                         self.select_conn(&key);
-                        self.set_status(format!(
-                            "{verb} '{}' in {}{}",
-                            v[0],
-                            crate::ini::collapse_tilde(&engine.store().to_string_lossy()),
-                            crate::ini::backup_note()
-                        ));
+                        match carried {
+                            Ok(()) => self.set_status(format!(
+                                "{verb} '{}' in {}{}",
+                                v[0],
+                                crate::ini::collapse_tilde(&engine.store().to_string_lossy()),
+                                crate::ini::backup_note()
+                            )),
+                            Err(e) => self.set_failed(format!(
+                                "'{}' saved, but {}",
+                                v[0],
+                                crate::commands::said(&e)
+                            )),
+                        }
                     }
                     Err(e) => self.set_failed(format!("{verb} failed: {e}")),
                 }

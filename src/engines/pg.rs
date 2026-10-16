@@ -15,6 +15,19 @@ use std::path::PathBuf;
 /// `connect_timeout`) is carried through an edit untouched.
 const KNOWN: [&str; 4] = ["host", "port", "dbname", "user"];
 
+/// What `sslmode` can be, in libpq's own words, with "leave it alone" first so
+/// a connection that never mentioned SSL does not silently gain an opinion.
+/// This is exactly the kind of value nobody remembers the spelling of, which is
+/// why it is picked rather than typed.
+pub const SSLMODES: [&str; 6] = [
+    "(unset)",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+    "disable",
+];
+
 /// `$PGSERVICEFILE`, else `~/.pg_service.conf`. Same precedence libpq uses, so
 /// we always read and write the file the client will.
 pub fn service_path() -> PathBuf {
@@ -161,19 +174,24 @@ impl ReadOnlyCheck {
 /// prompt, a deadline - whether a session on this read-only connection really
 /// refuses writes. The service's `options` are only a request: pgbouncer drops
 /// it silently when `options` is in `ignore_startup_parameters` (verified), so
-/// without asking, the blue name could be on a connection that writes.
+/// without asking, the blue name could be on a connection that writes. With
+/// no psql on PATH it asks through usql, whose driver cannot aim a service at
+/// another database, so there `db` is not asked about but its server is.
 pub fn check_read_only(c: &Conn, db: Option<&str>, timeout: u64) -> ReadOnlyCheck {
-    let out = std::process::Command::new("psql")
-        .args([
-            conninfo(&c.name, db).as_str(),
-            "-X",
-            "-w",
-            "-tAc",
-            "show default_transaction_read_only",
-        ])
-        .env("PGCONNECT_TIMEOUT", timeout.to_string())
-        .env_remove("PGOPTIONS")
-        .output();
+    let ask = "show default_transaction_read_only";
+    let out = match super::on_path("psql") || !super::on_path("usql") {
+        true => std::process::Command::new("psql")
+            .args([conninfo(&c.name, db).as_str(), "-X", "-w", "-tAc", ask])
+            .env("PGCONNECT_TIMEOUT", timeout.to_string())
+            .env_remove("PGOPTIONS")
+            .output(),
+        false => std::process::Command::new("usql")
+            .arg(format!("{}&connect_timeout={timeout}", usql_url(&c.name)))
+            .args(["-X", "-w", "-A", "-t", "-c", ask])
+            .env_remove("PGOPTIONS")
+            .stdin(std::process::Stdio::null())
+            .output(),
+    };
     let Ok(out) = out else {
         return ReadOnlyCheck::Unknown("`psql` is not installed to ask".to_string());
     };
@@ -220,6 +238,97 @@ fn quote(v: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// The connection as a usql URL: the service by name, read by usql's driver
+/// from the same `~/.pg_service.conf`, `options` and all, with the password
+/// from `~/.pgpass`.
+pub fn usql_url(name: &str) -> String {
+    format!(
+        "postgres://?service={}",
+        super::percent_encode(&quote(name), "")
+    )
+}
+
+/// The service name `usql_service_file` gives database `db`.
+fn db_service(db: &str) -> String {
+    format!("db:{db}")
+}
+
+/// The databases on the server that `\c` can reach by name, or none when the
+/// server cannot be asked without a prompt.
+pub fn usql_databases(
+    c: &Conn,
+    s: &crate::settings::Settings,
+    env: &[(String, String)],
+) -> Vec<String> {
+    let out = std::process::Command::new("usql")
+        .arg(format!(
+            "{}&connect_timeout={}",
+            usql_url(&c.name),
+            s.probe_timeout
+        ))
+        .args([
+            "-X",
+            "-w",
+            "-A",
+            "-t",
+            "-c",
+            "select datname from pg_database where not datistemplate and datallowconn",
+        ])
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Some(out) = out.ok().filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|n| super::is_cset_name(n))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A service file holding this connection's block aimed at `db`, then the
+/// same block once per entry of `dbs` under `db_service`. Holds no password,
+/// which stays in `~/.pgpass`.
+pub fn usql_service_file(c: &Conn, db: Option<&str>, dbs: &[String]) -> String {
+    let block = |name: &str, dbname: &str| {
+        let mut out = format!("[{name}]\n");
+        for (k, v) in [
+            ("host", c.host.as_str()),
+            ("port", c.port.as_str()),
+            ("dbname", dbname),
+            ("user", c.user.as_str()),
+        ] {
+            if !v.is_empty() {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
+        for (k, v) in &c.extra {
+            out.push_str(&format!("{k}={v}\n"));
+        }
+        out
+    };
+    let mut file = block(&c.name, db.unwrap_or(&c.database));
+    for d in dbs {
+        file.push_str(&block(&db_service(d), d));
+    }
+    file
+}
+
+/// One `--cset NAME=URL` per database `usql_service_file` wrote a block for.
+pub fn usql_csets(dbs: &[String]) -> Vec<String> {
+    dbs.iter()
+        .flat_map(|d| {
+            [
+                "--cset".to_string(),
+                format!("{d}={}", usql_url(&db_service(d))),
+            ]
+        })
+        .collect()
 }
 
 pub fn list() -> Vec<Conn> {

@@ -211,7 +211,10 @@ impl App {
             reach_tx: tx,
             reach_rx: rx,
             installed: [true; 4],
-            settings: Settings::default(),
+            settings: Settings {
+                in_tui: true,
+                ..Settings::default()
+            },
             // Selected from the start: the detail panel beside a list that has
             // never been touched would otherwise read "nothing selected", which
             // looks like an empty tab rather than one you have not moved in.
@@ -264,6 +267,7 @@ impl App {
     pub(super) fn new() -> Self {
         let mut app = Self::empty();
         app.settings = settings::load();
+        app.settings.in_tui = true;
         crate::ini::set_backups(app.settings.backups);
         app.history = history::load();
         app.refresh_all();
@@ -684,17 +688,56 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             // more so: Enter in the list is the usual way in, and the whole gap
             // it closes is "I am at a prompt and cannot remember this client's
             // word for `list the tables`".
+            let mut secret = match run
+                .connect
+                .as_ref()
+                .map(|c| c.secret_env(&app.settings))
+                .transpose()
+            {
+                Ok(secret) => secret,
+                Err(e) => {
+                    app.alert(
+                        "password not handed over",
+                        format!("The kept password could not be written for usql, so nothing was opened.\n\n{}", crate::commands::said(&e)),
+                    );
+                    continue;
+                }
+            };
+            let mut env: Vec<(String, String)> = run
+                .connect
+                .as_ref()
+                .map(|c| c.connect_env(&app.settings))
+                .unwrap_or_default();
+            let mut argv = run.argv.clone();
+            if let (Some(c), Some(secret)) = (run.connect.as_ref(), secret.as_mut()) {
+                match c.usql_session(&app.settings, None, true, secret) {
+                    Ok(csets) => argv.extend(csets),
+                    Err(e) => {
+                        app.alert(
+                            "usql not prepared",
+                            format!("The file usql reads for this connection could not be written, so nothing was opened.\n\n{}", crate::commands::said(&e)),
+                        );
+                        continue;
+                    }
+                }
+            }
+            env.extend(secret.iter().flat_map(|s| s.env.iter().cloned()));
+            let by_name = argv.len() > run.argv.len();
             let hint = run
                 .connect
                 .as_ref()
                 .filter(|_| app.settings.hints)
-                .map(|c| crate::engines::hint_line(c.engine, &app.settings));
-            let env: Vec<(String, String)> = run
+                .map(|c| crate::engines::hint_line(c.engine, &app.settings, by_name));
+            let note = run
                 .connect
                 .as_ref()
-                .map(|c| [c.connect_env(&app.settings), c.secret_env(&app.settings)].concat())
-                .unwrap_or_default();
-            let status = run_suspended(terminal, &run.argv, &env, hint)?;
+                .and_then(|c| crate::engines::mssql::usql_password_note(c, &app.settings, false));
+            let banner = match (note, hint) {
+                (Some(n), Some(h)) => Some(format!("{n}\n  {h}")),
+                (n, h) => n.or(h),
+            };
+            let status = run_suspended(terminal, &argv, &env, banner)?;
+            drop(secret);
 
             if let Some(conn) = run.connect.clone() {
                 match status {
@@ -734,9 +777,9 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                         .connect
                         .as_ref()
                         .map(|c| c.engine)
-                        .and_then(|e| match engines::install_argv(e) {
+                        .and_then(|e| match engines::install_argv(e, &app.settings) {
                             Some(argv) => Some(format!("Install it with:\n\n    {}", argv.join(" "))),
-                            None => engines::install_note(e).map(str::to_string),
+                            None => engines::install_note(e, &app.settings).map(str::to_string),
                         })
                         .unwrap_or_else(|| {
                             "Check that it is installed and on your PATH, or point the setting for this engine at the program you do have.".to_string()
@@ -811,7 +854,7 @@ fn run_suspended(
 /// the terminal acts on them. A caught signal is reset to the default in an
 /// exec'd child, so this never reaches it, unlike `SIG_IGN`, which it would
 /// inherit. Hand the ids to `signal_hook::low_level::unregister` to stop.
-fn swallow_interrupts() -> Vec<signal_hook::SigId> {
+pub(crate) fn swallow_interrupts() -> Vec<signal_hook::SigId> {
     use signal_hook::consts::{SIGINT, SIGQUIT};
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     [SIGINT, SIGQUIT]

@@ -127,6 +127,22 @@ pub fn remove_in(path: &std::path::Path, key: &str) -> Result<()> {
     ini::remove(path, key)
 }
 
+/// What the far end of a `-L` should say, which is *not* always the address you
+/// use from here. The host in the spec is resolved by the ssh host, so when the
+/// database sits on that very machine the answer is its loopback: a server bound
+/// to `127.0.0.1`, the usual reason a connection was refused in the first place,
+/// will not answer on its own LAN address even from itself. Anywhere else the
+/// address stays as it was, because then the ssh host really is a hop.
+pub fn forward_target(via: &str, db_host: &str) -> String {
+    if db_host.is_empty() {
+        return "localhost".to_string();
+    }
+    if crate::sshhosts::is_same_machine(via, db_host) {
+        return "127.0.0.1".to_string();
+    }
+    db_host.to_string()
+}
+
 /// Does this connection actually point at the near end of its own forward?
 ///
 /// Declining the repoint leaves the two disagreeing: the via is recorded, so
@@ -148,8 +164,16 @@ pub fn points_at_it(c: &crate::engines::Conn, via: &Via) -> bool {
 /// ways in must not disagree about that.
 pub fn ensure(key: &str) -> Option<Result<String>> {
     let via = get(key)?;
-    if crate::tunnels::carrying(&via.local).is_some() {
+    if crate::tunnels::carrying_via(&via).is_some() {
         return None;
+    }
+    if let Some(t) = crate::tunnels::carrying(&via.local) {
+        return Some(Err(anyhow::anyhow!(
+            "localhost:{} is already forwarded to {} through {}, which is not this connection's: stop that one, or move this one with `esql tunnel up {key} --local <port>`",
+            via.local,
+            t.spec,
+            t.host
+        )));
     }
     Some(match crate::tunnels::open('L', &via.spec(), &via.host) {
         Ok(t) => Ok(format!(

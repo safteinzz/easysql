@@ -71,6 +71,146 @@ pub fn has_password(name: &str) -> bool {
         .any(|s| s.name == group_of(name) && s.get("password").is_some())
 }
 
+/// The group's password, for usql alone: its driver never reads `~/.my.cnf`,
+/// so a usql session has nothing to log in with unless it is handed this,
+/// which is why it is one of the two reads of a stored password in the crate.
+/// Read the way mysql reads it (`option_read`).
+pub fn password(name: &str) -> Option<String> {
+    let raw = ini::read(&cnf_path())
+        .into_iter()
+        .find(|s| s.name == group_of(name))?
+        .get("password")?
+        .to_string();
+    Some(option_read(&raw))
+}
+
+/// An option value as mysql reads it, checked against the real client's
+/// `--print-defaults`: matching quotes are dropped and keep what is inside
+/// them, an unquoted value ends at `#`, and `\b \t \n \r \s \\ \" \'` are
+/// escapes, while a backslash before anything else stays a backslash.
+fn option_read(raw: &str) -> String {
+    let quoted = ['"', '\'']
+        .into_iter()
+        .find(|q| raw.len() >= 2 && raw.starts_with(*q) && raw.ends_with(*q));
+    let body = match quoted {
+        Some(_) => &raw[1..raw.len() - 1],
+        None => raw.split('#').next().unwrap_or_default().trim(),
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push('\u{8}'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('s') => out.push(' '),
+            Some(e @ ('\\' | '"' | '\'')) => out.push(e),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// `password` written so mysql reads it back unchanged: as it is when nothing
+/// in it means anything to the option-file reader, else in double quotes with
+/// `\` and `"` escaped, which keeps a `#`, a quote and edge spaces intact.
+fn option_written(password: &str) -> String {
+    let plain = !password.contains(['#', '"', '\'', '\\']) && password.trim() == password;
+    if plain {
+        return password.to_string();
+    }
+    format!(
+        "\"{}\"",
+        password.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+/// The connection as a usql URL, which carries no password: the database is
+/// the path, so `/db` and `\c <db>` can aim it anywhere.
+pub fn usql_url(c: &Conn, db: Option<&str>) -> String {
+    let host = if c.host.is_empty() {
+        "localhost"
+    } else {
+        &c.host
+    };
+    let host = match host.contains(':') && !host.starts_with('[') {
+        true => format!("[{host}]"),
+        false => host.to_string(),
+    };
+    let user = match c.user.is_empty() {
+        true => String::new(),
+        false => format!("{}@", super::percent_encode(&c.user, "")),
+    };
+    format!(
+        "mysql://{user}{host}:{}/{}",
+        c.port_or_default(),
+        super::percent_encode(db.unwrap_or(&c.database), "")
+    )
+}
+
+/// The group's password in a fresh passfile for `USQLPASS`, or `None` when
+/// the group has none or it cannot be written in that format.
+pub fn usql_passfile(c: &Conn) -> Result<Option<super::RunFile>> {
+    let Some(line) = password(&c.name).and_then(|p| super::mssql::passfile_line(c, &p).ok()) else {
+        return Ok(None);
+    };
+    super::RunFile::write(&line).map(Some)
+}
+
+/// Why the group's password is not handed to usql, when it has one that
+/// cannot be: usql then logs in with none and the server refuses.
+pub fn usql_password_note(c: &Conn) -> Option<String> {
+    if !has_password(&c.name) {
+        return None;
+    }
+    let reason = super::mssql::passfile_line(c, &password(&c.name)?).err()?;
+    Some(format!(
+        "the password for `{}` in ~/.my.cnf is not handed to usql: {reason}",
+        c.name
+    ))
+}
+
+/// The `--cset` flags that make `\c <db>` reach each database by name, asked
+/// of the server with `show databases` through the same `secret` env, and
+/// empty when it cannot be asked without a prompt.
+pub fn usql_csets(
+    c: &Conn,
+    s: &crate::settings::Settings,
+    db: Option<&str>,
+    secret: &[(String, String)],
+) -> Vec<String> {
+    let out = std::process::Command::new("usql")
+        .arg(format!("{}?timeout={}s", usql_url(c, db), s.probe_timeout))
+        .args(["-X", "-w", "-A", "-t", "-c", "show databases"])
+        .envs(secret.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Some(out) = out.ok().filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|n| super::is_cset_name(n))
+        .flat_map(|n| {
+            [
+                "--cset".to_string(),
+                format!("{n}={}", usql_url(c, Some(n))),
+            ]
+        })
+        .collect()
+}
+
 pub fn save(original: Option<&str>, nc: &NewConn) -> Result<()> {
     let path = cnf_path();
     let group = group_of(nc.name.trim());
@@ -107,7 +247,8 @@ pub fn delete(name: &str) -> Result<()> {
 /// Write or clear the group's password. The only place in easysql that touches
 /// a secret, and it goes straight into the file the client reads.
 pub fn set_password(name: &str, password: Option<&str>) -> Result<()> {
-    ini::set_key(&cnf_path(), &group_of(name), "password", password)
+    let written = password.map(option_written);
+    ini::set_key(&cnf_path(), &group_of(name), "password", written.as_deref())
 }
 
 pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<(String, String)>) {
@@ -123,6 +264,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn a_mysql_password_reads_back_exactly_as_typed() {
+        // Each of these was read back through mysql's own `--print-defaults`:
+        // unquoted, it ends the value at `#`, trims it and reads `\` escapes.
+        for typed in ["plain", "ab#cd", r"a\b", "x\"y", "a'b", "  lead ", r"q\qz"] {
+            let written = option_written(typed);
+            assert_eq!(
+                option_read(&written),
+                typed,
+                "saved as `password={written}`"
+            );
+        }
+    }
 
     #[test]
     fn client_and_foreign_groups_are_never_ours() {

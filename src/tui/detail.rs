@@ -62,11 +62,14 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             "read-only: writes are refused",
             Style::default().fg(READ_ONLY_COLOR),
         ));
-        // Neither engine can make it binding: psql can `SET` the default back
-        // and sqlite3 can `.open` the same file again, writable.
+        // Neither engine can make it binding: psql can `SET` the default back,
+        // sqlite3 can `.open` the same file again, writable, and usql `\c` it.
         lines.push(Line::styled(
             match c.engine {
                 Engine::Pg => "a session can undo it; the role's grants are the real limit",
+                _ if c.engine.uses_usql(&app.settings) => {
+                    "a session can \\c the file writable; its permissions are the real limit"
+                }
                 _ => "a session can .open the file writable; its permissions are the real limit",
             },
             dim(),
@@ -96,6 +99,8 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
                 "● the file is there".to_string()
             } else if c.read_only() {
                 "● no such file, and read-only will not create one".to_string()
+            } else if c.engine.uses_usql(&app.settings) {
+                "● no such file, and usql will not create one".to_string()
             } else {
                 "● no such file yet (sqlite3 would create it)".to_string()
             },
@@ -130,7 +135,7 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             Line::styled(
                 format!(
                     "{} asks for the password itself (p offers to keep it)",
-                    c.engine.default_client()
+                    c.engine.client_name(&app.settings)
                 ),
                 dim(),
             )
@@ -138,6 +143,8 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             Line::styled(
                 if c.engine.stores_password() {
                     "password on file (the client reads it itself)"
+                } else if c.engine.uses_usql(&app.settings) {
+                    "password kept by easysql, handed to usql for each session"
                 } else {
                     "password kept by easysql, handed to sqlcmd"
                 },
@@ -179,7 +186,7 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
     // shown whether or not it happens to be up right now - and it says which,
     // because "needs a tunnel" and "has one" are different situations.
     if let Some(v) = crate::vias::get(&c.key()) {
-        let live = crate::tunnels::carrying(&v.local).is_some();
+        let live = crate::tunnels::carrying_via(&v).is_some();
         lines.push(Line::raw(""));
         lines.push(row("Needs tunnel", format!("through {}", v.host)));
         lines.push(Line::styled(
@@ -291,6 +298,9 @@ fn cred_lines(app: &App) -> Vec<Line<'static>> {
         match c.source {
             crate::creds::Source::MsSql(_) => {
                 "never shown: easysql reads it back only to hand it to sqlcmd in SQLCMDPASSWORD"
+            }
+            crate::creds::Source::MyCnf(_) => {
+                "never shown: easysql reads it back only to hand it to usql, when usql opens mysql"
             }
             _ => "the password itself is never read back, only written",
         },
@@ -406,7 +416,7 @@ fn label(name: &str) -> Span<'static> {
 /// is worse, because whatever answered on that port cannot be the tunnel.
 pub(super) fn sleeping_via(c: &crate::engines::Conn) -> Option<crate::vias::Via> {
     let v = crate::vias::get(&c.key())?;
-    crate::tunnels::carrying(&v.local).is_none().then_some(v)
+    crate::tunnels::carrying_via(&v).is_none().then_some(v)
 }
 
 fn reach_line(reach: Option<&Reach>, sleeping: Option<crate::vias::Via>) -> Line<'static> {

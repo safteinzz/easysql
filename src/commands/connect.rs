@@ -10,7 +10,7 @@
 //!
 //! We `exec` (replace this process) so the client owns the terminal cleanly,
 //! except under `--md`, where the client runs as a child so its rows can be
-//! redrawn as markdown.
+//! redrawn as markdown. `--dump` execs the engine's dump tool instead.
 
 use colored::Colorize;
 
@@ -38,7 +38,7 @@ fn use_default_client_for_one_shot(conn: &crate::engines::Conn, s: &mut crate::s
             "{}",
             format!(
                 "      install it: {}",
-                crate::engines::install_hint(conn.engine)
+                crate::engines::install_hint(conn.engine, s)
             )
             .dimmed()
         );
@@ -59,8 +59,13 @@ fn use_default_client_for_one_shot(conn: &crate::engines::Conn, s: &mut crate::s
 /// Hand the client a query to run and exit, so stdout carries rows, easysql's
 /// own words stay on stderr and the exit status is the client's own. sqlite3
 /// takes it as a bare argument, so it has no flag.
-fn push_query(argv: &mut Vec<String>, conn: &crate::engines::Conn, sql: String) {
-    if let Some(flag) = conn.engine.query_flag() {
+fn push_query(
+    argv: &mut Vec<String>,
+    conn: &crate::engines::Conn,
+    s: &crate::settings::Settings,
+    sql: String,
+) {
+    if let Some(flag) = conn.engine.query_flag(s) {
         argv.push(flag.to_string());
     }
     argv.push(sql);
@@ -73,25 +78,30 @@ fn push_query(argv: &mut Vec<String>, conn: &crate::engines::Conn, sql: String) 
 fn print_markdown(
     program: &str,
     args: &[String],
-    conn: &crate::engines::Conn,
-    settings: &crate::settings::Settings,
+    env: Vec<(String, String)>,
+    secret: crate::engines::Secret,
     rows: crate::markdown::Rows,
 ) -> ! {
     use std::process::{Command, Stdio};
+    let caught = catch_interrupts_for(&secret);
     let out = Command::new(program)
         .args(args)
-        .envs(conn.connect_env(settings))
-        .envs(conn.secret_env(settings))
+        .envs(env)
+        .envs(secret.env.iter().cloned())
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output();
+    drop(secret);
+    for id in caught {
+        signal_hook::low_level::unregister(id);
+    }
     match out {
         Ok(out) => {
             print!(
                 "{}",
                 crate::markdown::render(&String::from_utf8_lossy(&out.stdout), rows)
             );
-            std::process::exit(out.status.code().unwrap_or(1));
+            std::process::exit(exit_code(out.status));
         }
         Err(e) => {
             eprintln!("{}", format!("esql: could not run {program}: {e}").red());
@@ -100,7 +110,147 @@ fn print_markdown(
     }
 }
 
-pub fn run(args: Vec<String>, md: bool) {
+/// Ctrl-C is the child's while a passfile is out, or it would end esql before
+/// the file is deleted. Hand the ids to `signal_hook::low_level::unregister`.
+fn catch_interrupts_for(secret: &crate::engines::Secret) -> Vec<signal_hook::SigId> {
+    match secret.holds_file() {
+        true => crate::tui::swallow_interrupts(),
+        false => Vec::new(),
+    }
+}
+
+/// The child's exit code, or the shell's `128 + signal` when a signal ended it.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    status.code().unwrap_or(1)
+}
+
+/// Run `program` as a child, where `exec` would leave nothing behind to delete
+/// the passfile `secret` holds, and exit with its status once the file is gone.
+fn run_then_forget(
+    program: &str,
+    args: &[String],
+    env: Vec<(String, String)>,
+    secret: crate::engines::Secret,
+    install: &str,
+) -> ! {
+    let caught = catch_interrupts_for(&secret);
+    let status = std::process::Command::new(program)
+        .args(args)
+        .envs(env)
+        .envs(secret.env.iter().cloned())
+        .status();
+    drop(secret);
+    for id in caught {
+        signal_hook::low_level::unregister(id);
+    }
+    match status {
+        Ok(status) => std::process::exit(exit_code(status)),
+        Err(e) => {
+            eprintln!("{}", format!("esql: could not run {program}: {e}").red());
+            eprintln!("{}", format!("install it: {install}").dimmed());
+            std::process::exit(127);
+        }
+    }
+}
+
+/// Replace this process with `program`, so it owns the terminal and its exit
+/// status is ours. `install` is what the failure says to do about it.
+fn exec(program: &str, args: &[String], env: Vec<(String, String)>, install: &str) -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec never returns on success; the client takes over this PID and terminal.
+        let err = std::process::Command::new(program)
+            .args(args)
+            .envs(env)
+            .exec();
+        eprintln!("{}", format!("esql: could not run {program}: {err}").red());
+        eprintln!("{}", format!("install it: {install}").dimmed());
+        std::process::exit(127);
+    }
+
+    #[cfg(not(unix))]
+    {
+        match std::process::Command::new(program)
+            .args(args)
+            .envs(env)
+            .status()
+        {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("{}", format!("esql: could not run {program}: {e}").red());
+                std::process::exit(127);
+            }
+        }
+    }
+}
+
+/// A connection that only works through a forward brings the forward back with
+/// it: the process died with the last reboot, but what it was is remembered.
+/// Said out loud rather than done silently, because it starts a background ssh
+/// that outlives this command.
+fn reopen_tunnel(conn: &crate::engines::Conn) {
+    match crate::vias::ensure(&conn.key()) {
+        Some(Ok(msg)) => eprintln!("{}", format!("esql: {msg}").dimmed()),
+        Some(Err(e)) => {
+            eprintln!(
+                "{}",
+                format!("esql: could not reopen the tunnel: {e}").red()
+            );
+            eprintln!(
+                "{}",
+                "      the connection points at it, so this will not connect.".dimmed()
+            );
+            std::process::exit(1);
+        }
+        None => {}
+    }
+}
+
+/// `esql --dump <name> [args]`: the engine's dump tool takes this process, so
+/// stdout is the dump and the exit status is the tool's. Everything after the
+/// name is the tool's own, a leading `--` dropped.
+fn dump(conn: &crate::engines::Conn, db: Option<&str>, mut rest: Vec<String>) -> ! {
+    if rest.first().is_some_and(|a| a == "--") {
+        rest.remove(0);
+    }
+    let Some(argv) = conn.dump_argv(db, &rest) else {
+        eprintln!(
+            "{}",
+            "esql: `--dump` cannot dump SQL Server, since sqlcmd ships no dump tool.".red()
+        );
+        eprintln!(
+            "{}",
+            "      run `BACKUP DATABASE` as a query instead, which writes the file on the server."
+                .dimmed()
+        );
+        std::process::exit(2);
+    };
+    let (program, args) = argv.split_first().expect("dump_argv is never empty");
+    // The dump tool is the engine's own whichever client opens its sessions.
+    let install = crate::engines::install_hint(conn.engine, &crate::settings::Settings::default());
+    if !crate::engines::on_path(program) {
+        eprintln!(
+            "{}",
+            format!("esql: `{program}` is not installed, and easysql is only a front end for it.")
+                .red()
+        );
+        eprintln!("      {}  {}", "install it:".dimmed(), install.bold());
+        std::process::exit(127);
+    }
+    reopen_tunnel(conn);
+    crate::history::record(&conn.key());
+    exec(program, args, Vec::new(), &install)
+}
+
+pub fn run(args: Vec<String>, md: bool, dump: bool) {
     if args.is_empty() {
         eprintln!(
             "{}",
@@ -128,12 +278,16 @@ pub fn run(args: Vec<String>, md: bool) {
         );
         eprintln!(
             "{}",
-            "      save that file as its own connection with `c` in `esql`.".dimmed()
+            "      save that file as its own connection: `esql conn add sqlite <name> --file <path>`"
+                .dimmed()
         );
         std::process::exit(2);
     }
 
     let rest: Vec<String> = args.into_iter().skip(1).collect();
+    if dump {
+        self::dump(&conn, db.as_deref(), rest);
+    }
     // Nothing after the connection name means a session is being opened rather
     // than a one-shot query. Asked before `rest` is consumed below.
     let session = rest.is_empty();
@@ -149,7 +303,8 @@ pub fn run(args: Vec<String>, md: bool) {
                 eprintln!("{}", format!("esql: no snippet called '{name}'").red());
                 eprintln!(
                     "{}",
-                    "      `esql` and the Snippets tab list and create them.".dimmed()
+                    "      `esql snippet ls` lists them, and `esql snippet add` saves one."
+                        .dimmed()
                 );
                 std::process::exit(2);
             }
@@ -158,7 +313,10 @@ pub fn run(args: Vec<String>, md: bool) {
     };
     let adhoc = !session && first != "--" && snippet.is_none() && !first.starts_with('-');
 
-    let table = match (md, conn.engine.table_output()) {
+    let mut settings = crate::settings::load();
+    crate::ini::set_backups(settings.backups);
+
+    let table = match (md, conn.engine.table_output(&settings)) {
         (false, _) => None,
         (true, None) => {
             eprintln!(
@@ -169,6 +327,19 @@ pub fn run(args: Vec<String>, md: bool) {
                 )
                 .red()
             );
+            if conn.engine == crate::engines::Engine::MsSql {
+                let key = match settings.usql_cli {
+                    true => "usql_mssql",
+                    false => "usql_cli",
+                };
+                eprintln!(
+                    "{}",
+                    format!(
+                        "      `esql set {key} on` opens SQL Server in usql, whose CSV it can read."
+                    )
+                    .dimmed()
+                );
+            }
             std::process::exit(2);
         }
         (true, Some(_)) if session => {
@@ -185,8 +356,6 @@ pub fn run(args: Vec<String>, md: bool) {
     // Before the tunnel and the history stamp, so a run refused for want of a
     // client leaves nothing behind. A flag the user typed themselves is theirs,
     // so a passthrough is not a one-shot here, unless `--md` has to add its own.
-    let mut settings = crate::settings::load();
-    crate::ini::set_backups(settings.backups);
     if db.is_some() || snippet.is_some() || adhoc || table.is_some() {
         use_default_client_for_one_shot(&conn, &mut settings);
     }
@@ -204,6 +373,10 @@ pub fn run(args: Vec<String>, md: bool) {
             )
             .dimmed()
         );
+    }
+
+    if let Some(note) = crate::engines::mssql::usql_password_note(&conn, &settings, !session) {
+        eprintln!("{}", format!("esql: {note}").dimmed());
     }
 
     if conn.engine == crate::engines::Engine::Sqlite
@@ -224,47 +397,28 @@ pub fn run(args: Vec<String>, md: bool) {
     // install easysql` could not have brought the client along - it is not Rust
     // - so the least this can do is name the one command that would.
     let program = conn.connect_argv_db(&settings, db.as_deref())[0].clone();
+    let install = crate::engines::install_hint(conn.engine, &settings);
     if !crate::engines::on_path(&program) {
         eprintln!(
             "{}",
             format!("esql: `{program}` is not installed, and easysql is only a front end for it.")
                 .red()
         );
-        eprintln!(
-            "      {}  {}",
-            "install it:".dimmed(),
-            crate::engines::install_hint(conn.engine).bold()
-        );
-        // Only promise the offer when there is one: SQL Server has no distro
-        // package, so nothing in the TUI can install it for you either.
-        if crate::engines::install_argv(conn.engine).is_some() {
+        if conn.engine.uses_usql(&settings) {
             eprintln!(
-                "      {}",
-                "or run `esql` and press Enter on it, which offers to do this for you.".dimmed()
+                "{}",
+                format!(
+                    "      the `usql_cli` setting opens {} connections in it.",
+                    conn.engine.label()
+                )
+                .dimmed()
             );
         }
+        eprintln!("      {}  {}", "install it:".dimmed(), install.bold());
         std::process::exit(127);
     }
 
-    // A connection that only works through a forward brings the forward back
-    // with it: the process died with the last reboot, but what it was is
-    // remembered. Said out loud rather than done silently, because it starts a
-    // background ssh that outlives this command.
-    match crate::vias::ensure(&conn.key()) {
-        Some(Ok(msg)) => eprintln!("{}", format!("esql: {msg}").dimmed()),
-        Some(Err(e)) => {
-            eprintln!(
-                "{}",
-                format!("esql: could not reopen the tunnel: {e}").red()
-            );
-            eprintln!(
-                "{}",
-                "      the connection points at it, so this will not connect.".dimmed()
-            );
-            std::process::exit(1);
-        }
-        None => {}
-    }
+    reopen_tunnel(&conn);
 
     // After the tunnel, which the question has to travel through, and before
     // the history stamp, so a refused run leaves nothing behind.
@@ -288,10 +442,6 @@ pub fn run(args: Vec<String>, md: bool) {
         }
     }
 
-    // Stamp the connect before handing the terminal over: `exec` never comes
-    // back, so there is no "after" in which to record it.
-    crate::history::record(&conn.key());
-
     // The same argv the TUI and the wizard preview build, so both ways in
     // behave identically and the preview can never lie about what runs.
     let mut argv = conn.connect_argv_db(&settings, db.as_deref());
@@ -300,7 +450,7 @@ pub fn run(args: Vec<String>, md: bool) {
     }
 
     if let Some(sql) = snippet.clone() {
-        push_query(&mut argv, &conn, sql);
+        push_query(&mut argv, &conn, &settings, sql);
         argv.extend(rest.into_iter().skip(1));
     } else if first == "--" {
         // The escape hatch: an argument the client wants bare, which the rule
@@ -308,7 +458,7 @@ pub fn run(args: Vec<String>, md: bool) {
         argv.extend(rest.into_iter().skip(1));
     } else if adhoc {
         // `esql prod 'select 1'`, the shape `ssh host 'cmd'` taught everyone.
-        push_query(&mut argv, &conn, first);
+        push_query(&mut argv, &conn, &settings, first);
         argv.extend(rest.into_iter().skip(1));
     } else {
         argv.extend(rest);
@@ -321,53 +471,61 @@ pub fn run(args: Vec<String>, md: bool) {
         let _ = crate::snippets::sync_psqlrc();
     }
 
+    let env = conn.connect_env(&settings);
+    let mut secret = conn.secret_env(&settings).unwrap_or_else(|e| {
+        eprintln!(
+            "{}",
+            format!(
+                "esql: could not hand the kept password over: {}",
+                super::said(&e)
+            )
+            .red()
+        );
+        std::process::exit(1);
+    });
+    let csets = conn
+        .usql_session(&settings, db.as_deref(), session, &mut secret)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "{}",
+                format!(
+                    "esql: could not prepare usql's connection: {}",
+                    super::said(&e)
+                )
+                .red()
+            );
+            std::process::exit(1);
+        });
+
     // Only when a session is actually being opened: a one-shot query prints its
     // own result and a hint above it would just be noise in a pipe.
     if settings.hints && session {
         eprintln!(
             "{}",
-            format!("  {}", crate::engines::hint_line(conn.engine, &settings)).dimmed()
+            format!(
+                "  {}",
+                crate::engines::hint_line(conn.engine, &settings, !csets.is_empty())
+            )
+            .dimmed()
         );
     }
 
     let (program, rest) = argv.split_first().expect("connect_argv is never empty");
     let program = program.clone();
-    let rest: Vec<String> = rest.to_vec();
+    let mut rest: Vec<String> = rest.to_vec();
+    rest.extend(csets);
+
+    // Stamp the connect before handing the terminal over, once nothing is left
+    // that could refuse it: `exec` never comes back, so there is no "after".
+    crate::history::record(&conn.key());
 
     if let Some((_, rows)) = table {
-        print_markdown(&program, &rest, &conn, &settings, rows);
+        print_markdown(&program, &rest, env, secret, rows);
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // exec never returns on success; the client takes over this PID and terminal.
-        let err = std::process::Command::new(&program)
-            .args(&rest)
-            .envs(conn.connect_env(&settings))
-            .envs(conn.secret_env(&settings))
-            .exec();
-        eprintln!("{}", format!("esql: could not run {program}: {err}").red());
-        eprintln!(
-            "{}",
-            format!("install it: {}", crate::engines::install_hint(conn.engine)).dimmed()
-        );
-        std::process::exit(127);
+    if secret.holds_file() {
+        run_then_forget(&program, &rest, env, secret, &install);
     }
-
-    #[cfg(not(unix))]
-    {
-        match std::process::Command::new(&program)
-            .args(&rest)
-            .envs(conn.connect_env(&settings))
-            .envs(conn.secret_env(&settings))
-            .status()
-        {
-            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-            Err(e) => {
-                eprintln!("{}", format!("esql: could not run {program}: {e}").red());
-                std::process::exit(127);
-            }
-        }
-    }
+    let mut env = env;
+    env.extend(secret.env);
+    exec(&program, &rest, env, &install);
 }

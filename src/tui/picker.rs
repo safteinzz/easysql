@@ -179,7 +179,7 @@ impl App {
                     .position(|f| f.label.contains("Database host"));
                 if let Some(i) = target {
                     let was = p.fields[i].value.clone();
-                    let now = super::prompt::forward_target(&choice, &was);
+                    let now = crate::vias::forward_target(&choice, &was);
                     if now != was {
                         p.fields[i].value = now;
                         self.set_status(format!(
@@ -206,7 +206,7 @@ impl App {
                 let shown = format!(
                     "{:<9} {:<8}{}",
                     e.label(),
-                    e.default_client(),
+                    e.client_name(&self.settings),
                     if installed {
                         String::new()
                     } else {
@@ -214,9 +214,9 @@ impl App {
                         // a bare "not installed" reads as though postgres itself
                         // were absent, and "no psql" still leaves you wondering
                         // what to ask your package manager for.
-                        match engines::install_package(e) {
+                        match engines::install_package(e, &self.settings) {
                             Some(pkg) => format!("needs {pkg}"),
-                            None => format!("no {} on this machine", e.default_client()),
+                            None => format!("no {} on this machine", e.client_name(&self.settings)),
                         }
                     }
                 );

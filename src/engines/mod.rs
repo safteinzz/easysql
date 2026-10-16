@@ -70,6 +70,9 @@ impl Engine {
     /// arguments (`pgcli`, `docker exec -it db psql`) works because this is a
     /// whole argv, not a program name.
     pub fn client_argv(self, s: &Settings) -> Vec<String> {
+        if self.uses_usql(s) {
+            return vec!["usql".to_string()];
+        }
         let words: Vec<String> = match self {
             Engine::Pg => &s.psql_command,
             Engine::MySql => &s.mysql_command,
@@ -83,6 +86,31 @@ impl Engine {
             vec![self.default_client().to_string()]
         } else {
             words
+        }
+    }
+
+    /// Whether `usql_tui` (in the TUI) or `usql_cli` (everywhere else) moves
+    /// this engine's sessions and one-shots to usql, for the engines the
+    /// `usql_mssql`, `usql_sqlite`, `usql_pg` and `usql_mysql` answers name.
+    pub fn uses_usql(self, s: &Settings) -> bool {
+        let on = match s.in_tui {
+            true => s.usql_tui,
+            false => s.usql_cli,
+        };
+        on && match self {
+            Engine::MsSql => s.usql_mssql,
+            Engine::Sqlite => s.usql_sqlite,
+            Engine::Pg => s.usql_pg,
+            Engine::MySql => s.usql_mysql,
+        }
+    }
+
+    /// The program a session runs under these settings, by name, for prose.
+    pub fn client_name(self, s: &Settings) -> &'static str {
+        if self.uses_usql(s) {
+            "usql"
+        } else {
+            self.default_client()
         }
     }
 
@@ -130,7 +158,10 @@ impl Engine {
     /// do it; no two spell it the same way, which is the whole reason a snippet
     /// shortcut has to live in easysql rather than in any one client's rc file.
     /// SQLite takes it as a bare argument, so there is no flag to give.
-    pub fn query_flag(self) -> Option<&'static str> {
+    pub fn query_flag(self, s: &Settings) -> Option<&'static str> {
+        if self.uses_usql(s) {
+            return Some("-c");
+        }
         match self {
             Engine::Pg => Some("-c"),
             Engine::MySql => Some("-e"),
@@ -143,13 +174,31 @@ impl Engine {
     /// be read back, and the shape they come in. psql's is a `-c` rather than
     /// `--csv` because `~/.psqlrc` runs after the flags and a `\pset format`
     /// there beats them; `-q` keeps a script's `SET` tags out of the rows.
-    /// sqlcmd has none: its `-s,` does not quote a comma inside a value.
-    pub fn table_output(self) -> Option<(&'static [&'static str], crate::markdown::Rows)> {
+    /// sqlcmd has none: its `-s,` does not quote a comma inside a value, which
+    /// usql's `-C` does.
+    pub fn table_output(
+        self,
+        s: &Settings,
+    ) -> Option<(&'static [&'static str], crate::markdown::Rows)> {
         use crate::markdown::Rows;
+        if self.uses_usql(s) {
+            return Some((&["-C"], Rows::Csv));
+        }
         match self {
             Engine::Pg => Some((&["-q", "-c", "\\pset format csv"], Rows::Csv)),
             Engine::MySql => Some((&["--batch"], Rows::Tsv)),
             Engine::Sqlite => Some((&["-csv", "-header"], Rows::Csv)),
+            Engine::MsSql => None,
+        }
+    }
+
+    /// The program `esql --dump` runs, which reads the same file the client
+    /// does. sqlcmd ships no dump tool, so SQL Server has none.
+    pub fn dump_client(self) -> Option<&'static str> {
+        match self {
+            Engine::Pg => Some("pg_dump"),
+            Engine::MySql => Some("mysqldump"),
+            Engine::Sqlite => Some("sqlite3"),
             Engine::MsSql => None,
         }
     }
@@ -181,6 +230,23 @@ impl Engine {
             // came from psql.
             Engine::MsSql => {
                 "GO runs what you typed · sp_databases dbs · use <db> · sp_tables tables · sp_help <table> · :r <file> · exit"
+            }
+        }
+    }
+
+    /// `hint` for a session that opens in usql. `\c <db>` is named only when
+    /// `by_name`, because usql's `\c` takes a whole URL unless the database was
+    /// named at launch (`mssql::usql_csets`), and a `use <db>` lasts only as
+    /// long as the pooled connection it ran on. `;` leads for SQL Server, where
+    /// `GO` runs nothing in usql.
+    pub fn usql_hint(self, by_name: bool) -> &'static str {
+        match (self, by_name) {
+            (Engine::Sqlite, _) => "\\dt tables · \\d <table> · \\i <file> · \\? help · \\q quit",
+            (_, true) => {
+                "; runs what you typed · \\l dbs · \\c <db> · \\dn schemas · \\dt tables · \\d <table> · \\i <file> · \\? help · \\q quit"
+            }
+            (_, false) => {
+                "; runs what you typed · \\l dbs · \\dn schemas · \\dt tables · \\d <table> · \\i <file> · \\? help · \\q quit"
             }
         }
     }
@@ -278,29 +344,91 @@ impl Conn {
     }
 
     /// What a session with this connection needs in its environment on top of
-    /// the argv, so every launcher applies the same thing. Only a read-only
-    /// Postgres connection opened in a client other than psql has any: psql
-    /// applies the service's `options` itself, but a client that reads the
-    /// service file on its own can drop them, as pgcli does.
+    /// the argv, so every launcher applies the same thing. A read-only
+    /// Postgres connection opened in a client other than psql gets PGOPTIONS:
+    /// psql applies the service's `options` itself, but a client that reads
+    /// the service file on its own can drop them, as pgcli does. A usql
+    /// session gets its pager (`usql_pager_env`).
     pub fn connect_env(&self, s: &Settings) -> Vec<(String, String)> {
         match self.engine {
             Engine::Pg if self.read_only() && !speaks_client_flags(self.engine, s) => {
                 vec![("PGOPTIONS".to_string(), pg::read_only_pgoptions())]
             }
+            _ if self.engine.uses_usql(s) => usql_pager_env(),
             _ => Vec::new(),
         }
     }
 
     /// The part of a session's environment that is a secret: only a SQL Server
-    /// password easysql was allowed to keep. Applied by the two launchers and
-    /// the probe, and never by anything that shows or copies a command, which
-    /// is why it is not in `connect_env`.
-    pub fn secret_env(&self, s: &Settings) -> Vec<(String, String)> {
+    /// password easysql was allowed to keep, in `SQLCMDPASSWORD` for sqlcmd or
+    /// as a passfile of its own for usql. Applied by the two launchers and the
+    /// probe, and never by anything that shows or copies a command, which is
+    /// why it is not in `connect_env`. An error means the passfile could not
+    /// be written.
+    pub fn secret_env(&self, s: &Settings) -> Result<Secret> {
         match self.engine {
-            Engine::MsSql if s.mssql_passwords => mssql::password(&self.name)
-                .map(|p| vec![("SQLCMDPASSWORD".to_string(), p)])
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            Engine::MsSql if s.mssql_passwords && self.engine.uses_usql(s) => {
+                let file = mssql::usql_passfile(self)?;
+                let env = file
+                    .iter()
+                    .map(|f| {
+                        (
+                            "USQLPASS".to_string(),
+                            f.path().to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect();
+                Ok(Secret {
+                    env,
+                    files: file.into_iter().collect(),
+                })
+            }
+            Engine::MySql if self.engine.uses_usql(s) => {
+                let mut secret = Secret::plain(Vec::new());
+                if let Some(file) = mysql::usql_passfile(self)? {
+                    secret.hold("USQLPASS", file);
+                }
+                Ok(secret)
+            }
+            Engine::MsSql if s.mssql_passwords => Ok(Secret::plain(
+                mssql::password(&self.name)
+                    .map(|p| vec![("SQLCMDPASSWORD".to_string(), p)])
+                    .unwrap_or_default(),
+            )),
+            _ => Ok(Secret::plain(Vec::new())),
+        }
+    }
+
+    /// What a usql run needs beyond `connect_argv` and `secret_env`, which
+    /// neither can do because the preview and `y` call them: for a `session`,
+    /// the `--cset` flags that make `\c <db>` reach each database by name, and
+    /// for Postgres, a copy of the service block aimed at `db` (and at each of
+    /// those databases), held in `secret` and named in `PGSERVICEFILE`,
+    /// because usql's driver lets the service file win over the URL's dbname.
+    /// Asks the server for its databases, so it runs only on the way in.
+    pub fn usql_session(
+        &self,
+        s: &Settings,
+        db: Option<&str>,
+        session: bool,
+        secret: &mut Secret,
+    ) -> Result<Vec<String>> {
+        if !self.engine.uses_usql(s) {
+            return Ok(Vec::new());
+        }
+        match self.engine {
+            Engine::MsSql if session => Ok(mssql::usql_csets(self, s, db, &secret.env)),
+            Engine::MySql if session => Ok(mysql::usql_csets(self, s, db, &secret.env)),
+            Engine::Pg if session || db.is_some() => {
+                let dbs = match session {
+                    true => pg::usql_databases(self, s, &secret.env),
+                    false => Vec::new(),
+                };
+                let file = RunFile::write(&pg::usql_service_file(self, db, &dbs))?;
+                secret.hold("PGSERVICEFILE", file);
+                Ok(pg::usql_csets(&dbs))
+            }
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -331,6 +459,13 @@ impl Conn {
     pub fn connect_argv_db(&self, s: &Settings, db: Option<&str>) -> Vec<String> {
         let mut argv = self.engine.client_argv(s);
         match self.engine {
+            Engine::MsSql if self.engine.uses_usql(s) => argv.extend(mssql::usql_args(self, s, db)),
+            Engine::Sqlite if self.engine.uses_usql(s) => {
+                argv.push(sqlite::usql_url(&self.database, self.read_only()))
+            }
+            // `db` reaches usql through the service file `usql_session` writes.
+            Engine::Pg if self.engine.uses_usql(s) => argv.push(pg::usql_url(&self.name)),
+            Engine::MySql if self.engine.uses_usql(s) => argv.push(mysql::usql_url(self, db)),
             Engine::Pg => argv.push(pg::conninfo(&self.name, db)),
             Engine::MySql => {
                 argv.push(format!("--defaults-group-suffix={}", self.name));
@@ -357,6 +492,48 @@ impl Conn {
             Engine::MsSql => argv.extend(mssql::flags(self, db)),
         }
         argv
+    }
+
+    /// What `esql --dump` runs: `Engine::dump_client` aimed at the same block
+    /// the client reads, with `args` handed to it verbatim. SQLite's dump is a
+    /// dot-command, so there `args` become the words of `.dump` (tables,
+    /// `--data-only`), and the file is opened `-readonly` so a wrong path is an
+    /// error rather than a new empty database. `None` for SQL Server.
+    pub fn dump_argv(&self, db: Option<&str>, args: &[String]) -> Option<Vec<String>> {
+        let mut argv = vec![self.engine.dump_client()?.to_string()];
+        match self.engine {
+            Engine::Pg => argv.push(pg::conninfo(&self.name, db)),
+            Engine::MySql => {
+                argv.push(format!("--defaults-group-suffix={}", self.name));
+                // mysqldump takes the database as a positional, and these flags
+                // name their own instead.
+                let names_its_own = args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "-A" | "--all-databases" | "-B" | "--databases"));
+                let db = db.unwrap_or(&self.database);
+                if !db.is_empty() && !names_its_own {
+                    argv.push(db.to_string());
+                }
+            }
+            Engine::Sqlite => {
+                argv.push("-readonly".into());
+                argv.push(
+                    crate::ini::expand_tilde(&self.database)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let mut dot = String::from(".dump");
+                for a in args {
+                    dot.push(' ');
+                    dot.push_str(&sqlite::dot_arg(a));
+                }
+                argv.push(dot);
+                return Some(argv);
+            }
+            Engine::MsSql => return None,
+        }
+        argv.extend(args.iter().cloned());
+        Some(argv)
     }
 
     /// A URL for the connection, which is what a GUI, an ORM config or a
@@ -387,6 +564,182 @@ impl Conn {
             }
         }
     }
+}
+
+/// What `Conn::secret_env` hands a launcher: the variables, and the passfile
+/// one of them may name, which is deleted when this is dropped. Hold it until
+/// the child has exited, and drop it before `process::exit`, which runs no
+/// destructors.
+pub struct Secret {
+    pub env: Vec<(String, String)>,
+    files: Vec<RunFile>,
+}
+
+impl Secret {
+    fn plain(env: Vec<(String, String)>) -> Self {
+        Self {
+            env,
+            files: Vec::new(),
+        }
+    }
+
+    /// Keep `file` alive for the run and name it to the child in `key`.
+    fn hold(&mut self, key: &str, file: RunFile) {
+        self.env
+            .push((key.to_string(), file.path().to_string_lossy().into_owned()));
+        self.files.push(file);
+    }
+
+    /// Whether a file has to outlive the child, so the CLI cannot `exec`.
+    pub fn holds_file(&self) -> bool {
+        !self.files.is_empty()
+    }
+}
+
+/// A private file easysql wrote for one usql run (a passfile, a service file),
+/// deleted when dropped.
+pub struct RunFile(PathBuf);
+
+impl RunFile {
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Write `contents` to a fresh 0600 file in the first of `run_file_dirs`
+    /// that will take one. A file left by an esql that was killed before it
+    /// could delete its own is removed on the way.
+    pub fn write(contents: &str) -> Result<RunFile> {
+        let mut first_error = None;
+        for dir in run_file_dirs() {
+            match Self::write_in(&dir, contents) {
+                Ok(file) => return Ok(file),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| anyhow::anyhow!("no folder to write it in")))
+    }
+
+    fn write_in(dir: &std::path::Path, contents: &str) -> Result<RunFile> {
+        use anyhow::Context;
+        use std::io::Write;
+        let dir = dir.to_path_buf();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            builder.mode(0o700);
+            builder
+                .create(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("making {} private", dir.display()))?;
+        }
+        #[cfg(not(unix))]
+        builder
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        sweep_run_files(&dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = dir.join(format!("{}-{stamp}", std::process::id()));
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        let mut f = open
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        let file = RunFile(path);
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", file.path().display()))?;
+        Ok(file)
+    }
+}
+
+impl Drop for RunFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Where run files may go, best first: `$XDG_RUNTIME_DIR`, which is the
+/// user's alone and cleared at logout, then the state dir, each in a folder
+/// only the owner can enter.
+fn run_file_dirs() -> Vec<PathBuf> {
+    let state = dirs::state_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"));
+    dirs::runtime_dir()
+        .into_iter()
+        .chain([state])
+        .map(|d| d.join("easysql").join("pass"))
+        .collect()
+}
+
+/// Remove the run files whose esql is gone, named `<pid>-<stamp>`. Only where
+/// `/proc` says which pids are alive, or every other run's file would look dead.
+fn sweep_run_files(dir: &std::path::Path) {
+    if !std::path::Path::new("/proc/self").exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some((pid, _)) = name.to_str().and_then(|n| n.split_once('-')) else {
+            continue;
+        };
+        if pid.parse::<u32>().is_ok() && !std::path::Path::new("/proc").join(pid).exists() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// usql pages with plain `less` when nothing names a pager, which wraps a wide
+/// table and opens even for one row. It runs `USQL_PAGER` or `PAGER` as one
+/// program name and never splits it (`less -S` is "executable file not
+/// found"), so the flags travel in `LESS`: `-S` scrolls sideways, `-F` prints
+/// a result that fits without opening the pager. A pager the user named is
+/// left alone.
+fn usql_pager_env() -> Vec<(String, String)> {
+    let set = |k: &str| std::env::var_os(k).is_some();
+    if set("USQL_PAGER") || set("PAGER") || !on_path("less") {
+        return Vec::new();
+    }
+    let mut env = vec![("USQL_PAGER".to_string(), "less".to_string())];
+    if !set("LESS") {
+        env.push(("LESS".to_string(), "-FRS".to_string()));
+    }
+    env
+}
+
+/// Whether usql takes `n` as a `--cset` name. It aborts at startup over any
+/// other, so a database named otherwise is left out of `\c` by name.
+pub fn is_cset_name(n: &str) -> bool {
+    !n.is_empty() && n.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// `s` percent-encoded for a URL, keeping only the unreserved characters and
+/// those in `keep`.
+pub fn percent_encode(s: &str, keep: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || "-._~".contains(c) || keep.contains(c) {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// What a wizard collects. Empty strings mean "not set" and are left out of the
@@ -481,6 +834,80 @@ pub fn delete(c: &Conn) -> Result<()> {
         Engine::Sqlite => sqlite::delete(&c.name),
         Engine::MsSql => mssql::delete(&c.name),
     }
+}
+
+/// Write the form's `sslmode` answer into a Postgres block's extras, `None`
+/// removing the key. It replaces whatever was there rather than adding to it.
+pub fn set_sslmode(extra: &mut Vec<(String, String)>, mode: Option<&str>) {
+    extra.retain(|(k, _)| !k.eq_ignore_ascii_case("sslmode"));
+    if let Some(mode) = mode {
+        extra.push(("sslmode".to_string(), mode.to_string()));
+    }
+}
+
+/// Write SQL Server's certificate answer into its extras, off removing the key.
+pub fn set_trust_cert(extra: &mut Vec<(String, String)>, on: bool) {
+    extra.retain(|(k, _)| !k.eq_ignore_ascii_case("trust_cert"));
+    if on {
+        extra.push(("trust_cert".to_string(), "yes".to_string()));
+    }
+}
+
+/// Make every session on the connection refuse writes, or stop doing so. Call
+/// it only when the answer changed, so a line spelled by hand is not respelled.
+/// A no-op for an engine where `Engine::offers_read_only` is false.
+pub fn set_read_only(engine: Engine, extra: &mut Vec<(String, String)>, on: bool) {
+    match engine {
+        Engine::Pg => pg::set_read_only(extra, on),
+        Engine::Sqlite => {
+            extra.retain(|(k, _)| !k.eq_ignore_ascii_case("readonly"));
+            if on {
+                extra.push(("readonly".to_string(), "yes".to_string()));
+            }
+        }
+        Engine::MySql | Engine::MsSql => {}
+    }
+}
+
+/// After a rename is saved, move everything else keyed on `Conn::key()` or on
+/// the name: the remembered tunnel, the history and a kept SQL Server password.
+/// Each is tried even when one before it failed, and the first failure is
+/// returned, saying which of them did not move.
+pub fn carry_rename(engine: Engine, from: &str, to: &str) -> Result<()> {
+    let old_key = format!("{}:{from}", engine.slug());
+    let new_key = format!("{}:{to}", engine.slug());
+    let tunnel = crate::vias::rename(&old_key, &new_key);
+    crate::history::rename(&old_key, &new_key);
+    let password = match engine {
+        Engine::MsSql => mssql::rename_password(from, to),
+        _ => Ok(()),
+    };
+    match (tunnel, password) {
+        (Err(e), _) => Err(e.context("its tunnel record did not move")),
+        (_, Err(e)) => Err(e.context("its password did not move")),
+        _ => Ok(()),
+    }
+}
+
+/// Delete a connection and what easysql keeps for it: the remembered tunnel,
+/// so the file does not fill with forwards for nothing, and a kept SQL Server
+/// password, so a new connection reusing the name does not inherit it. A
+/// `.pgpass` line is the client's and stays.
+pub fn delete_with_keyed(c: &Conn) -> Result<()> {
+    delete(c).map_err(|e| e.context("it was not deleted"))?;
+    crate::vias::remove(&c.key())
+        .map_err(|e| e.context("deleted, but its tunnel record was not forgotten"))?;
+    if c.engine == Engine::MsSql {
+        mssql::set_password(&c.name, None)
+            .map_err(|e| e.context("deleted, but its kept password was not forgotten"))?;
+    }
+    Ok(())
+}
+
+/// One connection by the name the CLI is given: bare `prod`, or `pg:prod` when
+/// two engines both have one. Never split on `/`, unlike `find_target`.
+pub fn find(needle: &str) -> Result<Conn> {
+    find_among(list(), needle)
 }
 
 /// Is this engine's client actually installed? A row whose client is missing is
@@ -588,10 +1015,14 @@ fn package(manager: PackageManager, engine: Engine) -> Option<&'static str> {
     }
 }
 
-/// The exact command that would install this engine's client here. `None` on a
-/// machine whose package manager we do not recognise, where the honest answer
-/// is to name the program and let the user find it.
-pub fn install_argv(engine: Engine) -> Option<Vec<String>> {
+/// The exact command that would install the client this engine's sessions run
+/// under these settings. `None` on a machine whose package manager we do not
+/// recognise, where the honest answer is to name the program and let the user
+/// find it, and for usql, whose distro packages can lack the SQL Server driver.
+pub fn install_argv(engine: Engine, s: &Settings) -> Option<Vec<String>> {
+    if engine.uses_usql(s) {
+        return None;
+    }
     let manager = PackageManager::detect()?;
     let pkg = package(manager, engine)?;
     // No `-y`: the modal already asked whether to do this, and the package
@@ -607,8 +1038,9 @@ pub fn install_argv(engine: Engine) -> Option<Vec<String>> {
 /// The hint plus this machine's snippets, when the client can expand them
 /// itself. Only psql can, so only psql is told about them - offering `:tables`
 /// to a client that will read it as a syntax error is worse than saying nothing.
-pub fn hint_line(engine: Engine, s: &Settings) -> String {
-    hint_line_from(engine, s, &crate::snippets::list())
+/// `by_name` says usql was handed the server's databases, so `\c <db>` works.
+pub fn hint_line(engine: Engine, s: &Settings, by_name: bool) -> String {
+    hint_line_from(engine, s, &crate::snippets::list(), by_name)
 }
 
 /// True when the configured command really is this engine's own client, even
@@ -617,17 +1049,26 @@ pub fn hint_line(engine: Engine, s: &Settings) -> String {
 /// the gate in front of them - a `-c` handed to pgcli is a usage error, and one
 /// invented for it would be a guess.
 pub fn speaks_client_flags(engine: Engine, s: &Settings) -> bool {
-    engine.client_argv(s).iter().any(|w| {
-        std::path::Path::new(w)
-            .file_name()
-            .is_some_and(|f| f == engine.default_client())
-    })
+    engine.uses_usql(s)
+        || engine.client_argv(s).iter().any(|w| {
+            std::path::Path::new(w)
+                .file_name()
+                .is_some_and(|f| f == engine.default_client())
+        })
 }
 
 /// The half that decides, kept apart from the half that reads the disk, so it
 /// can be exercised without a real `~/.config/easysql/snippets` anywhere near
 /// it - the same seam `pg::list_in` and `creds::set_pg_in` have.
-fn hint_line_from(engine: Engine, s: &Settings, snips: &[crate::snippets::Snippet]) -> String {
+fn hint_line_from(
+    engine: Engine,
+    s: &Settings,
+    snips: &[crate::snippets::Snippet],
+    by_name: bool,
+) -> String {
+    if engine.uses_usql(s) {
+        return engine.usql_hint(by_name).to_string();
+    }
     let base = engine.hint().to_string();
     // Only psql reads `~/.psqlrc`, so pgcli or a docker wrapper would answer
     // `:name` with a syntax error. Same gate as the install offer: default
@@ -640,7 +1081,11 @@ fn hint_line_from(engine: Engine, s: &Settings, snips: &[crate::snippets::Snippe
     if engine != Engine::Pg || !is_psql {
         return base;
     }
-    let names: Vec<String> = snips.iter().map(|s| format!(":{}", s.name)).collect();
+    let names: Vec<String> = snips
+        .iter()
+        .filter(|s| crate::snippets::psql_name(&s.name))
+        .map(|s| format!(":{}", s.name))
+        .collect();
     match names.is_empty() {
         true => base,
         false => format!("{base}\n  {}", names.join(" · ")),
@@ -650,27 +1095,40 @@ fn hint_line_from(engine: Engine, s: &Settings, snips: &[crate::snippets::Snippe
 /// Just the package name this machine calls the client, for a row that has no
 /// room for the whole command. The name is the part nobody can guess: `psql`
 /// lives in `postgresql-client` on Debian and in `postgresql` on Arch.
-pub fn install_package(engine: Engine) -> Option<&'static str> {
+pub fn install_package(engine: Engine, s: &Settings) -> Option<&'static str> {
+    if engine.uses_usql(s) {
+        return None;
+    }
     package(PackageManager::detect()?, engine)
 }
 
 /// How to install the missing client, as one line: the exact command for this
 /// machine when we recognise it, and the program to go looking for when we do
 /// not. Never a list of distros the reader has to pick themselves out of.
-pub fn install_hint(engine: Engine) -> String {
-    match install_argv(engine) {
+pub fn install_hint(engine: Engine, s: &Settings) -> String {
+    match install_argv(engine, s) {
         Some(argv) => argv.join(" "),
-        None => match install_note(engine) {
+        None => match install_note(engine, s) {
             Some(note) => note.to_string(),
             None => format!("install your distro's {} package", engine.default_client()),
         },
     }
 }
 
-/// Where a client comes from when no package manager here has it. Only SQL
-/// Server needs this, and saying "install your distro's sqlcmd package" would
-/// be worse than useless, because no distro has one.
-pub fn install_note(engine: Engine) -> Option<&'static str> {
+/// Where a client comes from when no package manager here has it: sqlcmd,
+/// which no distro has, and usql, whose Debian package is built without the
+/// SQL Server driver.
+pub fn install_note(engine: Engine, s: &Settings) -> Option<&'static str> {
+    if engine.uses_usql(s) {
+        return Some(match s.in_tui {
+            true => {
+                "get usql's static build from https://github.com/xo/usql/releases (a distro's usql may lack the SQL Server driver), or `esql set usql_tui off`"
+            }
+            false => {
+                "get usql's static build from https://github.com/xo/usql/releases (a distro's usql may lack the SQL Server driver), or `esql set usql_cli off`"
+            }
+        });
+    }
     match engine {
         Engine::MsSql => Some(
             "sqlcmd is not in any distro's repos: get it from https://aka.ms/go-sqlcmd, or add Microsoft's repo for mssql-tools18 (which installs to /opt/mssql-tools18/bin, not on PATH)",
@@ -787,7 +1245,7 @@ mod tests {
                 psql_command: cmd.into(),
                 ..Default::default()
             };
-            hint_line_from(Engine::Pg, &s, &snips)
+            hint_line_from(Engine::Pg, &s, &snips, false)
         };
 
         // The real psql, by name or by full path, gets the shortcuts - and so
@@ -805,7 +1263,7 @@ mod tests {
         // has variables of any kind.
         let s = Settings::default();
         for e in [Engine::MySql, Engine::Sqlite, Engine::MsSql] {
-            assert_eq!(hint_line_from(e, &s, &snips), e.hint());
+            assert_eq!(hint_line_from(e, &s, &snips, false), e.hint());
         }
     }
 

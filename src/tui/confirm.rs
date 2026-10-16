@@ -173,25 +173,21 @@ impl App {
                     .iter()
                     .find(|c| c.engine == engine && c.name == name)
                     .cloned();
-                // The remembered tunnel goes with it, or the file fills up
-                // with forwards for connections that no longer exist.
-                let key = conn.as_ref().map(|c| c.key());
-                match conn.map(|c| engines::delete(&c)) {
+                match conn.map(|c| engines::delete_with_keyed(&c)) {
                     Some(Ok(_)) => {
-                        if let Some(key) = key {
-                            let _ = crate::vias::remove(&key);
-                        }
-                        // A kept SQL Server password is keyed on the name, so it
-                        // goes with the connection rather than waiting for a new
-                        // one that happens to reuse the name.
                         if engine == Engine::MsSql {
-                            let _ = engines::mssql::set_password(&name, None);
                             self.refresh_creds();
                         }
                         self.refresh_conns();
                         self.set_status(format!("deleted '{name}'{}", crate::ini::backup_note()));
                     }
-                    Some(Err(e)) => self.set_failed(format!("delete failed: {e}")),
+                    Some(Err(e)) => {
+                        // The connection itself may be gone even though what it
+                        // kept elsewhere was not, so the list is read again.
+                        self.refresh_creds();
+                        self.refresh_conns();
+                        self.set_failed(format!("'{name}': {}", crate::commands::said(&e)));
+                    }
                     None => self.set_status(format!("'{name}' is already gone")),
                 }
             }
@@ -273,7 +269,7 @@ impl App {
             // wizard. It goes out suspended like a session does, because sudo
             // and the package manager both need the real terminal to ask.
             ConfirmAction::InstallClient { engine } => {
-                if let Some(argv) = engines::install_argv(engine) {
+                if let Some(argv) = engines::install_argv(engine, &self.settings) {
                     return Some(PendingRun {
                         label: super::widgets::shell_join_display(&argv),
                         argv,
@@ -282,8 +278,8 @@ impl App {
                 }
                 self.set_status(format!(
                     "{}: {}",
-                    engine.default_client(),
-                    engines::install_hint(engine)
+                    engine.client_name(&self.settings),
+                    engines::install_hint(engine, &self.settings)
                 ));
             }
         }
@@ -297,11 +293,23 @@ impl App {
     /// SQL Server has no password file, so keeping one is a choice the user
     /// makes once: say what easysql would do, and do it on Yes.
     pub(super) fn offer_mssql_passwords(&mut self, conn: &Conn) {
+        let (client, why, handed) = match conn.engine.uses_usql(&self.settings) {
+            true => (
+                "usql",
+                "usql asks every time it opens",
+                "in a passfile that lasts one session",
+            ),
+            false => (
+                "sqlcmd",
+                "sqlcmd has no password file, so it asks every time it opens",
+                "in SQLCMDPASSWORD",
+            ),
+        };
         self.confirm = Some(Confirm::offer(
-            "keep sqlcmd passwords?",
+            format!("keep {client} passwords?"),
             format!(
-                "sqlcmd has no password file, so it asks every time it opens. easysql can keep \
-                 one in {} (chmod 600) and hand it over in SQLCMDPASSWORD, never on the command \
+                "{why}. easysql can keep \
+                 one in {} (chmod 600) and hand it over {handed}, never on the command \
                  line where `ps` would show it. That is the one secret easysql would hold. Allow \
                  it and save a password for '{}'?",
                 crate::ini::collapse_tilde(&engines::mssql::pass_path().to_string_lossy()),
@@ -312,6 +320,17 @@ impl App {
     }
 
     pub(super) fn offer_install(&mut self, engine: Engine) {
+        if engine.uses_usql(&self.settings) {
+            self.alert(
+                "usql is not installed",
+                format!(
+                    "The `usql_tui` setting opens {} connections in usql, which is not on PATH: {}.",
+                    engine.label(),
+                    engines::install_hint(engine, &self.settings)
+                ),
+            );
+            return;
+        }
         let configured = engine.client_argv(&self.settings)[0].clone();
         // Only offer to install the *default* client. Somebody who pointed the
         // setting at `pgcli` or a docker wrapper wants that, and installing
@@ -323,10 +342,10 @@ impl App {
             ));
             return;
         }
-        let Some(argv) = engines::install_argv(engine) else {
+        let Some(argv) = engines::install_argv(engine, &self.settings) else {
             self.set_status(format!(
                 "{configured} is not installed, and I do not recognise this machine's package manager: {}",
-                engines::install_hint(engine)
+                engines::install_hint(engine, &self.settings)
             ));
             return;
         };

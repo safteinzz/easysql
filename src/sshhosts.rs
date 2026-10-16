@@ -5,8 +5,8 @@
 //! the list is the thing easysql exists to stop, so the tunnel wizard picks from
 //! here instead of giving you a text field.
 //!
-//! Deliberately a reader only: `~/.ssh/config` belongs to ssh and to easyssh,
-//! and a tool that writes another tool's config behind its back is how two
+//! Deliberately a reader only: `~/.ssh/config` belongs to ssh, and a
+//! tool that writes another tool's config behind its back is how two
 //! programs end up fighting over one file.
 
 use std::fs;
