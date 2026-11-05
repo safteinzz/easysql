@@ -14,6 +14,10 @@ categories = ["command-line-utilities", "database"]
 # URLs, never read out of the package, so shipping them would only bloat every download.
 exclude = ["readme-assets/", "demo/", "dev/"]
 
+# The programs esql starts, for tools that ask what an install needs beside its libraries.
+[package.metadata]
+runs = ["psql", "pgcli", "pg_dump", "mysql", "mariadb", "mysqldump", "sqlite3", "litecli", "sqlcmd", "usql", "ssh", "kill", "wl-copy", "xclip", "xsel", "pbcopy"]
+
 # The crate is `easysql`, but the command you type is the shorter `esql`
 # (sql + one letter).
 [[bin]]
