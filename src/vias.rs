@@ -39,7 +39,7 @@ impl Via {
 
     /// The command that rebuilds it, for a preview or a status line.
     pub fn command(&self) -> String {
-        format!("ssh -N -L {} {}", self.spec(), self.host)
+        crate::tunnels::command('L', &self.spec(), &self.host)
     }
 }
 
@@ -127,6 +127,22 @@ pub fn remove_in(path: &std::path::Path, key: &str) -> Result<()> {
     ini::remove(path, key)
 }
 
+/// Forget the via of `c`, and when `c` points at its forward, point it back at
+/// the far address first: the record is the only place that address is kept,
+/// and a connection left on `127.0.0.1` reaches whatever listens there later.
+/// Returns the address it was pointed back at.
+pub fn forget(c: &crate::engines::Conn) -> Result<Option<String>> {
+    let Some(via) = get(&c.key()) else {
+        return Ok(None);
+    };
+    let back = points_at_it(c, &via).then(|| (far_address(&via), via.port.clone()));
+    if let Some((host, port)) = &back {
+        crate::engines::repoint(c, host, port)?;
+    }
+    remove(&c.key())?;
+    Ok(back.map(|(host, port)| format!("{host}:{port}")))
+}
+
 /// What the far end of a `-L` should say, which is *not* always the address you
 /// use from here. The host in the spec is resolved by the ssh host, so when the
 /// database sits on that very machine the answer is its loopback: a server bound
@@ -141,6 +157,16 @@ pub fn forward_target(via: &str, db_host: &str) -> String {
         return "127.0.0.1".to_string();
     }
     db_host.to_string()
+}
+
+/// The address the database has from this machine, as the connection named it
+/// before it was pointed at this forward: the far end, which for a database on
+/// the hop itself is the hop's own `HostName`.
+pub fn far_address(via: &Via) -> String {
+    match via.target.as_str() {
+        "127.0.0.1" | "localhost" | "::1" => crate::sshhosts::hostname_of(&via.host),
+        target => target.to_string(),
+    }
 }
 
 /// Does this connection actually point at the near end of its own forward?
@@ -168,12 +194,11 @@ pub fn ensure(key: &str) -> Option<Result<String>> {
         return None;
     }
     if let Some(t) = crate::tunnels::carrying(&via.local) {
-        return Some(Err(anyhow::anyhow!(
-            "localhost:{} is already forwarded to {} through {}, which is not this connection's: stop that one, or move this one with `esql tunnel up {key} --local <port>`",
-            via.local,
-            t.spec,
-            t.host
-        )));
+        return Some(Err(crate::tunnels::Blocked::PortTaken {
+            port: via.local.parse().unwrap_or(0),
+            by: Some(format!("{} through {}", t.spec, t.host)),
+        }
+        .into()));
     }
     Some(match crate::tunnels::open('L', &via.spec(), &via.host) {
         Ok(t) => Ok(format!(
@@ -199,7 +224,7 @@ fn rows_from(
     let mut rows: Vec<crate::tunnels::Entry> = live
         .iter()
         .map(|t| crate::tunnels::Entry {
-            owner: t.ports().and_then(|(open, _, _)| owner_in(&recorded, open)),
+            owner: owner_in(&recorded, t),
             kind: t.kind,
             spec: t.spec.clone(),
             host: t.host.clone(),
@@ -208,14 +233,9 @@ fn rows_from(
         .collect();
 
     for (key, via) in recorded {
-        // Carrying the local port is what counts, exactly as `ensure` decides
-        // it: a forward already holding that port is the one this connection
-        // will use, whatever spec it was opened with, and it is on screen
-        // already as a row of its own.
-        if live
-            .iter()
-            .any(|t| t.kind == 'L' && t.ports().is_some_and(|(open, _, _)| open == via.local))
-        {
+        // A forward that carries this via is on screen already as a row of its
+        // own. One that only holds the same port is another connection's.
+        if live.iter().any(|t| t.carries(&via)) {
             continue;
         }
         rows.push(crate::tunnels::Entry {
@@ -229,11 +249,23 @@ fn rows_from(
     rows
 }
 
-fn owner_in(recorded: &[(String, Via)], local: &str) -> Option<String> {
+/// The connection whose via `t` carries, the same test `ensure` makes.
+fn owner_in(recorded: &[(String, Via)], t: &crate::tunnels::Tunnel) -> Option<String> {
     recorded
         .iter()
-        .find(|(_, v)| v.local == local)
+        .find(|(_, v)| t.carries(v))
         .map(|(key, _)| key.clone())
+}
+
+/// The other connections whose via `t` carries too: two connections to one
+/// server through one hop share a forward, and stopping it on behalf of one
+/// cuts the other off.
+pub fn sharing(key: &str, t: &crate::tunnels::Tunnel) -> Vec<String> {
+    all()
+        .into_iter()
+        .filter(|(k, v)| k != key && t.carries(v))
+        .map(|(k, _)| k)
+        .collect()
 }
 
 /// Every recorded via, for the checks that have to look at all of them.
@@ -304,14 +336,20 @@ mod tests {
     }
 
     #[test]
-    fn holding_the_port_is_what_counts_as_carrying_it() {
-        // `ensure` decides a via is satisfied by whatever holds its local port,
-        // whatever spec that forward was opened with. The list has to agree, or
-        // it grows a second row for a tunnel that is already there.
+    fn a_forward_belongs_only_to_the_via_it_carries() {
+        // Two connections may remember the same local port for different
+        // servers, so a forward on that port to another server is not this
+        // connection's: it is listed with no owner, and this via stays on the
+        // list as off, where `d` on the running one cannot forget it.
         let recorded = vec![("pg:prod".to_string(), via("5432", "5432"))];
-        let rows = rows_from(&[running("5432:10.0.0.9:5432")], recorded);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].on());
+        let rows = rows_from(&[running("5432:192.0.2.9:5432")], recorded);
+        assert_eq!(rows.len(), 2, "one row each for the forward and the via");
+        assert!(
+            rows[0].on() && rows[0].owner.is_none(),
+            "the running forward carries another server, so nothing owns it"
+        );
+        assert!(!rows[1].on());
+        assert_eq!(rows[1].owner.as_deref(), Some("pg:prod"));
 
         // A forward nothing recorded is still a row, just one with no owner to
         // name: it is running, and Enter and `d` on it have to mean something.

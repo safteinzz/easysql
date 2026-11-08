@@ -1,8 +1,8 @@
 //! easysql - a database toolbox that makes sql easy. Binary: `esql`.
 //!
-//! One tool over `psql`, `mysql` and `sqlite3` so you never dig through a
-//! password manager, a wiki page or your own notes for a connection string
-//! again.
+//! One tool over `psql`, `mysql`, `sqlite3`, `sqlcmd` and `usql`, so you never
+//! dig through a password manager, a wiki page or your own notes for a
+//! connection string again.
 //!
 //! This file is the clap `Cmd` enum and the dispatch match; what you can run is
 //! `esql --help`, which renders from the manifest, those doc comments and
@@ -51,7 +51,7 @@ const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
   esql <name> 'select 1'     run one query and exit, the way `ssh host 'cmd'` does
   esql <name> :<query>       run a saved query (`esql snippet ls` lists them)
   esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)
-  esql --md <name> ...       any of the above, its rows printed as markdown tables
+  esql --md <name> ...       a query or a saved query as above, its rows printed as markdown tables
   esql --dump <name>[/<db>]  print the database as SQL (`> app.sql`), any words after it going to the dump tool";
 
 /// The rest of the block: the words the output uses, what a script can
@@ -71,11 +71,11 @@ easysql exits 2 for a name, snippet, `/db`, `--md` or `--dump` it cannot use,
 127 when there is no client to run, and 1 when a tunnel it needs will not open
 or a read-only connection would not be read-only. Everything after `--` reaches
 the client untouched. Every other command prints its result on stdout and its
-errors on stderr, exiting 1 on a failure (`self check` has codes of its own,
-in `esql self --help`): a command that changes something prints one line per
-step, and -n prints the same lines and changes nothing. `rm` and `down` take
-one name each, so every delete names what it loses, and a script loops over
-`ls` for more.
+errors on stderr, exiting 1 on a failure and 2 on a usage error (`self check`
+has codes of its own, in `esql self --help`): a command that changes something
+prints one line per step, and -n prints the same lines and changes nothing.
+`rm` and `down` take one name each, so every delete names what it loses, and a
+script loops over `ls` for more.
 Nothing asks without a terminal: a delete asks first only on one, and -y
 answers it, and `pw set` reads the password from --stdin, or from a prompt that
 does not echo.
@@ -190,8 +190,15 @@ fn main() {
     match cli.command {
         // Bare `esql` → the toolbox.
         None => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                eprintln!(
+                    "esql: the toolbox needs a terminal: `esql ls` lists the connections, and `esql --help` the commands"
+                );
+                std::process::exit(2);
+            }
             if let Err(e) = tui::run() {
-                eprintln!("esql: {e}");
+                eprintln!("esql: {}", commands::said(&e));
                 std::process::exit(1);
             }
         }

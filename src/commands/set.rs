@@ -116,7 +116,7 @@ fn list(rows: &[&crate::settings::Row], json: bool) {
                 )
             })
             .collect();
-        println!("{}", json_array(&out));
+        outln!("{}", json_array(&out));
         return;
     }
     let kw = rows.iter().map(|r| r.key.len()).max().unwrap_or(0);
@@ -126,7 +126,7 @@ fn list(rows: &[&crate::settings::Row], json: bool) {
             Some(c) => c.join("|"),
             None => "typed".to_string(),
         };
-        println!(
+        outln!(
             "{:kw$}  {:vw$}  {}",
             r.key,
             r.value,

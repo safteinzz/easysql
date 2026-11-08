@@ -84,7 +84,7 @@ fn ls(args: LsArgs) {
                 )
             })
             .collect();
-        println!("{}", json_array(&rows));
+        outln!("{}", json_array(&rows));
         return;
     }
     if all.is_empty() {
@@ -92,10 +92,10 @@ fn ls(args: LsArgs) {
         return;
     }
     for s in &all {
-        println!("{}", s.name);
+        outln!("{}", s.name);
         if args.verbose {
             for line in s.sql.trim_end().lines() {
-                println!("    {line}");
+                outln!("    {line}");
             }
         }
     }
@@ -122,13 +122,15 @@ fn add(args: AddArgs) {
     if sql.trim().is_empty() {
         fail("the SQL is empty, so nothing was saved");
     }
-    let exists = snippets::get(&name).is_some();
+    let path = snippets::dir().join(format!("{name}.sql"));
+    // The file, not the list, so one that cannot be read is never overwritten
+    // as though the name were free.
+    let exists = path.exists();
     if exists && !args.replace {
         fail(&format!(
             "a query called '{name}' is already saved: `--replace` overwrites it"
         ));
     }
-    let path = snippets::dir().join(format!("{name}.sql"));
     let verb = if exists { "replace" } else { "save" };
     step(&format!("{verb} '{name}' in {}", shown(&path)));
     let mut after: Vec<Snippet> = snippets::list()
@@ -148,7 +150,7 @@ fn add(args: AddArgs) {
     if let Err(e) = snippets::save(&name, &sql) {
         fail(&said(&e));
     }
-    sync_psqlrc();
+    sync_psqlrc("saved");
 }
 
 fn rm(args: RmArgs) {
@@ -174,23 +176,26 @@ fn rm(args: RmArgs) {
     if let Err(e) = snippets::delete(&s.name) {
         fail(&said(&e));
     }
-    sync_psqlrc();
+    sync_psqlrc("deleted");
 }
 
 /// The `~/.psqlrc` step, printed only when the block would really change, as
 /// `sync_psqlrc` writes only then.
 fn psqlrc_step(after: &[Snippet]) {
-    let path = snippets::psqlrc_path();
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if snippets::splice(&existing, &snippets::psqlrc_block(after)) != existing {
-        step(&format!("update the easysql block in {}", shown(&path)));
+    if snippets::psqlrc_would_change(after) {
+        step(&format!(
+            "update the easysql block in {}",
+            shown(&snippets::psqlrc_path())
+        ));
     }
 }
 
-fn sync_psqlrc() {
+/// `done` is what already happened to the query, which a failure here does
+/// not undo.
+fn sync_psqlrc(done: &str) {
     if let Err(e) = snippets::sync_psqlrc() {
         fail(&format!(
-            "saved, but `:name` in psql was not updated: {}",
+            "{done}, but `:name` in psql was not updated: {}",
             said(&e)
         ));
     }

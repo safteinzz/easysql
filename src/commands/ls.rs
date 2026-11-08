@@ -1,8 +1,8 @@
 //! `esql ls` - every saved connection, one per line, across every engine. This
 //! is the `grep '^\[' ~/.pg_service.conf` you keep rewriting, built in.
 //!
-//! Alphabetical by engine then name, never by history: a script's output must
-//! not depend on what you did yesterday.
+//! Grouped by engine in a fixed order, then by name, never by history: a
+//! script's output must not depend on what you did yesterday.
 
 use super::{json_array, json_opt, json_str};
 use crate::engines;
@@ -65,7 +65,7 @@ pub fn run(args: Args) {
                 )
             })
             .collect();
-        println!("{}", json_array(&rows));
+        outln!("{}", json_array(&rows));
         return;
     }
 
@@ -77,7 +77,10 @@ pub fn run(args: Args) {
         return;
     }
 
-    let names: Vec<String> = conns.iter().map(|c| typed(c, &conns)).collect();
+    let names: Vec<String> = conns
+        .iter()
+        .map(|c| engines::typed_name(c, &conns))
+        .collect();
     if args.verbose {
         // Pad the name column so the targets line up.
         let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
@@ -90,7 +93,7 @@ pub fn run(args: Args) {
             // Words rather than the TUI's colour, because this is the line a
             // script or an agent reads to pick the connection it may use.
             let ro = if c.read_only() { "  (read-only)" } else { "" };
-            println!(
+            outln!(
                 "  {:ew$}  {:width$}  {}{}",
                 c.engine.label().dimmed(),
                 name.bold(),
@@ -100,18 +103,7 @@ pub fn run(args: Args) {
         }
     } else {
         for name in &names {
-            println!("{name}");
+            outln!("{name}");
         }
-    }
-}
-
-/// The name as `esql` takes it: bare, or `<engine>:<name>` when another engine
-/// has the same name or it is also a command, since the bare word would then
-/// be refused or open something else.
-fn typed(c: &engines::Conn, all: &[engines::Conn]) -> String {
-    let shared = all.iter().filter(|o| o.name == c.name).count() > 1;
-    match shared || super::COMMANDS.contains(&c.name.as_str()) {
-        true => c.key(),
-        false => c.name.clone(),
     }
 }

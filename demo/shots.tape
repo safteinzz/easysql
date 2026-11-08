@@ -13,6 +13,7 @@ Set Shell bash
 Set Theme "Catppuccin Mocha"
 Set FontFamily "JetBrainsMono NF"
 Set FontSize 15
+# 1320 like the GIFs, so the toolbox is one size in every picture of it.
 Set Width 1320
 Set Height 640
 Set Padding 20
@@ -20,9 +21,7 @@ Set Framerate 24
 Set TypingSpeed 55ms
 
 # vhs runs the tape from the directory it was invoked in, which is `demo/`, so
-# this is a bare `./stage.sh shell` - and that script refuses to open one unless
-# the stage exists, so a broken setup stops the render instead of quietly
-# screenshotting the real home.
+# this is `./stage.sh shell`, which refuses to open one unless the stage exists.
 Hide
 # `exec`, so a stage that refuses to open takes the terminal with it: without it
 # the script exits, the outer shell survives, and every keystroke after this

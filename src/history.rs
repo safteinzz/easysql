@@ -34,11 +34,13 @@ impl History {
     }
 
     /// Sort key for the Connections list: most recently opened first, then every
-    /// connection you have never used, alphabetically. Returning the negated
-    /// stamp keeps it a plain ascending sort at the call site.
-    pub fn rank(&self, key: &str) -> (i64, String) {
+    /// connection you have never used, alphabetically by name, the engine only
+    /// breaking a tie. Returning the negated stamp keeps it a plain ascending
+    /// sort at the call site.
+    pub fn rank(&self, key: &str) -> (i64, String, String) {
         let last = self.get(key).map(|e| e.last).unwrap_or(0);
-        (-(last as i64), key.to_string())
+        let name = key.split_once(':').map_or(key, |(_, name)| name);
+        (-(last as i64), name.to_string(), key.to_string())
     }
 }
 
@@ -64,6 +66,16 @@ pub fn record(key: &str) {
         let _ = fs::create_dir_all(dir);
     }
     let _ = record_in(&p, key, now());
+}
+
+/// Forget a deleted connection, so a new one that reuses its name starts
+/// without its place in the list. Best-effort, like `record`.
+pub fn forget(key: &str) {
+    let path = path();
+    let mut h = load_from(&path);
+    if h.entries.remove(key).is_some() {
+        let _ = write_all(&path, &h);
+    }
 }
 
 /// Move a connection's record to its new name. Keyed on `Conn::key()` like
@@ -97,17 +109,26 @@ pub fn load_from(path: &Path) -> History {
     let Ok(text) = fs::read_to_string(path) else {
         return History { entries };
     };
+    fn field(s: &str) -> Option<(&str, &str)> {
+        s.trim_start().split_once(char::is_whitespace)
+    }
     for line in text.lines() {
-        // `<epoch> <count> <key>`; the key is last because a service name and
-        // an option group cannot contain whitespace, so it needs no quoting.
-        let mut f = line.split_whitespace();
-        let (Some(last), Some(count), Some(key)) = (f.next(), f.next(), f.next()) else {
+        // `<epoch> <count> <key>`, the first two apart by any run of blanks;
+        // the key is last and runs to the end of the line, because a
+        // connection's name may hold a space.
+        let Some((last, rest)) = field(line) else {
+            continue;
+        };
+        let Some((count, key)) = field(rest) else {
             continue;
         };
         let (Ok(last), Ok(count)) = (last.parse(), count.parse()) else {
             continue;
         };
-        entries.insert(key.to_string(), Entry { last, count });
+        let key = key.trim();
+        if !key.is_empty() {
+            entries.insert(key.to_string(), Entry { last, count });
+        }
     }
     History { entries }
 }
@@ -154,5 +175,33 @@ pub fn ago(then: u64, now: u64) -> String {
         86400..=2591999 => format!("{}d ago", secs / 86400),
         2592000..=31535999 => format!("{}mo ago", secs / 2592000),
         _ => format!("{}y ago", secs / 31536000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_history_line_reads_with_any_spacing_and_a_name_with_a_space() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("easysql-history-{}-{stamp}", std::process::id()));
+        fs::write(&path, "100     41 pg:app\n200 2 pg:my db\n").unwrap();
+        let h = load_from(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            h.get("pg:app").map(|e| e.count),
+            Some(41),
+            "columns padded with spaces still read"
+        );
+        assert_eq!(
+            h.get("pg:my db").map(|e| e.last),
+            Some(200),
+            "the name runs to the end of the line"
+        );
     }
 }

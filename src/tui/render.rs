@@ -2,7 +2,7 @@
 //! line and help.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 
 use super::confirm::render_confirm;
 use super::detail::{DETAIL_PCT, detail_fits};
@@ -43,7 +43,7 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
         render_help(f, area, app);
     }
     if let Some(p) = &app.prompt {
-        render_prompt(f, area, p, &app.tunnels, &app.settings);
+        render_prompt(f, area, p, &app.tunnels, &app.settings, &app.conns);
     }
     if let Some(p) = &app.picker {
         render_picker(f, area, p);
@@ -55,7 +55,7 @@ pub(super) fn ui(f: &mut Frame, app: &mut App) {
         super::typed::render_typed(f, area, t);
     }
     // Last, so a failure is never drawn under the thing that caused it.
-    if let Some(a) = &app.alert {
+    if let Some(a) = app.alert.as_mut() {
         super::alert::render_alert(f, area, a);
     }
 }
@@ -92,14 +92,14 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
             let no_clients = if app.installed.iter().any(|&i| i) {
                 ""
             } else {
-                "\n\nNo database client is installed here yet either. easysql is a front end,\nso cargo could not bring one: press Enter on a connection and it offers\nto install the right one for this machine."
+                "\n\nNo database client is installed here yet either. easysql is a front end, so cargo could not bring one: press Enter on a connection and it offers to install the right one for this machine."
             };
             if let Some(msg) = nothing_here(
                 app,
                 app.conns.len(),
                 rows.len(),
                 &format!(
-                    "No saved connections yet.\nPress `c` to add one: postgres, mysql or sqlite.{no_clients}"
+                    "No saved connections yet.\nPress `c` to add one: postgres, mysql, sqlite or sql server.{no_clients}"
                 ),
             ) {
                 empty(f, area, "Connections", &msg);
@@ -137,8 +137,8 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     let c = &app.conns[i];
                     let (mark, style) = reach_mark(
                         app.reach.get(&c.key()),
-                        c.engine.networked(),
-                        super::detail::sleeping_via(c).is_some(),
+                        c.engine.networked() && app.settings.probe,
+                        super::detail::sleeping_via(app, c).is_some(),
                     );
                     let age = match app.history.get(&c.key()) {
                         Some(e) => history::ago(e.last, now),
@@ -244,7 +244,7 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     // truncated by the terminal mid-word, which reads as a
                     // rendering fault.
                     let room = (area.width as usize).saturating_sub(2 + 2);
-                    let body = t.describe();
+                    let body = fit_end(&t.describe(), room);
                     let owner = fit_end(&owner, room.saturating_sub(body.chars().count()));
                     ListItem::new(Line::from(vec![
                         Span::raw(body),
@@ -283,10 +283,10 @@ pub(super) fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
                     let s = &app.snippets[i];
                     let room = (area.width as usize).saturating_sub(2 + 2 + nw + 2 + 12 + 2);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:nw$}", s.name), bold),
+                        Span::styled(fit(&s.name, nw), bold),
                         Span::raw("  "),
                         Span::styled(
-                            format!("{:12}", format!(":{}", s.name)),
+                            fit(&format!(":{}", s.name), 12),
                             Style::default().fg(Color::Cyan),
                         ),
                         Span::raw("  "),
@@ -409,8 +409,6 @@ fn counted(name: &str, shown: usize, total: usize) -> Block<'static> {
     }
 }
 
-/// The dot in front of a connection: filled and coloured once we know, hollow
-/// while we are still asking. A SQLite file has no port and gets no dot.
 /// Cut to at most `w` without padding, for a trailing column that should simply
 /// disappear when there is no room rather than push the row over.
 fn fit_end(s: &str, w: usize) -> String {
@@ -437,16 +435,19 @@ fn fit(s: &str, w: usize) -> String {
     out
 }
 
-fn reach_mark(reach: Option<&Reach>, networked: bool, sleeping_via: bool) -> (&'static str, Style) {
-    // A closed port in front of a tunnel we can reopen is not a server that is
-    // gone. Yellow on the same glyph rather than a rarer codepoint, which is one
-    // font fallback from rendering as a stray `‹`. Up counts too, and matters
-    // more: a port answering while the forward is down is answering for something
-    // else.
-    if sleeping_via && matches!(reach, Some(Reach::Down) | Some(Reach::Up(_))) {
+/// The dot in front of a connection: filled and coloured once we know, hollow
+/// while we are still asking. A SQLite file has no port, and with the checks
+/// off nothing is asked, so neither gets a dot.
+fn reach_mark(reach: Option<&Reach>, probed: bool, sleeping_via: bool) -> (&'static str, Style) {
+    // A tunnel we can reopen in front of the port is not a server that is gone,
+    // whatever the port said. Yellow on the same glyph rather than a rarer
+    // codepoint, which is one font fallback from rendering as a stray `‹`. Up
+    // matters most: a port answering while the forward is down is answering for
+    // something else.
+    if sleeping_via {
         return ("●", Style::default().fg(Color::Yellow));
     }
-    if !networked {
+    if !probed {
         return (" ", Style::default());
     }
     match reach {
@@ -527,7 +528,7 @@ const HELP: &[HelpSection] = &[
             ("j/k ↑↓", "move in the list"),
             ("h/l ←→", "the previous, next tab"),
             ("tab shift-tab", "the next, previous tab"),
-            ("ctrl-j/k/h/l", "the same, from anywhere"),
+            ("ctrl-j/k/h/l", "the same, on a tab"),
         ],
     ),
     (
@@ -550,10 +551,7 @@ const HELP: &[HelpSection] = &[
             ("Y", "yank the url"),
             ("p", "save its password"),
             ("t", "reach it through ssh (ssh -L)"),
-            (
-                "",
-                "● up · ● down · ● tunnel closed · ○ checking · pw saved",
-            ),
+            ("", LEGEND),
         ],
     ),
     (
@@ -589,7 +587,7 @@ const HELP: &[HelpSection] = &[
         "in a form",
         &[
             ("type", "fill the field, h/j/k/l included"),
-            ("ctrl-j/k ↑↓", "the previous, next field"),
+            ("ctrl-j/k ↑↓", "move between the fields"),
             ("tab shift-tab", "the next, previous field"),
             ("h/l ←→", "step a ‹ choice ›"),
             ("ctrl-o", "pick the ssh host for a tunnel"),
@@ -621,9 +619,59 @@ const HELP: &[HelpSection] = &[
 /// The width of the key column, so every description starts in one place.
 const HELP_KEYS: usize = 16;
 
-pub(super) fn help_lines() -> Vec<Line<'static>> {
+/// The note that stands for the list's marks, drawn in their own colours.
+const LEGEND: &str = "legend";
+
+/// The groups that hold on every screen, under the one for the screen itself.
+const SHARED: [&str; 5] = [
+    "moving",
+    "every tab",
+    "in a form",
+    "in a box",
+    "in this help",
+];
+
+/// The marks of the Connections list, each in the colour it has there.
+fn legend() -> Line<'static> {
+    let c = |text: &'static str, style: Style| Span::styled(text, style);
+    let fg = |color: Color| Style::default().fg(color);
+    let plain =
+        |text: &'static str| Span::styled(text, Style::default().add_modifier(Modifier::DIM));
+    Line::from(vec![
+        Span::raw("  "),
+        c("●", fg(Color::Green)),
+        plain(" up · "),
+        c("●", fg(Color::Red)),
+        plain(" down · "),
+        c("●", fg(Color::Yellow)),
+        plain(" tunnel closed · "),
+        c("○", Style::default().add_modifier(Modifier::DIM)),
+        plain(" checking · "),
+        c("pw", fg(Color::Green)),
+        plain(" saved · "),
+        c("no client", fg(Color::Red)),
+        plain(" · "),
+        c("name", fg(READ_ONLY_COLOR).add_modifier(Modifier::BOLD)),
+        plain(" read-only"),
+    ])
+}
+
+/// The help for `view`: its own group first, then the groups that hold on
+/// every screen. The other screens' keys cannot be pressed from here, so they
+/// are left to the help opened there.
+pub(super) fn help_lines(view: View) -> Vec<Line<'static>> {
+    let own = match view {
+        View::Connections => "connections",
+        View::Passwords => "passwords",
+        View::Tunnels => "tunnels",
+        View::Snippets => "snippets",
+        View::Settings => "settings",
+    };
     let mut lines = Vec::new();
-    for (section, entries) in HELP {
+    for name in std::iter::once(own).chain(SHARED) {
+        let Some((section, entries)) = HELP.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
         if !lines.is_empty() {
             lines.push(Line::raw(""));
         }
@@ -634,6 +682,10 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ));
         for (keys, what) in *entries {
+            if keys.is_empty() && *what == LEGEND {
+                lines.push(legend());
+                continue;
+            }
             if keys.is_empty() {
                 lines.push(Line::styled(
                     format!("  {what}"),
@@ -656,10 +708,19 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
 /// The help reader: the body scrolls under a key row that never moves, with a
 /// scrollbar on the right border once it is taller than the box.
 pub(super) fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
-    let lines = help_lines();
-    let width = box_width(area.width);
+    let lines = help_lines(app.view);
+    let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let width = box_width(
+        area.width,
+        super::widgets::widest("help", texts.iter().map(String::as_str)),
+    );
+    // Wrapped, so a narrow screen loses no word off the right edge.
+    let rows: usize = texts
+        .iter()
+        .map(|t| wrapped_line_count(t, box_inner_width(width)))
+        .sum();
     // The body, then a blank and the key row.
-    let rect = box_area(area, width, box_height(lines.len() as u16 + 2, area.height));
+    let rect = box_area(area, width, box_height(rows as u16 + 2, area.height));
     f.render_widget(Clear, rect);
     let block = box_block(Color::Cyan, "help");
     let inner = block.inner(rect);
@@ -668,20 +729,23 @@ pub(super) fn render_help(f: &mut Frame, area: Rect, app: &mut App) {
     let shown = inner.height.saturating_sub(2) as usize;
     // Clamped here, where the height is known, so scrolling past the end never
     // piles up presses that then take as many to undo.
-    app.help_scroll = app.help_scroll.min(lines.len().saturating_sub(shown));
+    app.help_scroll = app.help_scroll.min(rows.saturating_sub(shown));
     let top = app.help_scroll;
     let body = Rect {
         height: shown as u16,
         ..inner
     };
-    f.render_widget(Paragraph::new(lines[top..].to_vec()), body);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top as u16, 0)),
+        body,
+    );
     let keys = Rect {
         y: inner.y + inner.height.saturating_sub(1),
         height: 1,
         ..inner
     };
     f.render_widget(Paragraph::new(box_hint(READER_KEYS)), keys);
-    if lines.len() > shown {
-        vscrollbar(f, rect, lines.len(), top, shown);
-    }
+    vscrollbar(f, rect, rows, top, shown);
 }

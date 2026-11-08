@@ -21,16 +21,27 @@ impl Shell {
         }
     }
 
-    /// The file the shell reads at every start, relative to `$HOME`.
-    fn rc_file(self) -> &'static str {
+    /// The file the shell reads at every start, where the shell itself looks
+    /// for it: zsh's under `$ZDOTDIR` and fish's under `$XDG_CONFIG_HOME` when
+    /// those are set.
+    fn rc_path(self, home: &std::path::Path) -> std::path::PathBuf {
+        let dir = |key: &str| {
+            std::env::var_os(key)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        };
         match self {
-            Shell::Bash => ".bashrc",
-            Shell::Zsh => ".zshrc",
-            Shell::Fish => ".config/fish/config.fish",
+            Shell::Bash => home.join(".bashrc"),
+            Shell::Zsh => dir("ZDOTDIR")
+                .unwrap_or_else(|| home.to_path_buf())
+                .join(".zshrc"),
+            Shell::Fish => dir("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| home.join(".config"))
+                .join("fish/config.fish"),
         }
     }
 
-    /// The line in `rc_file` that loads completion at every start.
+    /// The line in `rc_path` that loads completion at every start.
     fn rc_line(self) -> &'static str {
         match self {
             Shell::Bash => "source <(esql completions bash)",
@@ -79,8 +90,8 @@ fn add(shell: Shell, dry: bool) {
     let Some(home) = dirs::home_dir() else {
         fail("could not find your home directory; set `HOME` and try again");
     };
-    let rc = home.join(shell.rc_file());
-    let shown = format!("~/{}", shell.rc_file());
+    let rc = shell.rc_path(&home);
+    let shown = super::shown(&rc);
     // Lossy, so one byte that is not UTF-8 cannot make the file read as empty.
     let existing = std::fs::read(&rc)
         .map(|b| String::from_utf8_lossy(&b).into_owned())

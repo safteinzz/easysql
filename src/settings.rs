@@ -25,6 +25,7 @@ pub enum ConnOrder {
     Name,
 }
 
+#[derive(Clone)]
 pub struct Settings {
     /// Whether to check each server's port in the background.
     pub probe: bool,
@@ -214,11 +215,6 @@ impl Settings {
         if let Some(value) = value {
             self.set(key, &value);
         }
-        // A setting whose default is empty cannot be restored through `set`,
-        // which reads an empty value as "leave it alone".
-        if key == "tunnel_host" {
-            self.tunnel_host = String::new();
-        }
     }
 
     /// Move a cycled setting to its next (or previous) answer. A no-op on a
@@ -406,18 +402,49 @@ impl Settings {
     }
 
     /// Write every setting, defaults included, so the file doubles as the list
-    /// of what can be changed.
+    /// of what can be changed. A setting's line is rewritten where it stands,
+    /// and every other line, a comment or a key from a newer build, is kept as
+    /// it was.
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let mut body = String::from(
-            "# easysql settings - `key = value`, one per line. Delete a line\n# to go back to its default. The Settings tab edits this file.\n\n",
-        );
-        for row in self.rows() {
+        let old = match fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let rows = self.rows();
+        let mut body = String::new();
+        if old.is_empty() {
+            body.push_str(
+                "# easysql settings: `key = value`, one per line. Delete a line\n# to go back to its default. The Settings tab edits this file.\n\n",
+            );
+        }
+        let mut written: Vec<&str> = Vec::new();
+        for line in old.lines() {
+            let key = match line.trim_start().starts_with('#') {
+                true => None,
+                false => line.split_once('=').map(|(k, _)| k.trim()),
+            };
+            match key.and_then(|k| rows.iter().find(|r| r.key == k)) {
+                // A second line for one key would win on the next load, so
+                // only the first is kept.
+                Some(row) if written.contains(&row.key) => {}
+                Some(row) => {
+                    body.push_str(&format!("{} = {}\n", row.key, row.value));
+                    written.push(row.key);
+                }
+                None => {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+        }
+        for row in rows.iter().filter(|r| !written.contains(&r.key)) {
             body.push_str(&format!("{} = {}\n", row.key, row.value));
         }
-        fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+        crate::ini::write_atomic(path, &body)
     }
 }
 

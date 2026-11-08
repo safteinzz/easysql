@@ -10,16 +10,94 @@
 //! It is here because it is the step between you and the database, and having
 //! it in the same window as the connection it serves is the whole point.
 //!
-//! We capture each tunnel's stderr to its own log and, after spawning, wait a
-//! beat to confirm it actually stayed up - so a bad port or auth failure surfaces
-//! as an error instead of a "tunnel" that was already dead on arrival.
+//! We capture each tunnel's stderr to its own log and, after spawning, wait
+//! until the forward is really listening, so a bad port or an auth failure
+//! surfaces as an error instead of a "tunnel" that was already dead on arrival.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::fs::{self, File};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// What `open` runs, which is also what every line that shows the command
+/// prints, so the two cannot disagree. `BatchMode` turns a host key or a
+/// passphrase that would need asking into a failure that can be read, where a
+/// prompt from a background ssh is drawn over the screen and never answered;
+/// `ExitOnForwardFailure` ends ssh when its port cannot be bound, where it
+/// would otherwise stay connected and carry nothing.
+pub fn argv(kind: char, spec: &str, host: &str) -> Vec<String> {
+    [
+        "ssh",
+        "-N",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+    ]
+    .iter()
+    .map(|w| w.to_string())
+    .chain([format!("-{kind}"), spec.to_string(), host.to_string()])
+    .collect()
+}
+
+/// `argv` as one line, for a preview or a status line.
+pub fn command(kind: char, spec: &str, host: &str) -> String {
+    argv(kind, spec, host).join(" ")
+}
+
+/// Why a forward could not come up, for the failures something can be done
+/// about. Anything else is ssh's own words.
+#[derive(Debug)]
+pub enum Blocked {
+    /// There is no `ssh` on PATH.
+    NoSsh,
+    /// Something already listens on the local port: another program, or `by`,
+    /// a forward that carries another connection.
+    PortTaken { port: u16, by: Option<String> },
+    /// ssh has never seen `host`'s key, and a forward in the background cannot
+    /// ask whether to trust it. `said` is ssh's own words.
+    UnknownHostKey { host: String, said: String },
+}
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Blocked::NoSsh => write!(
+                f,
+                "`ssh` is not on PATH, so no tunnel can be opened: install the OpenSSH client"
+            ),
+            Blocked::PortTaken { port, by: None } => write!(
+                f,
+                "localhost:{port} is already taken by another program: pick another local port"
+            ),
+            Blocked::PortTaken { port, by: Some(by) } => write!(
+                f,
+                "localhost:{port} is already forwarded to {by}, which is not this connection's: pick another local port"
+            ),
+            Blocked::UnknownHostKey { said, .. } => write!(f, "{said}"),
+        }
+    }
+}
+
+impl std::error::Error for Blocked {}
+
+/// Whether nothing listens on `port` here, so a forward can take it.
+pub fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// The first port after `from` that nothing listens on and no recorded
+/// forward claims, for a tunnel that cannot have the one it asked for.
+pub fn free_port_after(from: u16) -> Option<u16> {
+    let claimed: Vec<String> = recorded()
+        .iter()
+        .filter_map(|t| t.ports().map(|(open, _, _)| open.to_string()))
+        .collect();
+    (from.saturating_add(1)..=from.saturating_add(200))
+        .find(|p| !claimed.contains(&p.to_string()) && port_free(*p))
+}
 
 /// A live (or once-live) forward. `spec` is the raw ssh forward argument, e.g.
 /// `8080:localhost:80`; `kind` is 'L' (local) or 'R' (reverse/remote).
@@ -114,7 +192,7 @@ impl Entry {
 
     /// The command that opens it, exactly as it is run.
     pub fn command(&self) -> String {
-        format!("ssh -N -{} {} {}", self.kind, self.spec, self.host)
+        command(self.kind, &self.spec, &self.host)
     }
 }
 
@@ -123,10 +201,31 @@ impl Tunnel {
         ports_of(&self.spec)
     }
 
-    /// When it was opened: the log file is created as the tunnel is spawned, so
-    /// its mtime is the tunnel's birth time. `None` if the file has gone.
+    /// The command that runs it, exactly as it was started.
+    pub fn command(&self) -> String {
+        command(self.kind, &self.spec, &self.host)
+    }
+
+    /// When it was opened: the log is named for the moment the tunnel was
+    /// spawned, which ssh writing to it later does not move. A log from an
+    /// older build without that name falls back to its mtime.
     pub fn started_at(&self) -> Option<SystemTime> {
-        fs::metadata(&self.log).ok()?.modified().ok()
+        let named = self
+            .log
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok());
+        match named {
+            Some(nanos) => Some(UNIX_EPOCH + Duration::from_nanos(nanos)),
+            None => fs::metadata(&self.log).ok()?.modified().ok(),
+        }
+    }
+
+    /// Whether this is the forward `via` asks for: the same spec through the
+    /// same host. Holding the same local port is not enough, since two
+    /// connections may remember one port for two different servers.
+    pub fn carries(&self, via: &crate::vias::Via) -> bool {
+        self.kind == 'L' && self.spec == via.spec() && self.host == via.host
     }
 
     /// Whatever ssh wrote to stderr and kept running through - a warning about
@@ -185,14 +284,29 @@ fn log_path() -> PathBuf {
     state_dir().join("tunnels").join(format!("{stamp}.log"))
 }
 
-/// Read all tracked tunnels, dropping any whose process has died, and rewrite
-/// the state file so it self-prunes. TSV: `pid\tkind\tspec\thost\tlog`.
+/// Every tracked tunnel whose process still runs it. One that has died has its
+/// log deleted and its line dropped from the state file, which is written only
+/// then. TSV: `pid\tkind\tspec\thost\tlog`.
 pub fn list() -> Vec<Tunnel> {
+    let (live, dead): (Vec<Tunnel>, Vec<Tunnel>) = recorded().into_iter().partition(Tunnel::alive);
+    if !dead.is_empty() {
+        for t in &dead {
+            if !t.log.as_os_str().is_empty() {
+                let _ = fs::remove_file(&t.log);
+            }
+        }
+        // Best effort: a stale line just reappears and is dropped next time.
+        let _ = forget(&dead);
+    }
+    live
+}
+
+/// Every line of the state file, alive or not.
+fn recorded() -> Vec<Tunnel> {
     let Ok(text) = fs::read_to_string(state_path()) else {
         return Vec::new();
     };
-
-    let mut live = Vec::new();
+    let mut out = Vec::new();
     for line in text.lines() {
         let mut f = line.split('\t');
         let (Some(pid), Some(kind), Some(spec), Some(host)) =
@@ -205,30 +319,30 @@ pub fn list() -> Vec<Tunnel> {
         };
         // `log` is optional so a state file from an older build still parses.
         let log = f.next().map(PathBuf::from).unwrap_or_default();
-        let t = Tunnel {
+        out.push(Tunnel {
             pid,
             kind: kind.chars().next().unwrap_or('L'),
             spec: spec.to_string(),
             host: host.to_string(),
             log,
-        };
-        if t.alive() {
-            live.push(t);
-        } else if !t.log.as_os_str().is_empty() {
-            let _ = fs::remove_file(&t.log); // clean the log of a tunnel that has died
-        }
+        });
     }
+    out
+}
 
-    // Persist the pruned set (best effort - a stale line just reappears next run).
-    let _ = save(&live);
-    live
+/// Drop `gone` from the state file. The file is read again just before the
+/// write, so a tunnel another esql recorded in the meantime is kept.
+fn forget(gone: &[Tunnel]) -> Result<()> {
+    let same = |a: &Tunnel, b: &Tunnel| a.pid == b.pid && a.spec == b.spec && a.host == b.host;
+    let keep: Vec<Tunnel> = recorded()
+        .into_iter()
+        .filter(|t| !gone.iter().any(|g| same(g, t)))
+        .collect();
+    save(&keep)
 }
 
 fn save(tunnels: &[Tunnel]) -> Result<()> {
     let path = state_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let body: String = tunnels
         .iter()
         .map(|t| {
@@ -242,8 +356,7 @@ fn save(tunnels: &[Tunnel]) -> Result<()> {
             )
         })
         .collect();
-    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    crate::ini::write_atomic(&path, &body)
 }
 
 /// Is a live `-L` already opening this local port? A remembered tunnel must
@@ -259,29 +372,44 @@ pub fn carrying(local: &str) -> Option<Tunnel> {
 /// connections may remember the same local port for different servers, and
 /// `carrying` alone would let one use, report and stop the other's.
 pub fn carrying_via(via: &crate::vias::Via) -> Option<Tunnel> {
-    let spec = via.spec();
-    list()
-        .into_iter()
-        .find(|t| t.kind == 'L' && t.spec == spec && t.host == via.host)
+    list().into_iter().find(|t| t.carries(via))
 }
 
-/// Open a forward: spawn `ssh -N -{L|R} <spec> <host>` fully detached (its own
-/// process group, stderr to a log file) so it outlives us, wait ~1s to confirm
-/// it connected, then record it. If ssh bailed (bad port, auth, DNS) the captured
-/// stderr becomes the returned error instead of a phantom tunnel.
-/// Assumes key/agent auth - a background tunnel can't answer a password prompt.
+/// How long a `-L` gets to come up: ssh connecting, authenticating and
+/// binding the port. Long enough for a bastion on the far side of a VPN.
+const UP_WITHIN: Duration = Duration::from_secs(15);
+
+/// Open a forward: spawn `argv` fully detached (its own process group, stderr
+/// to a log file) so it outlives us, wait until it is up, then record it. Up
+/// means a `-L` is listening on its port, and a `-R`, which has nothing here to
+/// ask, is still running after a moment. If ssh bailed (bad port, auth, DNS)
+/// its own words become the returned error instead of a phantom tunnel.
+/// Assumes key or agent auth: `BatchMode` turns any prompt into a failure.
 pub fn open(kind: char, spec: &str, host: &str) -> Result<Tunnel> {
+    if !crate::engines::on_path("ssh") {
+        return Err(Blocked::NoSsh.into());
+    }
+    let local = match kind {
+        'L' => ports_of(spec).and_then(|(open, _, _)| open.parse::<u16>().ok()),
+        _ => None,
+    };
+    // A port another program already holds would make the forward fail, or
+    // answer for it if it were only asked whether something listens there.
+    if let Some(port) = local
+        && !port_free(port)
+    {
+        return Err(Blocked::PortTaken { port, by: None }.into());
+    }
+
     let log = log_path();
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
     let errfile = File::create(&log).with_context(|| format!("creating {}", log.display()))?;
 
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-N")
-        .arg(format!("-{kind}"))
-        .arg(spec)
-        .arg(host)
+    let argv = argv(kind, spec, host);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(errfile));
@@ -294,35 +422,55 @@ pub fn open(kind: char, spec: &str, host: &str) -> Result<Tunnel> {
         cmd.process_group(0);
     }
 
-    let child = cmd.spawn().with_context(|| "spawning ssh tunnel")?;
+    let mut child = cmd.spawn().context("starting ssh")?;
     let pid = child.id();
-
-    // Give ssh a moment to connect, then judge it by what it wrote rather than
-    // only by whether it is still running.
-    sleep(Duration::from_millis(800));
-    let stderr = fs::read_to_string(&log).unwrap_or_default();
-    let first = || {
-        stderr
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("ssh exited immediately")
-            .to_string()
+    let started = Instant::now();
+    let within = if local.is_some() {
+        UP_WITHIN
+    } else {
+        Duration::from_millis(1500)
     };
-    if !proc_is_ours(pid, kind, spec, host) {
-        let reason = first();
-        let _ = fs::remove_file(&log);
-        bail!("{reason}");
+    loop {
+        sleep(Duration::from_millis(100));
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err(gave_up(
+                &mut child,
+                &log,
+                host,
+                "ssh exited before the tunnel was up",
+            ));
+        }
+        if forwarding_failed(&fs::read_to_string(&log).unwrap_or_default()) {
+            return Err(gave_up(
+                &mut child,
+                &log,
+                host,
+                "ssh could not set up the forward",
+            ));
+        }
+        if local.is_some_and(|port| listening(pid, port)) {
+            break;
+        }
+        if started.elapsed() >= within {
+            if local.is_none() {
+                break;
+            }
+            return Err(gave_up(
+                &mut child,
+                &log,
+                host,
+                &format!(
+                    "ssh did not bring the tunnel up within {}s",
+                    UP_WITHIN.as_secs()
+                ),
+            ));
+        }
     }
-    // A forward whose port is already taken does NOT kill ssh: it keeps the
-    // session open with no forward on it, which used to be listed as a live
-    // tunnel that quietly carried nothing. Take ssh at its word and clean up.
-    if forwarding_failed(&stderr) {
-        let reason = first();
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-        let _ = fs::remove_file(&log);
-        bail!("{reason}");
-    }
+    // Reaped in the background, or a forward that ends during a long session
+    // stays a zombie of ours until the app exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 
     let tunnel = Tunnel {
         pid,
@@ -331,16 +479,87 @@ pub fn open(kind: char, spec: &str, host: &str) -> Result<Tunnel> {
         host: host.to_string(),
         log,
     };
-
-    let mut all = list();
+    let mut all = recorded();
     all.push(tunnel.clone());
     save(&all)?;
     Ok(tunnel)
 }
 
+/// Stop ssh if it still runs, and turn what it wrote into the error: its own
+/// lines that say what failed, at most five, without the known-hosts notice it
+/// prints on the way, or `fallback` when it said nothing. A host whose key ssh
+/// has never seen is `Blocked::UnknownHostKey`; a key that changed is not,
+/// since accepting that one is a decision, not a fix.
+fn gave_up(child: &mut Child, log: &Path, host: &str, fallback: &str) -> anyhow::Error {
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let _ = fs::remove_file(log);
+    let said: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("Warning: Permanently added"))
+        .collect();
+    if said.is_empty() {
+        return anyhow::anyhow!("{fallback}");
+    }
+    let words = said[said.len().saturating_sub(5)..].join("\n");
+    // ssh's own words over a host it would have asked about, and over a key
+    // that changed, which says "has changed" in both of its warnings.
+    if text.contains("Host key verification failed.")
+        && !text.to_ascii_lowercase().contains("has changed")
+    {
+        return Blocked::UnknownHostKey {
+            host: host.to_string(),
+            said: words,
+        }
+        .into();
+    }
+    anyhow::anyhow!("{words}")
+}
+
+/// Whether `pid` holds a listening socket on `port`: the forward's own
+/// listener and never another program's, read from `/proc` so no connection
+/// reaches the far end just to ask. Where there is no `/proc/net/tcp`, a
+/// connect to the port answers instead.
+fn listening(pid: u32, port: u16) -> bool {
+    if !Path::new("/proc/net/tcp").exists() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        return std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
+    }
+    let sockets: Vec<String> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read_link(e.path()).ok())
+        .filter_map(|l| {
+            let l = l.to_str()?;
+            Some(l.strip_prefix("socket:[")?.strip_suffix(']')?.to_string())
+        })
+        .collect();
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        fs::read_to_string(table)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .any(|row| {
+                // sl, local address, remote address, state (0A is LISTEN), ..., inode
+                let cols: Vec<&str> = row.split_whitespace().collect();
+                cols.len() > 9
+                    && cols[3] == "0A"
+                    && cols[1]
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| u16::from_str_radix(p, 16).ok())
+                        == Some(port)
+                    && sockets.iter().any(|s| s == cols[9])
+            })
+    })
+}
+
 /// Did ssh tell us the forward itself could not be set up? These are the exact
-/// phrases OpenSSH uses; the session survives all of them, so nothing else
-/// would notice.
+/// phrases OpenSSH uses. `ExitOnForwardFailure` ends ssh over them too, but
+/// reading them first is what stops a failing forward a moment sooner.
 fn forwarding_failed(stderr: &str) -> bool {
     const FAILURES: [&str; 4] = [
         "Address already in use",
@@ -351,14 +570,46 @@ fn forwarding_failed(stderr: &str) -> bool {
     FAILURES.iter().any(|f| stderr.contains(f))
 }
 
-/// Terminate a tunnel by PID (SIGTERM via `kill`), delete its log, and forget it.
-pub fn kill(pid: u32) -> Result<()> {
-    let all = list();
-    if let Some(t) = all.iter().find(|t| t.pid == pid) {
+/// How long `kill` waits for ssh to exit after the signal.
+const GONE_WITHIN: Duration = Duration::from_secs(3);
+
+/// Whether `pid` has exited with its files closed: gone, or a zombie waiting
+/// to be reaped. Its command line empties before that, while it still holds
+/// its port, so `alive` cannot tell.
+fn exited(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    // `pid (comm) state ...`, where the name may hold a `)` itself.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .is_some_and(|state| matches!(state, 'Z' | 'X'))
+}
+
+/// Stop the tunnel `pid` runs (SIGTERM via `kill`), delete its log and forget
+/// it. A pid that no longer runs that forward is never signalled, since the
+/// kernel may have handed the number to something else. It returns once ssh
+/// has exited, or after `GONE_WITHIN`, so a forward opened onto the same port
+/// straight after does not find it still taken. Returns whether there was a
+/// forward to stop.
+pub fn kill(pid: u32) -> Result<bool> {
+    let Some(t) = recorded().into_iter().find(|t| t.pid == pid) else {
+        return Ok(false);
+    };
+    let ours = t.alive();
+    if ours {
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status();
+        let deadline = Instant::now() + GONE_WITHIN;
+        while !exited(pid) && Instant::now() < deadline {
+            sleep(Duration::from_millis(20));
+        }
+    }
+    if !t.log.as_os_str().is_empty() {
         let _ = fs::remove_file(&t.log);
     }
-    let _ = Command::new("kill").arg(pid.to_string()).status();
-    let remaining: Vec<Tunnel> = all.into_iter().filter(|t| t.pid != pid).collect();
-    save(&remaining)?;
-    Ok(())
+    forget(std::slice::from_ref(&t))?;
+    Ok(ours)
 }

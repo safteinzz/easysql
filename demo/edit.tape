@@ -9,6 +9,8 @@ Set Shell bash
 Set Theme "Catppuccin Mocha"
 Set FontFamily "JetBrainsMono NF"
 Set FontSize 15
+# 1320 rather than 1240, where the Connections footer the toolbox opens on
+# drops `q quit`.
 Set Width 1320
 Set Height 640
 Set Padding 20

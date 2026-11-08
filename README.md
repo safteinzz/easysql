@@ -18,7 +18,7 @@ No cargo yet? Rust installs the same way on every distro: [rustup.rs](https://ru
 
 ## Browse and connect
 
-![Moving down the connection list to a postgres connection whose tunnel is not running, pressing Enter to reopen it into a real psql session, then turning that forward off on the Tunnels tab](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/browse.gif)
+![Moving down the connection list to a postgres connection whose tunnel is not running, the tunnel reopening into a real psql session, then that forward turned off on the Tunnels tab](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/browse.gif)
 
 Legend: green answered · red did not · yellow its tunnel is not running · `pw` a password on file · `no client` its program is missing · blue name refuses writes
 
@@ -51,7 +51,7 @@ Typed once, written straight to the file that engine's client reads, and never s
 
 ## Saved queries
 
-![Making a saved query in the Snippets tab as one line, then opening its file in vim with o and pasting a longer version, which the details panel then shows](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.gif)
+![Making a saved query in the Snippets tab as one line, then its file open in vim with a longer version pasted in, which the details panel then shows](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.gif)
 
 ```bash
 esql app :tables       # → psql … -c
@@ -93,17 +93,18 @@ esql conn add pg prod --host db.example.com  # save one where psql reads it
 esql conn edit prod --read-only              # change only what you name
 esql conn rm prod                            # delete it
 esql pw set prod                             # save its password, typed without echo
+esql pw rm prod                              # forget it
 esql tunnel up prod --via bastion            # open the forward and point prod at it
 esql tunnel down prod                        # stop it, and the next connect reopens it
 esql snippet add tables 'select ...'         # save a query for `esql <name> :tables`
+esql snippet ls                              # list the saved queries
+esql snippet rm tables                       # delete one, and its file
 esql set backups 5                           # change a setting, and `esql set` lists them
 ```
 
 `esql <command> --help` has the details, and `?` in the toolbox lists every key.
 
-A script never has to edit a file by hand. Nothing asks without a terminal: a delete takes `-y`, `pw set --stdin` reads the password from a pipe, `-n` prints the steps without taking them, and `esql ls --json` has fixed field names.
-
-Rows, or the dump, go to stdout and easysql's own words to stderr. Once the client starts the exit code is the client's, and `esql --help` lists the codes easysql exits with before that.
+For a script: nothing asks without a terminal (`-y` answers a delete, `pw set --stdin` reads a pipe), `-n` prints the steps without taking them, `--json` has fixed field names, and once the client starts the exit code is its own.
 
 ## Tab completion
 
@@ -116,10 +117,6 @@ Open a new shell and Tab completes commands, connection names, saved queries and
 ## Where it keeps things
 
 ```
-~/.pg_service.conf                   Postgres connections
-~/.pgpass                            Postgres passwords
-~/.psqlrc                            your saved queries as \set shortcuts
-~/.my.cnf                            MySQL and MariaDB connections and passwords
 ~/.esqlpass                          sqlcmd passwords, once you allow it
 ~/.config/easysql/sqlite.conf        SQLite connections
 ~/.config/easysql/mssql.conf         SQL Server connections
@@ -130,17 +127,38 @@ Open a new shell and Tab completes commands, connection names, saved queries and
 $XDG_RUNTIME_DIR/easysql/pass/       what usql is handed for one run, gone when it ends
 ```
 
-Password files are chmod 600, and every write rewrites only its own section, so your comments and extra keys survive.
+Everything under `~/.config/easysql` can live in your dotfiles, but `~/.esqlpass` holds passwords, which is why it sits beside `~/.pgpass` instead.
+
+## What it edits
+
+```
+~/.pg_service.conf                   Postgres connections
+~/.pgpass                            Postgres passwords
+~/.my.cnf                            MySQL and MariaDB connections and passwords
+~/.psqlrc                            your saved queries as \set shortcuts, in one marked block
+```
+
+A change rewrites only its own section, so your comments, blank lines and other keys survive byte for byte. Password files are written 0600.
 
 ## When it fails
 
-A connect that fails is asked again without a prompt, and easysql offers the step that would get you in:
+A connect from the toolbox that fails is asked again without a prompt, and easysql offers the step that would get you in:
 
 ```
 no password supplied             save one in ~/.pgpass
 Connection refused               open an ssh tunnel
 no pg_hba.conf entry for host    open an ssh tunnel
 database "x" does not exist      edit the connection
+```
+
+Before that, what this machine lacks is offered the same way, in one box, and then the connection opens:
+
+```
+psql not installed               install it with this machine's package manager
+pgcli not installed              set psql_command back to psql
+ssh not installed                install it
+a host ssh has never seen        connect once to check its key and accept it
+the tunnel's port is taken       open the tunnel form on a free port
 ```
 
 ## Notes

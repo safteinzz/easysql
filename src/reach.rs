@@ -25,7 +25,8 @@ pub enum Reach {
     Probing,
     /// The port accepted a connection, in this many milliseconds.
     Up(u64),
-    /// Refused, unroutable, unresolvable or slower than `TIMEOUT`.
+    /// Refused, unroutable, unresolvable or slower than the `probe_timeout`
+    /// setting.
     Down,
 }
 
@@ -79,9 +80,19 @@ pub fn probe_all(targets: Vec<Target>, generation: u64, tx: Sender<Msg>, timeout
 
 /// One TCP connect with a deadline. DNS resolution has no timeout of its own,
 /// so a name with broken DNS can hold its thread until the resolver gives up;
-/// the answer is discarded by generation if the round has moved on.
+/// the answer is discarded by generation if the round has moved on. A host
+/// that is a directory is a Postgres socket directory, where libpq connects to
+/// `.s.PGSQL.<port>` in it, so that socket is what is asked.
 fn probe(host: &str, port: u16, timeout: Duration) -> Reach {
     let started = Instant::now();
+    #[cfg(unix)]
+    if host.starts_with('/') {
+        let socket = std::path::Path::new(host).join(format!(".s.PGSQL.{port}"));
+        return match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(_) => Reach::Up(started.elapsed().as_millis() as u64),
+            Err(_) => Reach::Down,
+        };
+    }
     let Ok(mut addrs) = (host, port).to_socket_addrs() else {
         return Reach::Down;
     };

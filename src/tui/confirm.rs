@@ -89,10 +89,19 @@ pub(crate) enum ConfirmAction {
     FixConn {
         key: String,
     },
-    /// Offered when the client itself is missing: run this machine's own package
-    /// manager, suspended, so sudo and the manager can both prompt.
-    InstallClient {
-        engine: Engine,
+    /// An offered fix: change these settings, run this command suspended (an
+    /// install, so sudo and the package manager can both ask, or an ssh that
+    /// asks about a host key), then, once it has worked, do `retry` again.
+    Remedy {
+        settings: Vec<(String, String)>,
+        run: Option<Vec<String>>,
+        retry: Option<Retry>,
+    },
+    /// Offered when a forward's local port is taken: open the tunnel form for
+    /// this connection on a free one.
+    MoveTunnel {
+        key: String,
+        local: u16,
     },
     /// Offered when a SQL Server password is asked for and easysql is not yet
     /// allowed to keep one: switch the setting on, then open the password form.
@@ -107,19 +116,35 @@ pub(super) fn render_confirm(f: &mut Frame, area: Rect, c: &Confirm) {
     // on No; an offer is cyan and starts on Yes: the colour says how much is at
     // stake, the default focus says what Enter does.
     let accent = if c.danger { Color::Red } else { Color::Cyan };
-    let width = box_width(area.width);
+    let width = box_width(
+        area.width,
+        super::widgets::widest(
+            &c.title,
+            [
+                c.message.as_str(),
+                " Yes (y)    No (n) ",
+                &GATE_KEYS.join(super::widgets::SEP),
+            ],
+        ),
+    );
     let msg_rows = wrapped_line_count(&c.message, box_inner_width(width)) as u16;
     // The message, a blank, the buttons, a blank, the keys.
     let rect = box_area(area, width, box_height(msg_rows + 4, area.height));
     f.render_widget(Clear, rect);
 
-    let lines = vec![
-        Line::raw(c.message.clone()),
+    // One `Line` per line of the message, since a line break inside one is
+    // not drawn.
+    let mut lines: Vec<Line> = c
+        .message
+        .lines()
+        .map(|l| Line::raw(l.to_string()))
+        .collect();
+    lines.extend([
         Line::raw(""),
         box_buttons(accent, c.yes),
         Line::raw(""),
         box_hint(GATE_KEYS),
-    ];
+    ]);
     let para = Paragraph::new(lines)
         .block(box_block(accent, &c.title))
         .wrap(Wrap { trim: false });
@@ -173,21 +198,25 @@ impl App {
                     .iter()
                     .find(|c| c.engine == engine && c.name == name)
                     .cloned();
-                match conn.map(|c| engines::delete_with_keyed(&c)) {
+                let done = conn.map(|c| engines::delete_with_keyed(&c));
+                // Its password, its tunnel and its history may go with it, and
+                // on a failure the connection itself may be gone even though
+                // what it kept elsewhere was not, so every list is read again.
+                self.history = crate::history::load();
+                self.refresh_creds();
+                self.refresh_conns();
+                self.refresh_tunnels();
+                self.start_probes();
+                match done {
                     Some(Ok(_)) => {
-                        if engine == Engine::MsSql {
-                            self.refresh_creds();
-                        }
-                        self.refresh_conns();
-                        self.set_status(format!("deleted '{name}'{}", crate::ini::backup_note()));
+                        self.set_status(format!("deleted '{name}'{}", crate::ini::backup_note()))
                     }
-                    Some(Err(e)) => {
-                        // The connection itself may be gone even though what it
-                        // kept elsewhere was not, so the list is read again.
-                        self.refresh_creds();
-                        self.refresh_conns();
-                        self.set_failed(format!("'{name}': {}", crate::commands::said(&e)));
-                    }
+                    Some(Err(e)) => self.report_failure(
+                        "not deleted",
+                        &format!("'{name}'"),
+                        "",
+                        &crate::commands::said(&e),
+                    ),
                     None => self.set_status(format!("'{name}' is already gone")),
                 }
             }
@@ -195,21 +224,49 @@ impl App {
                 if let Some(pid) = pid {
                     let _ = tunnels::kill(pid);
                 }
-                let forgot = owner.as_deref().map(crate::vias::remove);
+                // A connection pointed at the forward goes back to the address
+                // the record kept, which is the only place it is written down.
+                let conn = owner
+                    .as_ref()
+                    .and_then(|key| self.conns.iter().find(|c| &c.key() == key).cloned());
+                let forgot = match (&conn, owner.as_deref()) {
+                    (Some(c), _) => crate::vias::forget(c),
+                    (None, Some(key)) => crate::vias::remove(key).map(|_| None),
+                    (None, None) => Ok(None),
+                };
+                self.refresh_conns();
                 self.refresh_tunnels();
                 // Whatever was reachable through it is not any more.
                 self.start_probes();
                 match forgot {
-                    Some(Err(e)) => self.set_failed(format!("could not forget it: {e}")),
-                    _ => self.set_status(format!("deleted the tunnel through {host}")),
+                    Err(e) => self.report_failure(
+                        "not forgotten",
+                        "could not forget it",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
+                    Ok(Some(back)) => self.set_status(format!(
+                        "deleted the tunnel through {host}, and pointed the connection back at {back}"
+                    )),
+                    Ok(None) => self.set_status(format!("deleted the tunnel through {host}")),
                 }
             }
             ConfirmAction::DeleteSnippet { name } => match crate::snippets::delete(&name) {
-                Ok(_) => {
-                    self.refresh_snippets();
-                    self.set_status(format!("deleted '{name}'"));
-                }
-                Err(e) => self.set_failed(format!("could not delete it: {e}")),
+                Ok(_) => match self.refresh_snippets() {
+                    Ok(_) => self.set_status(format!("deleted '{name}'")),
+                    Err(e) => self.report_failure(
+                        "~/.psqlrc not updated",
+                        &format!("deleted '{name}', but `:name` in psql was not updated"),
+                        "",
+                        &crate::commands::said(&e),
+                    ),
+                },
+                Err(e) => self.report_failure(
+                    "not deleted",
+                    "could not delete it",
+                    "",
+                    &crate::commands::said(&e),
+                ),
             },
             ConfirmAction::ForgetPassword(cred) => {
                 let where_stored = cred.where_stored();
@@ -221,7 +278,13 @@ impl App {
                             crate::ini::backup_note()
                         ));
                     }
-                    Err(e) => self.set_failed(format!("could not forget it: {e}")),
+                    Err(e) if e.downcast_ref::<creds::Gone>().is_some() => self.reread_creds(&e),
+                    Err(e) => self.report_failure(
+                        "not forgotten",
+                        "could not forget it",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
                 }
             }
             // The three offered fixes all end the same way: open the wizard that
@@ -234,7 +297,12 @@ impl App {
             ConfirmAction::AllowMssqlPasswords { key } => {
                 self.settings.set("mssql_passwords", "on");
                 if let Err(e) = self.settings.save() {
-                    self.set_failed(format!("could not save the setting: {e}"));
+                    self.report_failure(
+                        "setting not saved",
+                        "could not save the setting",
+                        "",
+                        &crate::commands::said(&e),
+                    );
                     return None;
                 }
                 if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
@@ -265,31 +333,52 @@ impl App {
                     self.prompt = Some(Prompt::edit_conn(&conn));
                 }
             }
-            // The one offered fix that runs something rather than opening a
-            // wizard. It goes out suspended like a session does, because sudo
-            // and the package manager both need the real terminal to ask.
-            ConfirmAction::InstallClient { engine } => {
-                if let Some(argv) = engines::install_argv(engine, &self.settings) {
-                    return Some(PendingRun {
+            // A fix that runs something goes out suspended like a session
+            // does, because sudo, the package manager and ssh all need the
+            // real terminal to ask.
+            ConfirmAction::Remedy {
+                settings,
+                run,
+                retry,
+            } => {
+                if !settings.is_empty() {
+                    for (key, value) in &settings {
+                        self.settings.set(key, value);
+                    }
+                    if let Err(e) = self.settings.save() {
+                        self.report_failure(
+                            "setting not saved",
+                            "could not save the setting",
+                            "",
+                            &crate::commands::said(&e),
+                        );
+                        return None;
+                    }
+                    self.apply_settings();
+                }
+                return match run {
+                    Some(argv) => Some(PendingRun {
                         label: super::widgets::shell_join_display(&argv),
                         argv,
                         connect: None,
-                    });
+                        then: retry,
+                    }),
+                    None => retry.and_then(|r| self.retry(r)),
+                };
+            }
+            ConfirmAction::MoveTunnel { key, local } => {
+                if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
+                    let mut p = Prompt::forward(&conn, &self.settings);
+                    if let Some(f) = p.fields.get_mut(3) {
+                        f.value = local.to_string();
+                    }
+                    self.prompt = Some(p);
                 }
-                self.set_status(format!(
-                    "{}: {}",
-                    engine.client_name(&self.settings),
-                    engines::install_hint(engine, &self.settings)
-                ));
             }
         }
         None
     }
 
-    /// The client this connection needs is not on PATH. `cargo install easysql`
-    /// could never have brought it: the clients are not Rust. So rather than
-    /// failing at the moment you press Enter, work out the one command this
-    /// machine needs and offer to run it.
     /// SQL Server has no password file, so keeping one is a choice the user
     /// makes once: say what easysql would do, and do it on Yes.
     pub(super) fn offer_mssql_passwords(&mut self, conn: &Conn) {
@@ -319,44 +408,207 @@ impl App {
         ));
     }
 
-    pub(super) fn offer_install(&mut self, engine: Engine) {
-        if engine.uses_usql(&self.settings) {
+    /// What this machine lacks to open `conn`, offered as one fix: its client
+    /// (installed, or the setting that names a missing one put back), and
+    /// ssh when the forward it needs has to be reopened. `cargo install
+    /// easysql` could never have brought them, since they are not Rust. A
+    /// client nothing here can install is an alert naming where it comes from.
+    /// Returns whether anything was missing.
+    pub(super) fn offer_missing(&mut self, conn: &Conn) -> bool {
+        let engine = conn.engine;
+        let client_ok = self.installed[engine.idx()];
+        let needs_ssh = !engines::on_path("ssh")
+            && crate::vias::get(&conn.key()).is_some_and(|v| tunnels::carrying_via(&v).is_none());
+        if client_ok && !needs_ssh {
+            return false;
+        }
+        // The setting that points at a missing client goes back to the engine's
+        // own, and what is still missing after that gets installed.
+        let configured = engine.client_argv(&self.settings)[0].clone();
+        let mut after = self.settings.clone();
+        let mut settings: Vec<(String, String)> = Vec::new();
+        let mut lacks: Vec<String> = Vec::new();
+        if !client_ok {
+            if engine.uses_usql(&self.settings) {
+                settings.push(("usql_tui".into(), "off".into()));
+                lacks.push(format!(
+                    "`usql` is not installed, and the `usql_tui` setting opens {} connections in it",
+                    engine.label()
+                ));
+            } else if configured != engine.default_client() {
+                settings.push((
+                    engine.client_setting().into(),
+                    engine.default_client().into(),
+                ));
+                lacks.push(format!(
+                    "`{configured}` is not installed, and the `{}` setting opens {} sessions with it",
+                    engine.client_setting(),
+                    engine.label()
+                ));
+            } else {
+                lacks.push(format!("`{configured}` is not installed"));
+            }
+            for (key, value) in &settings {
+                after.set(key, value);
+            }
+        }
+        let client_missing = !client_ok && !engines::client_installed(engine, &after);
+        if client_missing && engines::install_argv(engine, &after).is_none() {
+            let fallback = (!settings.is_empty()).then_some(&after);
+            return self.alert_not_installed(engine, &configured, fallback);
+        }
+        if needs_ssh {
+            lacks.push(format!(
+                "its tunnel needs `ssh`, which is not installed{}",
+                if client_ok { "" } else { " either" }
+            ));
+        }
+        let tools: &[engines::Tool] = if needs_ssh {
+            &[engines::Tool::Ssh]
+        } else {
+            &[]
+        };
+        let run = match client_missing || needs_ssh {
+            true => engines::install_argv_for(client_missing.then_some(engine), tools),
+            false => None,
+        };
+        if (client_missing || needs_ssh) && run.is_none() {
+            // Nothing here can install it: say what is missing and stop.
             self.alert(
-                "usql is not installed",
+                "missing here",
                 format!(
-                    "The `usql_tui` setting opens {} connections in usql, which is not on PATH: {}.",
-                    engine.label(),
-                    engines::install_hint(engine, &self.settings)
+                    "{}. easysql is a front end, and no package manager it knows is on PATH to install them.",
+                    capitalized(&lacks.join(", and "))
                 ),
             );
-            return;
+            return true;
         }
-        let configured = engine.client_argv(&self.settings)[0].clone();
-        // Only offer to install the *default* client. Somebody who pointed the
-        // setting at `pgcli` or a docker wrapper wants that, and installing
-        // postgresql-client would not be what they asked for.
-        if configured != engine.default_client() {
-            self.set_status(format!(
-                "'{configured}' is not on PATH (Settings · {} with)",
-                engine.label()
-            ));
-            return;
+        let mut steps: Vec<String> = settings
+            .iter()
+            .map(|(key, value)| format!("set `{key}` to `{value}`"))
+            .collect();
+        if let Some(argv) = &run {
+            steps.push(format!("run `{}`", shell_join(argv)));
         }
-        let Some(argv) = engines::install_argv(engine, &self.settings) else {
-            self.set_status(format!(
-                "{configured} is not installed, and I do not recognise this machine's package manager: {}",
-                engines::install_hint(engine, &self.settings)
-            ));
-            return;
+        let sudo = match run {
+            Some(_) => {
+                " sudo will ask for your password, and the package manager will show what it is about to install."
+            }
+            None => "",
         };
+        let mut names: Vec<&str> = Vec::new();
+        if !client_ok {
+            names.push(&configured);
+        }
+        if needs_ssh {
+            names.push("ssh");
+        }
         self.confirm = Some(Confirm::offer(
-            format!("{configured} is not installed"),
+            format!("{} not installed", names.join(" and ")),
             format!(
-                "easysql is a front end: it needs the real {configured} to hand the terminal to, and cargo could not have installed it. Run `{}` now? sudo will ask for your password, and the package manager will show what it is about to install.",
-                shell_join(&argv)
+                "{}. {} now, then open {}?{sudo}",
+                capitalized(&lacks.join(", and ")),
+                capitalized(&steps.join(" and ")),
+                conn.name
             ),
-            ConfirmAction::InstallClient { engine },
+            ConfirmAction::Remedy {
+                settings,
+                run,
+                retry: Some(Retry::Open(conn.key())),
+            },
         ));
+        true
+    }
+
+    /// The alert for a client that nothing here can install, `program` being
+    /// the one the settings name: where it comes from instead, which only the
+    /// person can go and get. `fallback` is the settings that would open it in
+    /// the engine's own client, which is missing too.
+    fn alert_not_installed(
+        &mut self,
+        engine: Engine,
+        program: &str,
+        fallback: Option<&crate::settings::Settings>,
+    ) -> bool {
+        let hint = engines::install_hint_for(engine, &self.settings, program);
+        let own = fallback
+            .map(|s| {
+                format!(
+                    "\n\nIts own client, {}, is not installed either: {}.",
+                    engine.default_client(),
+                    engines::install_hint(engine, s)
+                )
+            })
+            .unwrap_or_default();
+        self.alert(
+            format!("{program} is not installed"),
+            format!(
+                "easysql is a front end: it needs the real {program} to hand the terminal to, and cargo could not have installed it.\n\n{hint}.{own}"
+            ),
+        );
+        true
+    }
+
+    /// A forward that did not come up. Missing ssh is offered as an install,
+    /// a host ssh has never seen as one interactive ssh that asks about its
+    /// key, and a taken port as the tunnel form on a free one; each then
+    /// retries what failed. Anything else is reported in ssh's own words.
+    pub(super) fn tunnel_failed(
+        &mut self,
+        e: &anyhow::Error,
+        owner: Option<String>,
+        retry: Retry,
+        said: &str,
+        cmd: &str,
+    ) {
+        let offer = match e.downcast_ref::<tunnels::Blocked>() {
+            Some(tunnels::Blocked::NoSsh) => engines::install_argv_for(None, &[engines::Tool::Ssh])
+                .map(|argv| {
+                    Confirm::offer(
+                        "ssh is missing",
+                        format!(
+                            "ssh is not installed, and every tunnel runs through it. Run `{}` now, then try again? sudo will ask for your password.",
+                            shell_join(&argv)
+                        ),
+                        ConfirmAction::Remedy {
+                            settings: Vec::new(),
+                            run: Some(argv),
+                            retry: Some(retry),
+                        },
+                    )
+                }),
+            Some(tunnels::Blocked::UnknownHostKey { host, said: words }) => Some(Confirm::offer(
+                format!("{host} is new to ssh"),
+                format!(
+                    "{words}\n\nssh has never seen {host}'s key, and a tunnel opened in the background cannot ask whether to trust it. Connect to {host} once now, check the fingerprint it shows and answer yes, then try again?"
+                ),
+                ConfirmAction::Remedy {
+                    settings: Vec::new(),
+                    run: Some(vec!["ssh".into(), host.clone(), "exit".into()]),
+                    retry: Some(retry),
+                },
+            )),
+            Some(tunnels::Blocked::PortTaken { port, by }) => owner
+                .zip(tunnels::free_port_after(*port))
+                .map(|(key, free)| {
+                    let holder = match by {
+                        Some(by) => format!("forwards to {by}"),
+                        None => "is held by another program".to_string(),
+                    };
+                    Confirm::offer(
+                        "port taken",
+                        format!(
+                            "localhost:{port} {holder}, so this tunnel cannot open there. Open the tunnel form for it on localhost:{free} instead?"
+                        ),
+                        ConfirmAction::MoveTunnel { key, local: free },
+                    )
+                }),
+            None => None,
+        };
+        match offer {
+            Some(offer) => self.confirm = Some(offer),
+            None => self.report_failure("tunnel failed", said, cmd, &crate::commands::said(e)),
+        }
     }
 
     /// After a failed open: ask the server the same question non-interactively,
@@ -377,9 +629,12 @@ impl App {
                 format!(
                     "{said}. easysql can save one {}, so this never asks again. Save a password now?",
                     match conn.engine {
-                        Engine::Pg => "where psql looks for it, in ~/.pgpass",
-                        Engine::MsSql => "and hand it to sqlcmd itself",
-                        _ => "where mysql looks for it, in ~/.my.cnf",
+                        Engine::Pg => "where psql looks for it, in ~/.pgpass".to_string(),
+                        Engine::MsSql => format!(
+                            "and hand it to {} itself",
+                            conn.engine.client_name(&self.settings)
+                        ),
+                        _ => "where mysql looks for it, in ~/.my.cnf".to_string(),
                     }
                 ),
                 ConfirmAction::SavePassword { key },
@@ -410,5 +665,14 @@ impl App {
                 ConfirmAction::FixConn { key },
             ),
         });
+    }
+}
+
+/// `s` with its first letter in upper case, for a part that starts a sentence.
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }

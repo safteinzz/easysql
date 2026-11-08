@@ -42,11 +42,15 @@ pub fn write_registration(
     completer.write_registration("COMPLETE", cmd.get_name(), bin, &me.to_string_lossy(), buf)
 }
 
-/// Every saved connection, for the first word, with where it points as help.
+/// Every saved connection, for the first word, with where it points as help,
+/// each spelled the way `esql` takes it, as `esql ls` prints it.
 pub fn conns() -> Vec<CompletionCandidate> {
-    crate::engines::list()
-        .into_iter()
-        .map(|c| CompletionCandidate::new(&c.name).help(Some(c.target().into())))
+    let all = crate::engines::list();
+    all.iter()
+        .map(|c| {
+            CompletionCandidate::new(crate::engines::typed_name(c, &all))
+                .help(Some(c.target().into()))
+        })
         .collect()
 }
 

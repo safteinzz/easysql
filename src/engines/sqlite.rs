@@ -22,10 +22,14 @@ pub fn store_path() -> PathBuf {
 
 /// Whether this connection opens its file with `-readonly`, which sqlite3
 /// enforces itself: a write fails with "attempt to write a readonly database".
+/// A hand-written line counts in any of the spellings a person uses for yes.
 pub fn read_only(extra: &[(String, String)]) -> bool {
-    extra
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("readonly") && v == "yes")
+    extra.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("readonly")
+            && ["yes", "true", "on", "1"]
+                .iter()
+                .any(|y| v.eq_ignore_ascii_case(y))
+    })
 }
 
 /// The file as a usql URL. A `file:` URI is the one form whose `mode` the

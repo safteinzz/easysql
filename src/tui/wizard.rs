@@ -28,12 +28,32 @@ impl App {
             return;
         };
         let was = p.fields[i].value.clone();
-        let now = crate::vias::forward_target(&via, &was);
+        // A loopback here means the hop the form was opened with, so a new hop
+        // starts again from the database's own address.
+        let far = match (
+            &p.action,
+            matches!(was.as_str(), "127.0.0.1" | "localhost" | "::1"),
+        ) {
+            (Action::Forward { key }, true) => self
+                .conns
+                .iter()
+                .find(|c| &c.key() == key)
+                .map(super::prompt::far_of)
+                .unwrap_or_else(|| was.clone()),
+            _ => was.clone(),
+        };
+        let now = crate::vias::forward_target(&via, &far);
+        let Some(p) = self.prompt.as_mut() else {
+            return;
+        };
         if now != was {
-            p.fields[i].value = now;
-            self.set_status(format!(
-                "the database is on {via} itself, so the forward points at its 127.0.0.1"
-            ));
+            p.fields[i].value = now.clone();
+            self.set_status(match now.as_str() {
+                "127.0.0.1" => format!(
+                    "the database is on {via} itself, so the forward points at its 127.0.0.1"
+                ),
+                _ => format!("the database is {now}, as {via} reaches it"),
+            });
         }
     }
 
@@ -176,10 +196,14 @@ impl App {
     /// validation error it puts the prompt back so the user can fix the field.
     pub(super) fn submit_prompt(&mut self) -> Option<PendingRun> {
         let prompt = self.prompt.take()?;
+        // Trimmed, except a password, whose edge spaces are part of it.
         let v: Vec<String> = prompt
             .fields
             .iter()
-            .map(|f| f.value.trim().to_string())
+            .map(|f| match f.kind {
+                Kind::Secret => f.value.clone(),
+                _ => f.value.trim().to_string(),
+            })
             .collect();
         // A cycled field holds no text, so its answer is an index rather than
         // anything in `v`. Found by label, since which choices a form carries
@@ -218,15 +242,20 @@ impl App {
                 let existing = original.as_deref().and_then(|o| self.existing(engine, o));
                 let was_read_only = existing.is_some_and(Conn::read_only);
                 let mut extra = existing.map(|c| c.extra.clone()).unwrap_or_default();
-                // These are extras this wizard *does* ask about, so the field's
-                // answer replaces whatever was in the block rather than being
-                // carried through. Index 0 means the key is removed entirely.
+                // These are extras this wizard *does* ask about, so a changed
+                // answer replaces whatever was in the block. Index 0 means the
+                // key is removed entirely. Only a changed one, so a value the
+                // form has no choice for is never dropped by an edit that did
+                // not touch it.
+                let started = super::prompt::choices_of(existing);
                 match engine {
-                    Engine::Pg => engines::set_sslmode(
+                    Engine::Pg if encryption != started.encryption => engines::set_sslmode(
                         &mut extra,
                         (encryption > 0).then(|| super::prompt::SSLMODES[encryption]),
                     ),
-                    Engine::MsSql => engines::set_trust_cert(&mut extra, certificate > 0),
+                    Engine::MsSql if certificate != started.certificate => {
+                        engines::set_trust_cert(&mut extra, certificate > 0)
+                    }
                     _ => {}
                 }
                 // Only rewritten when the answer changed, so a read-only line
@@ -241,7 +270,11 @@ impl App {
                         name: v[0].clone(),
                         host: String::new(),
                         port: String::new(),
-                        database: engines::sqlite::absolute(&v[1]),
+                        // A path the edit did not change stays as written.
+                        database: match existing {
+                            Some(c) if c.database == v[1] => v[1].clone(),
+                            _ => engines::sqlite::absolute(&v[1]),
+                        },
                         user: String::new(),
                         extra,
                     },
@@ -270,11 +303,14 @@ impl App {
                             Some(was) => engines::carry_rename(engine, was, &v[0]),
                             None => Ok(()),
                         };
-                        if engine == Engine::MsSql {
-                            self.refresh_creds();
-                        }
+                        // What moved with it: the history that ranks it, the
+                        // password a rename carried, the tunnel row it owns.
+                        self.history = crate::history::load();
+                        self.refresh_creds();
                         self.refresh_conns();
+                        self.refresh_tunnels();
                         self.start_probes();
+                        self.goto_view(View::Connections);
                         self.select_conn(&key);
                         match carried {
                             Ok(()) => self.set_status(format!(
@@ -283,53 +319,100 @@ impl App {
                                 crate::ini::collapse_tilde(&engine.store().to_string_lossy()),
                                 crate::ini::backup_note()
                             )),
-                            Err(e) => self.set_failed(format!(
-                                "'{}' saved, but {}",
-                                v[0],
-                                crate::commands::said(&e)
-                            )),
+                            Err(e) => self.report_failure(
+                                "not all saved",
+                                &format!("'{}' saved", v[0]),
+                                "",
+                                &crate::commands::said(&e),
+                            ),
                         }
                     }
-                    Err(e) => self.set_failed(format!("{verb} failed: {e}")),
+                    // Put back, so fixing a name is one field and not the form.
+                    Err(e) => {
+                        self.report_failure(
+                            "not saved",
+                            &format!("'{}' was not saved", v[0]),
+                            "",
+                            &crate::commands::said(&e),
+                        );
+                        self.prompt = Some(prompt);
+                    }
                 }
                 None
             }
 
-            Action::Snippet { original } => {
+            Action::Snippet { original, sql_was } => {
                 if v[0].is_empty() || v[1].is_empty() {
                     self.set_failed("a snippet needs a name and some SQL");
                     self.prompt = Some(prompt);
                     return None;
                 }
-                match crate::snippets::save(&v[0], &v[1]) {
+                let renamed = original.as_ref().is_some_and(|w| *w != v[0]);
+                // The file is the only copy, so a name another query already
+                // has is refused, never written over.
+                if (original.is_none() || renamed)
+                    && crate::snippets::dir()
+                        .join(format!("{}.sql", v[0]))
+                        .exists()
+                {
+                    self.set_failed(format!(
+                        "a query called '{}' is already saved: e edits it, or choose another name",
+                        v[0]
+                    ));
+                    self.prompt = Some(prompt);
+                    return None;
+                }
+                // The field holds one line of what may be a longer file, so an
+                // SQL left as it was is never written back over the file.
+                let saved = match (original.as_deref(), v[1] == sql_was) {
+                    (Some(was), true) => crate::snippets::rename(was, &v[0]),
+                    (Some(was), false) => {
+                        crate::snippets::save(&v[0], &v[1]).and_then(|_| match renamed {
+                            true => crate::snippets::delete(was),
+                            false => Ok(()),
+                        })
+                    }
+                    (None, _) => crate::snippets::save(&v[0], &v[1]).map(|_| ()),
+                };
+                match saved {
                     Ok(_) => {
-                        // A rename leaves the old file behind otherwise.
-                        if let Some(was) = original.filter(|w| *w != v[0]) {
-                            let _ = crate::snippets::delete(&was);
-                        }
                         self.goto_view(View::Snippets);
-                        self.refresh_snippets();
-                        self.select_snippet(&v[0]);
                         // psql is the one client that can also expand `:name`
                         // at its own prompt, so its rc file is kept in step.
-                        let also = match crate::snippets::sync_psqlrc() {
-                            Ok(_) => " · :name works in psql too",
-                            Err(_) => "",
+                        let synced = self.refresh_snippets();
+                        self.select_snippet(&v[0]);
+                        let also = match synced {
+                            Ok(_) if crate::snippets::psql_name(&v[0]) => {
+                                " · :name works in psql too"
+                            }
+                            _ => "",
                         };
                         self.set_status(format!("saved · esql <connection> :{}{also}", v[0]));
                     }
-                    Err(e) => self.set_failed(format!("could not save it: {e}")),
+                    Err(e) => self.report_failure(
+                        "not saved",
+                        "could not save it",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
                 }
                 None
             }
 
-            Action::EditPassword { idx } => {
-                match creds::rekey_pg(idx, &v[0], &v[1], &v[2], &v[3]) {
+            Action::EditPassword { idx, was } => {
+                let was = [&was[0], &was[1], &was[2], &was[3]].map(String::as_str);
+                match creds::rekey_pg(idx, was, &v[0], &v[1], &v[2], &v[3]) {
                     Ok(_) => {
                         self.refresh_creds();
                         self.set_status("moved it, and kept the password that was on it");
                     }
-                    Err(e) => self.set_failed(format!("could not move it: {e}")),
+                    Err(e) if e.downcast_ref::<creds::Gone>().is_some() => self.reread_creds(&e),
+                    Err(e) => self.report_failure(
+                        "not moved",
+                        "could not move it",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
                 }
                 None
             }
@@ -367,7 +450,12 @@ impl App {
                             _ => format!("saved into [client{name}] in ~/.my.cnf (chmod 600)"),
                         });
                     }
-                    Err(e) => self.set_failed(format!("could not save the password: {e}")),
+                    Err(e) => self.report_failure(
+                        "password not saved",
+                        "could not save the password",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
                 }
                 None
             }
@@ -391,36 +479,60 @@ impl App {
                     v[3].clone()
                 };
                 let spec = format!("{local}:{db_host}:{db_port}");
-                match tunnels::open('L', &spec, &via) {
+                let old = crate::vias::get(&key).and_then(|v| tunnels::carrying_via(&v));
+                let opened = match old {
+                    // Asked again for the forward that is already up: it is
+                    // kept, never opened a second time onto its own port.
+                    Some(t) if t.spec == spec && t.host == via => Ok(t),
+                    // The forward this connection had is replaced, never left
+                    // running with nothing remembering it, unless another
+                    // connection rides on it too.
+                    old => {
+                        if let Some(t) = old.filter(|t| crate::vias::sharing(&key, t).is_empty()) {
+                            let _ = tunnels::kill(t.pid);
+                        }
+                        tunnels::open('L', &spec, &via)
+                    }
+                };
+                match opened {
                     Ok(t) => {
-                        self.goto_view(View::Tunnels);
-                        self.refresh_tunnels();
-                        // A forward that just came up changes what answers on
-                        // the near port, which is what the dots are about.
-                        self.start_probes();
-                        self.select_tunnel(&t.spec, &t.host);
-                        self.set_status(format!(
-                            "localhost:{local} is now {db_host}:{db_port} via {via} (pid {})",
-                            t.pid
-                        ));
                         // Remembered against the connection that asked, even if the repoint below is
-                        // declined: what the tunnel is does not depend on what points at it.
+                        // declined: what the tunnel is does not depend on what points at it. Before
+                        // the list is read, so its row names its owner.
                         let v = crate::vias::Via {
                             host: via.clone(),
                             target: db_host.clone(),
                             port: db_port.clone(),
                             local: local.clone(),
                         };
-                        if let Err(e) = crate::vias::set(&key, &v) {
-                            self.set_failed(format!("tunnel open, but not remembered: {e}"));
+                        let remembered = crate::vias::set(&key, &v);
+                        self.goto_view(View::Tunnels);
+                        self.refresh_tunnels();
+                        // A forward that just came up changes what answers on
+                        // the near port, which is what the dots are about.
+                        self.start_probes();
+                        self.select_tunnel(&t.spec, &t.host);
+                        match remembered {
+                            Ok(_) => self.set_status(format!(
+                                "localhost:{local} is now {db_host}:{db_port} via {via} (pid {})",
+                                t.pid
+                            )),
+                            Err(e) => self.report_failure(
+                                "not remembered",
+                                "tunnel open, but not remembered",
+                                "",
+                                &crate::commands::said(&e),
+                            ),
                         }
                         // The app dug this tunnel for this connection and knows which address moved,
                         // so it offers rather than leaving it to fail again.
-                        if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned() {
+                        if let Some(conn) = self.conns.iter().find(|c| c.key() == key).cloned()
+                            && !crate::vias::points_at_it(&conn, &v)
+                        {
                             self.confirm = Some(Confirm::offer(
                                 "the tunnel is open",
                                 format!(
-                                    "localhost:{local} now reaches {}. The connection still points at {}:{}, which is what was refused. Repoint it now?",
+                                    "localhost:{local} now reaches {}, and the connection points at {}:{}. Point it at localhost:{local} now?",
                                     conn.name,
                                     conn.host,
                                     conn.port_or_default(),
@@ -432,18 +544,40 @@ impl App {
                             ));
                         }
                     }
-                    // ssh refused it - usually the local port is already taken.
-                    // Leave the wizard open on the port that failed, so the fix
-                    // is editing one number rather than starting again.
+                    // The form stays open on what was typed. A taken port is
+                    // swapped for a free one in it, so Enter is the whole fix;
+                    // what else can be fixed is offered, then submitted again.
                     Err(e) => {
-                        self.set_failed(format!("tunnel failed: {e}"));
                         self.prompt = Some(prompt);
+                        let taken = match e.downcast_ref::<tunnels::Blocked>() {
+                            Some(tunnels::Blocked::PortTaken { port, .. }) => {
+                                Some(*port).zip(tunnels::free_port_after(*port))
+                            }
+                            _ => None,
+                        };
+                        match (taken, self.prompt.as_mut()) {
+                            (Some((port, free)), Some(p)) => {
+                                if let Some(f) = p.fields.get_mut(3) {
+                                    f.value = free.to_string();
+                                }
+                                self.set_failed(format!(
+                                    "localhost:{port} is taken, so the form now asks for {free}: ↵ opens it there"
+                                ));
+                            }
+                            _ => self.tunnel_failed(
+                                &e,
+                                None,
+                                super::Retry::Submit,
+                                "tunnel failed",
+                                &tunnels::command('L', &spec, &via),
+                            ),
+                        }
                     }
                 }
                 None
             }
 
-            Action::EditSetting { key, label } => {
+            Action::EditSetting { key, label, .. } => {
                 // Blank means "back to how it ships", which is the same thing
                 // deleting the line from the file does.
                 let value = if v[0].is_empty() {
@@ -452,12 +586,17 @@ impl App {
                     v[0].clone()
                 };
                 self.settings.set(&key, &value);
-                let msg = match self.settings.save() {
-                    Ok(_) => format!("{label} = {value}"),
-                    Err(e) => format!("could not save settings: {e}"),
-                };
+                let saved = self.settings.save();
                 self.apply_settings();
-                self.set_status(msg);
+                match saved {
+                    Ok(_) => self.set_status(format!("{label} = {value}")),
+                    Err(e) => self.report_failure(
+                        "settings not saved",
+                        "could not save settings",
+                        "",
+                        &crate::commands::said(&e),
+                    ),
+                }
                 None
             }
         }

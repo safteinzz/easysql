@@ -21,13 +21,13 @@ pub enum Cmd {
 /// One flag per field of the connection form.
 #[derive(clap::Args)]
 pub struct Fields {
-    /// Server address (default: localhost)
+    /// Server address (a new connection left without one reaches localhost)
     #[arg(long)]
     host: Option<String>,
     /// Port, when it is not the engine's own (5432, 3306, 1433)
     #[arg(long)]
     port: Option<String>,
-    /// Database to open (default: whatever the server gives that user)
+    /// Database to open (left without one, whatever the server gives that user)
     #[arg(long, value_name = "NAME")]
     db: Option<String>,
     /// User to log in as
@@ -49,11 +49,12 @@ pub struct Fields {
     trust_cert: Option<String>,
 }
 
-const SSL_CHOICES: [&str; 6] = [
+const SSL_CHOICES: [&str; 7] = [
     "prefer",
     "require",
     "verify-ca",
     "verify-full",
+    "allow",
     "disable",
     "unset",
 ];
@@ -169,7 +170,7 @@ fn add(args: AddArgs) {
         nc.name,
         shown(&engine.store())
     ));
-    lines(&nc);
+    lines(&nc, &[]);
     if args.dry.dry_run {
         return;
     }
@@ -235,7 +236,7 @@ fn edit(args: EditArgs) {
         c.name,
         shown(&engine.store())
     ));
-    lines(&nc);
+    lines(&nc, &c.bare_keys());
     if name != c.name {
         step(&format!("rename it to '{name}'"));
         if crate::vias::get(&c.key()).is_some() {
@@ -275,6 +276,9 @@ fn rm(args: RmArgs) {
     let what = format!("{} connection '{}'", c.engine.label(), c.name);
     can_ask(&what, args.yes.yes, args.dry.dry_run);
     step(&format!("delete {what} from {}", shown(&c.engine.store())));
+    if let Some(t) = engines::forward_only_of(&c) {
+        step(&format!("stop {} (pid {})", t.command(), t.pid));
+    }
     if crate::vias::get(&c.key()).is_some() {
         step(&format!(
             "forget its tunnel in {}",
@@ -302,14 +306,34 @@ fn check_name(engine: Engine, name: &str) {
     if name.is_empty() {
         fail("a connection needs a name");
     }
-    if name.starts_with(['-', ':']) || name.contains(['[', ']', '\n']) {
+    if name.starts_with(['-', ':']) || name.contains(['[', ']', '\n', '\r']) {
         fail(&format!(
             "'{name}' cannot be a connection name: it may not start with `-` or `:`, or hold `[` or `]`"
+        ));
+    }
+    // `esql my:thing` is the mysql connection `thing`, so a name that starts
+    // like an engine could never be typed bare.
+    if let Some((prefix, _)) = name.split_once(':')
+        && let Some(other) = Engine::from_slug(prefix)
+    {
+        fail(&format!(
+            "'{name}' cannot be a connection name: `esql {prefix}:…` names a {} connection",
+            other.label()
         ));
     }
     if COMMANDS.contains(&name) {
         warn(&format!(
             "`esql {name}` is a command, so this connection opens as `esql {}:{name}`",
+            engine.slug()
+        ));
+    }
+    if let Some(other) = engines::list()
+        .iter()
+        .find(|c| c.name == name && c.engine != engine)
+    {
+        warn(&format!(
+            "a {} connection is called '{name}' too, so `esql {name}` will ask which: each opens as `esql <engine>:{name}` (`esql {}:{name}`)",
+            other.engine.label(),
             engine.slug()
         ));
     }
@@ -326,6 +350,18 @@ fn check_fields(engine: Engine, f: &Fields) {
             ));
         }
     };
+    // A line break would be written into the client's file as lines of its
+    // own: a key in this block, or a whole new block.
+    for value in [&f.host, &f.port, &f.db, &f.user, &f.file]
+        .into_iter()
+        .flatten()
+    {
+        if value.contains(['\n', '\r']) {
+            fail(
+                "a value cannot hold a line break, which would start a line of its own in the file",
+            );
+        }
+    }
     let server = engine.networked();
     only(
         !server && (f.host.is_some() || f.port.is_some() || f.db.is_some() || f.user.is_some()),
@@ -368,9 +404,10 @@ fn apply_choices(
     }
 }
 
-/// The keys the block will hold, under its step. A password is never one of
-/// them: MySQL's is carried through unseen, and no other block holds one.
-fn lines(nc: &NewConn) {
+/// The keys the block will hold, under its step. One that holds a secret is
+/// shown only as `(set)`, one in `bare` as the lone word it is written as, and
+/// MySQL's own password is carried through unseen.
+fn lines(nc: &NewConn, bare: &[String]) {
     let fields: [(&str, &str); 4] = match nc.engine {
         Engine::Sqlite => [("path", &nc.database), ("", ""), ("", ""), ("", "")],
         Engine::Pg => [
@@ -392,8 +429,13 @@ fn lines(nc: &NewConn) {
         }
     }
     for (k, v) in &nc.extra {
-        if !k.eq_ignore_ascii_case("password") {
-            step(&format!("  {k}={v}"));
+        if v.is_empty() && bare.iter().any(|b| b.eq_ignore_ascii_case(k)) {
+            step(&format!("  {k}"));
+            continue;
+        }
+        match engines::is_secret_key(nc.engine, k) {
+            true => step(&format!("  {k}=(set)")),
+            false => step(&format!("  {k}={v}")),
         }
     }
 }

@@ -25,13 +25,35 @@ pub(super) fn detail_fits(_app: &App, width: u16) -> bool {
 }
 
 pub(super) fn render_detail(f: &mut Frame, area: Rect, app: &App) {
-    let lines = match app.view {
+    let mut lines = match app.view {
         View::Connections => conn_lines(app),
         View::Passwords => cred_lines(app),
         View::Tunnels => tunnel_lines(app),
         View::Snippets => snippet_lines(app),
         View::Settings => setting_lines(app),
     };
+    // Taller than the panel: the blank lines between the groups go first, so
+    // the command at the bottom stays on screen, and whatever still does not
+    // fit says so rather than ending mid-panel as though that were all.
+    let inner = (
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(2) as usize,
+    );
+    let rows = |lines: &[Line]| -> usize {
+        lines
+            .iter()
+            .map(|l| super::widgets::wrapped_line_count(&l.to_string(), inner.0.max(1)))
+            .sum()
+    };
+    if rows(&lines) > inner.1 {
+        lines.retain(|l| !l.to_string().trim().is_empty());
+    }
+    if rows(&lines) > inner.1 {
+        while !lines.is_empty() && rows(&lines) + 1 > inner.1 {
+            lines.pop();
+        }
+        lines.push(Line::styled("… more than fits: widen the window", dim()));
+    }
     let para = Paragraph::new(lines)
         .block(
             Block::default()
@@ -54,8 +76,10 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
     ];
 
     // State first: the things that decide whether you press Enter at all.
+    let via = via_of(app, c);
     if c.engine.networked() {
-        lines.push(reach_line(app.reach.get(&c.key()), sleeping_via(c)));
+        let sleeping = via.as_ref().filter(|(_, on)| !on).map(|(v, _)| v);
+        lines.push(reach_line(app, c, sleeping));
     }
     if c.read_only() {
         lines.push(Line::styled(
@@ -128,7 +152,11 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             crate::engines::pg::set_read_only(&mut shown, false);
         }
         for (k, v) in &shown {
-            lines.push(row(k, v.clone()));
+            // A password written into the block itself is shown only as there.
+            match crate::engines::is_secret_key(c.engine, k) {
+                true => lines.push(row(k, "(set, never shown)".into())),
+                false => lines.push(row(k, v.clone())),
+            }
         }
         lines.push(Line::raw(""));
         lines.push(if !c.engine.keeps_password(&app.settings) {
@@ -141,7 +169,9 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             )
         } else if app.has_password(c) {
             Line::styled(
-                if c.engine.stores_password() {
+                if c.engine.stores_password() && c.engine.uses_usql(&app.settings) {
+                    "password on file, handed to usql for each session"
+                } else if c.engine.stores_password() {
                     "password on file (the client reads it itself)"
                 } else if c.engine.uses_usql(&app.settings) {
                     "password kept by easysql, handed to usql for each session"
@@ -157,17 +187,12 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
 
     // What this connection is currently doing, pulled from the Tunnels tab so
     // you do not have to go and look.
-    let via: Vec<String> = app
+    // Only forwards that are up and reach this very host and port, the same
+    // test the tunnel offer makes.
+    let carrying: Vec<String> = app
         .tunnels
         .iter()
-        // Host *and* port: every forward on this machine points at 127.0.0.1
-        // somewhere, so matching the host alone lists every unrelated tunnel
-        // under every local connection.
-        .filter(|t| {
-            t.ports()
-                .map(|(_, target, port)| target == c.host && port == c.port_or_default())
-                .unwrap_or(false)
-        })
+        .filter(|t| super::reaches(t, c))
         .map(|t| {
             format!(
                 "localhost:{} via {}",
@@ -176,17 +201,16 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
             )
         })
         .collect();
-    if !via.is_empty() {
+    if !carrying.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(row("Tunnels", via.join(", ")));
+        lines.push(row("Tunnels", carrying.join(", ")));
     }
 
     // A remembered forward is the difference between this connection working
     // after a reboot and failing with a refusal that explains nothing, so it is
     // shown whether or not it happens to be up right now - and it says which,
     // because "needs a tunnel" and "has one" are different situations.
-    if let Some(v) = crate::vias::get(&c.key()) {
-        let live = crate::tunnels::carrying_via(&v).is_some();
+    if let Some((v, live)) = via {
         lines.push(Line::raw(""));
         lines.push(row("Needs tunnel", format!("through {}", v.host)));
         lines.push(Line::styled(
@@ -225,7 +249,10 @@ fn conn_lines(app: &App) -> Vec<Line<'static>> {
         ),
         Style::default().fg(Color::Green),
     ));
-    lines.push(Line::styled(format!("esql {}", c.name), dim()));
+    lines.push(Line::styled(
+        format!("esql {}", crate::engines::typed_name(c, &app.conns)),
+        dim(),
+    ));
     lines
 }
 
@@ -296,6 +323,9 @@ fn cred_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         match c.source {
+            crate::creds::Source::MsSql(_) if c.engine.uses_usql(&app.settings) => {
+                "never shown: easysql reads it back only to hand it to usql in a passfile"
+            }
             crate::creds::Source::MsSql(_) => {
                 "never shown: easysql reads it back only to hand it to sqlcmd in SQLCMDPASSWORD"
             }
@@ -327,8 +357,6 @@ fn tunnel_lines(app: &App) -> Vec<Line<'static>> {
         Some(live) => {
             lines.push(row("Process", format!("pid {}", live.pid)));
             if let Some(started) = live.started_at() {
-                // The log file is created as the tunnel is spawned, so its age
-                // is the tunnel's age.
                 let secs = started
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -410,23 +438,36 @@ fn label(name: &str) -> Span<'static> {
     Span::styled(format!("{name}{:pad$}", "", pad = pad), dim())
 }
 
+/// The via `c` remembers and whether a forward carrying it is up, read from
+/// what was loaded with the Tunnels rows rather than from disk on every frame.
+pub(super) fn via_of(app: &App, c: &Conn) -> Option<(crate::vias::Via, bool)> {
+    let key = c.key();
+    let (_, via) = app.vias.iter().find(|(k, _)| *k == key)?;
+    let on = app
+        .tunnels
+        .iter()
+        .any(|t| t.live.as_ref().is_some_and(|l| l.carries(via)));
+    Some((via.clone(), on))
+}
+
 /// A connection whose forward is recorded but not running. The probe is not
 /// wrong either way, but it is answering a different question: "down" would
 /// blame the database for a tunnel that is one keypress from opening, and "up"
 /// is worse, because whatever answered on that port cannot be the tunnel.
-pub(super) fn sleeping_via(c: &crate::engines::Conn) -> Option<crate::vias::Via> {
-    let v = crate::vias::get(&c.key())?;
-    crate::tunnels::carrying_via(&v).is_none().then_some(v)
+pub(super) fn sleeping_via(app: &App, c: &Conn) -> Option<crate::vias::Via> {
+    via_of(app, c).filter(|(_, on)| !on).map(|(v, _)| v)
 }
 
-fn reach_line(reach: Option<&Reach>, sleeping: Option<crate::vias::Via>) -> Line<'static> {
-    if let Some(via) = sleeping.as_ref() {
+fn reach_line(app: &App, c: &Conn, sleeping: Option<&crate::vias::Via>) -> Line<'static> {
+    let reach = app.reach.get(&c.key());
+    if let Some(via) = sleeping {
         // Something answering on the near end of a forward that is not running
         // is not this database: it is whatever else holds the port, and going
         // in without saying so is how you run a migration against the wrong
-        // server. The tunnel cannot even be opened until it lets go.
+        // server. The tunnel cannot even be opened until it lets go. Only said
+        // when the connection asks for that port, which is what was probed.
         let text = match reach {
-            Some(Reach::Up(_)) => format!(
+            Some(Reach::Up(_)) if crate::vias::points_at_it(c, via) => format!(
                 "● something else answers on {}: the tunnel to {} is not open",
                 via.local, via.host
             ),
@@ -448,11 +489,15 @@ fn reach_line(reach: Option<&Reach>, sleeping: Option<crate::vias::Via>) -> Line
             format!("● up · answered in {ms} ms"),
             Style::default().fg(Color::Green),
         ),
+        // Refused, unresolvable and unanswered alike: all a connect can say.
         Some(Reach::Down) => Line::styled(
-            "● down · nothing listening on that port",
+            "● down · nothing answered at that address",
             Style::default().fg(Color::Red),
         ),
         Some(Reach::Probing) => Line::styled("○ checking the port…", dim()),
+        None if !app.settings.probe => {
+            Line::styled("○ port checks are off (Settings · Check ports)", dim())
+        }
         None => Line::styled("○ not checked (r to check)", dim()),
     }
 }

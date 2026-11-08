@@ -10,7 +10,9 @@
 //!
 //! We `exec` (replace this process) so the client owns the terminal cleanly,
 //! except under `--md`, where the client runs as a child so its rows can be
-//! redrawn as markdown. `--dump` execs the engine's dump tool instead.
+//! redrawn as markdown, and for a usql run holding a passfile or a service
+//! file, which a child has to outlive so it can be deleted. `--dump` execs the
+//! engine's dump tool instead.
 
 use colored::Colorize;
 
@@ -92,31 +94,25 @@ fn print_markdown(
         .stderr(Stdio::inherit())
         .output();
     drop(secret);
-    for id in caught {
-        signal_hook::low_level::unregister(id);
-    }
+    drop(caught);
     match out {
         Ok(out) => {
-            print!(
+            use std::io::Write as _;
+            let _ = write!(
+                std::io::stdout(),
                 "{}",
                 crate::markdown::render(&String::from_utf8_lossy(&out.stdout), rows)
             );
             std::process::exit(exit_code(out.status));
         }
-        Err(e) => {
-            eprintln!("{}", format!("esql: could not run {program}: {e}").red());
-            std::process::exit(127);
-        }
+        Err(e) => could_not_run(program, &e, ""),
     }
 }
 
 /// Ctrl-C is the child's while a passfile is out, or it would end esql before
-/// the file is deleted. Hand the ids to `signal_hook::low_level::unregister`.
-fn catch_interrupts_for(secret: &crate::engines::Secret) -> Vec<signal_hook::SigId> {
-    match secret.holds_file() {
-        true => crate::tui::swallow_interrupts(),
-        false => Vec::new(),
-    }
+/// the file is deleted. Keep what it returns until the child has exited.
+fn catch_interrupts_for(secret: &crate::engines::Secret) -> Option<crate::tui::Swallowed> {
+    secret.holds_file().then(crate::tui::swallow_interrupts)
 }
 
 /// The child's exit code, or the shell's `128 + signal` when a signal ended it.
@@ -147,16 +143,10 @@ fn run_then_forget(
         .envs(secret.env.iter().cloned())
         .status();
     drop(secret);
-    for id in caught {
-        signal_hook::low_level::unregister(id);
-    }
+    drop(caught);
     match status {
         Ok(status) => std::process::exit(exit_code(status)),
-        Err(e) => {
-            eprintln!("{}", format!("esql: could not run {program}: {e}").red());
-            eprintln!("{}", format!("install it: {install}").dimmed());
-            std::process::exit(127);
-        }
+        Err(e) => could_not_run(program, &e, install),
     }
 }
 
@@ -171,9 +161,7 @@ fn exec(program: &str, args: &[String], env: Vec<(String, String)>, install: &st
             .args(args)
             .envs(env)
             .exec();
-        eprintln!("{}", format!("esql: could not run {program}: {err}").red());
-        eprintln!("{}", format!("install it: {install}").dimmed());
-        std::process::exit(127);
+        could_not_run(program, &err, install);
     }
 
     #[cfg(not(unix))]
@@ -184,12 +172,23 @@ fn exec(program: &str, args: &[String], env: Vec<(String, String)>, install: &st
             .status()
         {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-            Err(e) => {
-                eprintln!("{}", format!("esql: could not run {program}: {e}").red());
-                std::process::exit(127);
-            }
+            Err(e) => could_not_run(program, &e, install),
         }
     }
+}
+
+/// Why `program` could not be started, in words, and what to do about it. The
+/// install line only when it is missing: a client that is there but cannot run
+/// needs its mode or owner fixed, not a second copy.
+fn could_not_run(program: &str, e: &std::io::Error, install: &str) -> ! {
+    eprintln!(
+        "{}",
+        format!("esql: could not run {program}: {}", super::io_said(e)).red()
+    );
+    if e.kind() == std::io::ErrorKind::NotFound && !install.is_empty() {
+        eprintln!("{}", format!("install it: {install}").dimmed());
+    }
+    std::process::exit(127);
 }
 
 /// A connection that only works through a forward brings the forward back with
@@ -202,12 +201,30 @@ fn reopen_tunnel(conn: &crate::engines::Conn) {
         Some(Err(e)) => {
             eprintln!(
                 "{}",
-                format!("esql: could not reopen the tunnel: {e}").red()
+                format!("esql: could not reopen the tunnel: {}", super::said(&e)).red()
             );
             eprintln!(
                 "{}",
                 "      the connection points at it, so this will not connect.".dimmed()
             );
+            // The command that gets past it, where there is one.
+            let next = match e.downcast_ref::<crate::tunnels::Blocked>() {
+                Some(crate::tunnels::Blocked::NoSsh) => {
+                    crate::engines::install_argv_for(None, &[crate::engines::Tool::Ssh])
+                        .map(|argv| format!("install it: {}", argv.join(" ")))
+                }
+                Some(crate::tunnels::Blocked::PortTaken { .. }) => Some(format!(
+                    "move it: `esql tunnel up {} --local <port>`",
+                    conn.key()
+                )),
+                Some(crate::tunnels::Blocked::UnknownHostKey { host, .. }) => Some(format!(
+                    "`ssh {host} exit` checks its key once and accepts it"
+                )),
+                None => None,
+            };
+            if let Some(next) = next {
+                eprintln!("{}", format!("      {next}").dimmed());
+            }
             std::process::exit(1);
         }
         None => {}
@@ -397,7 +414,7 @@ pub fn run(args: Vec<String>, md: bool, dump: bool) {
     // install easysql` could not have brought the client along - it is not Rust
     // - so the least this can do is name the one command that would.
     let program = conn.connect_argv_db(&settings, db.as_deref())[0].clone();
-    let install = crate::engines::install_hint(conn.engine, &settings);
+    let install = crate::engines::install_hint_for(conn.engine, &settings, &program);
     if !crate::engines::on_path(&program) {
         eprintln!(
             "{}",

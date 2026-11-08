@@ -35,10 +35,10 @@ pub fn list() -> Vec<Conn> {
 }
 
 /// Where SQL Server passwords live when the setting allows it: one `[name]`
-/// with a `password` key per connection, written through `ini`, which makes
-/// every file it writes 0600. In the home folder beside `~/.pgpass` and
-/// `~/.my.cnf`, where anyone who knows those looks for it, and deliberately not
-/// in `~/.config`, which is what people sync, back up and commit.
+/// with a `password` key per connection, written 0600 through `ini`. In the
+/// home folder beside `~/.pgpass` and `~/.my.cnf`, where anyone who knows
+/// those looks for it, and deliberately not in `~/.config`, which is what
+/// people sync, back up and commit.
 pub fn pass_path() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".esqlpass")
 }
@@ -56,18 +56,15 @@ pub fn pass_is_private() -> bool {
     true
 }
 
-/// The one read of a stored password anywhere in this crate, for the
-/// environment of the child that needs it and nothing else. A file others can
-/// read is not used at all, so sqlcmd asks instead.
+/// One of the two reads of a stored password in this crate (the other is
+/// `mysql::password`), for the environment of the child that needs it and
+/// nothing else. Read as typed, edge spaces included. A file others can read
+/// is not used at all, so sqlcmd asks instead.
 pub fn password(name: &str) -> Option<String> {
     if !pass_is_private() {
         return None;
     }
-    ini::read(&pass_path())
-        .into_iter()
-        .find(|s| s.name == name)
-        .and_then(|s| s.get("password").map(str::to_string))
-        .filter(|p| !p.is_empty())
+    ini::raw_value(&pass_path(), name, "password").filter(|p| !p.is_empty())
 }
 
 pub fn has_password(name: &str) -> bool {
@@ -92,14 +89,13 @@ pub fn set_password(name: &str, password: Option<&str>) -> Result<()> {
 
 /// A rename moves the password with the connection, since it is keyed on the name.
 pub fn rename_password(from: &str, to: &str) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
     // Read whatever the file's mode, unlike `password`: a move hands the
     // secret to nobody, and refusing it would leave it under the old name for
     // the next connection called that.
-    let kept = ini::read(&pass_path())
-        .into_iter()
-        .find(|s| s.name == from)
-        .and_then(|s| s.get("password").map(str::to_string));
-    match kept {
+    match ini::raw_value(&pass_path(), from, "password") {
         Some(p) => ini::upsert(&pass_path(), Some(from), to, &[("password".to_string(), p)]),
         None => Ok(()),
     }

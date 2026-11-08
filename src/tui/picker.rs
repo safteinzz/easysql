@@ -66,9 +66,18 @@ pub(super) fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
     // Two more rows than the list needs, for the blank and the key line, which
     // live in the body here like in every other kind of box.
     let rows = (p.items.len() as u16).clamp(1, 10);
+    let widest = super::widgets::widest(
+        &p.title,
+        p.items
+            .iter()
+            .map(|i| i.as_str())
+            .chain([super::widgets::PICKER_KEYS
+                .join(super::widgets::SEP)
+                .as_str()]),
+    ) + 2;
     let rect = box_area(
         area,
-        box_width(area.width),
+        box_width(area.width, widest),
         box_height(rows + 2, area.height),
     );
     f.render_widget(Clear, rect);

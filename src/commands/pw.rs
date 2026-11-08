@@ -58,13 +58,8 @@ pub fn run(cmd: Cmd) {
 /// them: the connection's own, with the database widened to `*` by default
 /// because a role and its password are the same on every database.
 fn pgpass_fields(c: &Conn, db: Option<&str>) -> [String; 4] {
-    let host = if c.host.is_empty() {
-        "localhost".to_string()
-    } else {
-        c.host.clone()
-    };
     [
-        host,
+        creds::pgpass_host(&c.host).to_string(),
         c.port_or_default(),
         db.unwrap_or("*").to_string(),
         match c.user.is_empty() {
@@ -102,8 +97,18 @@ fn set(args: SetArgs) {
         ),
         Engine::MsSql => format!("{} [{}]", shown(&engines::mssql::pass_path()), c.name),
     };
-    // Read before the step, so a run with no password prints nothing it did not do.
-    let password = (!args.dry.dry_run).then(|| read_password(&c, args.stdin));
+    // Read before the step, so a run with no password prints nothing it did not
+    // do. A dry run refuses what the real one would, and asks for nothing.
+    let password = match (args.dry.dry_run, args.stdin, std::io::stdin().is_terminal()) {
+        (false, _, _) => Some(read_password(&c, args.stdin)),
+        // A terminal could answer the real run's prompt.
+        (true, _, true) => None,
+        (true, true, false) => {
+            read_password(&c, true);
+            None
+        }
+        (true, false, false) => no_password(),
+    };
     step(&format!(
         "save the password (set) for {} in {target}",
         c.key()
@@ -129,7 +134,10 @@ fn set(args: SetArgs) {
 /// on a terminal, and otherwise a refusal: nothing here may block on a prompt
 /// nobody can answer.
 fn read_password(c: &Conn, from_stdin: bool) -> String {
-    let password = if from_stdin {
+    let at_terminal = std::io::stdin().is_terminal();
+    // `--stdin` at a terminal would echo what is typed, so it is asked for
+    // without echo there, as it is without the flag.
+    let password = if from_stdin && !at_terminal {
         let mut raw = String::new();
         if std::io::stdin().read_to_string(&mut raw).is_err() {
             fail("could not read the password from stdin: it has to be text");
@@ -139,13 +147,13 @@ fn read_password(c: &Conn, from_stdin: bool) -> String {
             .or_else(|| raw.strip_suffix('\n'))
             .unwrap_or(&raw);
         trimmed.to_string()
-    } else if std::io::stdin().is_terminal() {
+    } else if at_terminal {
         match super::read_secret(&format!("password for {}: ", c.key())) {
             Some(p) => p,
             None => fail("cancelled, nothing was saved"),
         }
     } else {
-        fail("no password given: pipe it in with `--stdin` (`esql pw set <name> --stdin < file`)");
+        no_password();
     };
     if password.is_empty() {
         fail("the password is empty, so nothing was saved");
@@ -154,6 +162,10 @@ fn read_password(c: &Conn, from_stdin: bool) -> String {
         fail("a password cannot hold a line break, since each of these files keeps one per line");
     }
     password
+}
+
+fn no_password() -> ! {
+    fail("no password given: pipe it in with `--stdin` (`esql pw set <name> --stdin < file`)")
 }
 
 fn rm(args: RmArgs) {
@@ -171,13 +183,24 @@ fn rm(args: RmArgs) {
         ));
     }
     // The one libpq would use: the first line that covers the connection, or
-    // with `--db` the first that covers it on that database.
+    // with `--db` the line written for that database itself, never a `*` one
+    // that also covers it.
     let mut asked = c.clone();
     if let Some(db) = &args.db {
         asked.database = db.clone();
     }
-    let Some(cred) = creds::list().into_iter().find(|cr| cr.covers(&asked)) else {
-        fail(&format!("{} has no saved password", c.key()));
+    let found = creds::list()
+        .into_iter()
+        .find(|cr| cr.covers(&asked) && args.db.as_ref().is_none_or(|db| cr.database == *db));
+    let Some(cred) = found else {
+        match &args.db {
+            Some(db) => fail(&format!(
+                "{} has no `.pgpass` line for the database '{db}' itself: `esql pw rm {}` forgets the one libpq uses",
+                c.key(),
+                args.name
+            )),
+            None => fail(&format!("{} has no saved password", c.key())),
+        }
     };
     let what = match &cred.source {
         Source::Pgpass(_) => format!(

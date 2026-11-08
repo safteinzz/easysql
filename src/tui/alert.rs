@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
-use super::widgets::{BOX_CHROME_H, READER_KEYS, vscrollbar};
+use super::widgets::{READER_KEYS, vscrollbar};
 use super::*;
 
 pub(crate) struct Alert {
@@ -58,22 +58,41 @@ impl App {
     }
 }
 
-pub(super) fn render_alert(f: &mut Frame, area: Rect, a: &Alert) {
-    let width = box_width(area.width);
-    let rows = wrapped_line_count(&a.body, box_inner_width(width)) as u16;
+/// The body scrolls under a key row that never moves, and the scroll stops at
+/// the last screenful, so no press is spent scrolling into nothing.
+pub(super) fn render_alert(f: &mut Frame, area: Rect, a: &mut Alert) {
+    let width = box_width(
+        area.width,
+        super::widgets::widest(&a.title, [a.body.as_str()]),
+    );
+    let rows = wrapped_line_count(&a.body, box_inner_width(width));
     // The body, a blank, the keys.
-    let rect = box_area(area, width, box_height(rows + 2, area.height));
+    let rect = box_area(area, width, box_height(rows as u16 + 2, area.height));
     f.render_widget(Clear, rect);
+    let block = box_block(Color::Yellow, &a.title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
 
-    let mut lines: Vec<Line> = a.body.lines().map(|l| Line::raw(l.to_string())).collect();
-    lines.push(Line::raw(""));
-    lines.push(box_hint(READER_KEYS));
-
-    let para = Paragraph::new(lines)
-        .block(box_block(Color::Yellow, &a.title))
-        .wrap(Wrap { trim: false })
-        .scroll((a.scroll, 0));
-    f.render_widget(para, rect);
-    let view = rect.height.saturating_sub(BOX_CHROME_H) as usize;
-    vscrollbar(f, rect, rows as usize + 2, a.scroll as usize, view);
+    let shown = inner.height.saturating_sub(2) as usize;
+    a.scroll = a
+        .scroll
+        .min(u16::try_from(rows.saturating_sub(shown)).unwrap_or(u16::MAX));
+    let body = Rect {
+        height: shown as u16,
+        ..inner
+    };
+    let lines: Vec<Line> = a.body.lines().map(|l| Line::raw(l.to_string())).collect();
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((a.scroll, 0)),
+        body,
+    );
+    let keys = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(box_hint(READER_KEYS)), keys);
+    vscrollbar(f, rect, rows, a.scroll as usize, shown);
 }

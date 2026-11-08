@@ -66,9 +66,19 @@ impl App {
 }
 
 pub(super) fn render_typed(f: &mut Frame, area: Rect, t: &Typed) {
-    let width = box_width(area.width);
-    let inner = box_inner_width(width);
     let field = format!("type {}:  {}█", t.name, t.input);
+    let width = box_width(
+        area.width,
+        super::widgets::widest(
+            &t.title,
+            [
+                t.message.as_str(),
+                field.as_str(),
+                &TYPED_DEL_KEYS.join(super::widgets::SEP),
+            ],
+        ),
+    );
+    let inner = box_inner_width(width);
     // The message, a blank, the field, a blank, the keys, each counted wrapped.
     let rows = wrapped_line_count(&t.message, inner) + 1 + wrapped_line_count(&field, inner) + 2;
     let rect = box_area(area, width, box_height(rows as u16, area.height));

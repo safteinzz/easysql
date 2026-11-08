@@ -9,7 +9,7 @@ Set Shell bash
 Set Theme "Catppuccin Mocha"
 Set FontFamily "JetBrainsMono NF"
 Set FontSize 15
-Set Width 1320
+Set Width 1240
 Set Height 300
 Set Padding 20
 Set Framerate 24

@@ -19,12 +19,13 @@ const KNOWN: [&str; 4] = ["host", "port", "dbname", "user"];
 /// a connection that never mentioned SSL does not silently gain an opinion.
 /// This is exactly the kind of value nobody remembers the spelling of, which is
 /// why it is picked rather than typed.
-pub const SSLMODES: [&str; 6] = [
+pub const SSLMODES: [&str; 7] = [
     "(unset)",
     "prefer",
     "require",
     "verify-ca",
     "verify-full",
+    "allow",
     "disable",
 ];
 

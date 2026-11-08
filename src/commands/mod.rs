@@ -2,6 +2,16 @@
 //! `tunnel`, `snippet`, `set`), so a script or an agent can do what the toolbox
 //! does without driving a terminal or editing a client's file by hand.
 
+/// `println!` that a closed stdout cannot turn into a panic. A reader that
+/// stopped reading (`| head`) is not a failure of this run, so what it did not
+/// read is dropped and the run goes on to its own exit code.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 pub mod completions;
 pub mod conn;
 pub mod connect;
@@ -56,7 +66,7 @@ pub struct Json {
 /// One step of a change, on stdout. A dry run prints the same lines and stops
 /// there, so its output is the real run's line for line.
 pub fn step(line: &str) {
-    println!("{line}");
+    outln!("{line}");
 }
 
 /// Our own words for a failure, on stderr, then exit 1.
@@ -80,7 +90,8 @@ pub fn said(e: &anyhow::Error) -> String {
     parts.join(": ")
 }
 
-fn io_said(e: &std::io::Error) -> String {
+/// One I/O failure in words, with what to do when a person can fix it.
+pub fn io_said(e: &std::io::Error) -> String {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::PermissionDenied => {

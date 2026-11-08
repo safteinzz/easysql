@@ -30,7 +30,8 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
         // `col == 0` instead swallowed a column for every leading space, which
         // undercounted the rows and clipped the last line off a box.
         let need = if i == 0 { w } else { col + 1 + w };
-        if need <= width {
+        // The first word starts the row it is on, however long it is.
+        if need <= width || i == 0 {
             col = need;
         } else {
             rows += 1;
@@ -75,13 +76,13 @@ pub(super) fn shell_join_display(argv: &[String]) -> String {
         .iter()
         .map(|a| {
             let c = crate::ini::collapse_tilde(a);
-            // A collapsed `~/x` must not come back quoted: `'~/x'` is a literal
-            // directory called `~` to every shell, so the line on screen would
-            // no longer be the line you could paste. Quote the rest of it the
-            // normal way by handing the tail through unchanged.
+            // A collapsed `~/x` keeps its `~/` outside the quotes: `'~/x'` is a
+            // literal directory called `~` to every shell, so the line on
+            // screen would no longer be the line you could paste. Only the
+            // rest of it is quoted, when it needs to be.
             match c.strip_prefix("~/") {
-                Some(rest) if !needs_quoting(rest) => c,
-                _ => shell_join(std::slice::from_ref(&c)),
+                Some(rest) => format!("~/{}", shell_join(&[rest.to_string()])),
+                None => shell_join(std::slice::from_ref(&c)),
             }
         })
         .collect();
@@ -133,9 +134,28 @@ pub(super) const BOX_CHROME_H: u16 = 3;
 /// Columns the chrome costs: two borders plus two columns of padding a side.
 pub(super) const BOX_CHROME_W: u16 = 6;
 
-/// How wide a box is on a screen this wide.
-pub(super) fn box_width(screen_w: u16) -> u16 {
-    screen_w.saturating_sub(4).clamp(BOX_MIN_W, BOX_MAX_W)
+/// How wide a box is: as wide as its widest line wants, within the house
+/// limits, a margin of the screen, and never wider than the screen itself, or
+/// the body is measured wider than it is drawn.
+pub(super) fn box_width(screen_w: u16, widest: usize) -> u16 {
+    let want = u16::try_from(widest)
+        .unwrap_or(u16::MAX)
+        .saturating_add(BOX_CHROME_W);
+    want.clamp(BOX_MIN_W, BOX_MAX_W)
+        .min(screen_w.saturating_sub(4).max(BOX_MIN_W))
+        .min(screen_w)
+}
+
+/// The widest line among `texts` in characters, which is what `box_width`
+/// sizes a box from. The title counts, with the border it sits on.
+pub(super) fn widest<'a>(title: &str, texts: impl IntoIterator<Item = &'a str>) -> usize {
+    texts
+        .into_iter()
+        .flat_map(|t| t.split('\n'))
+        .map(|l| l.chars().count())
+        .chain([(title.chars().count() + 4).saturating_sub(BOX_CHROME_W as usize)])
+        .max()
+        .unwrap_or(0)
 }
 
 /// The columns a body actually gets, which is what it must be wrapped to.
@@ -304,7 +324,12 @@ pub(super) fn vscrollbar(f: &mut Frame, area: Rect, total: usize, top: usize, vi
     if total <= view {
         return;
     }
-    let mut state = ScrollbarState::new(total - view).position(top);
+    // One position per row the top can be on, and the viewport's length, so
+    // the thumb is as long as the share on screen and reaches the bottom at
+    // the last of them.
+    let mut state = ScrollbarState::new(total - view + 1)
+        .position(top)
+        .viewport_content_length(view);
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None);

@@ -1,5 +1,5 @@
-//! The toolbox - bare `esql`. Four tabs (Connections / Passwords / Tunnels /
-//! Settings) and a set of wizards that stand in for the things nobody
+//! The toolbox: bare `esql`. Five tabs (Connections / Passwords / Tunnels /
+//! Snippets / Settings) and a set of wizards that stand in for the things nobody
 //! remembers: a `~/.pg_service.conf` block, a `~/.pgpass` line, a `[clientX]`
 //! group, and `ssh -L port:host:port bastion`.
 //!
@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::{ListState, Padding};
 use std::collections::HashMap;
 use std::io::{self, Stdout};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,38 @@ pub(super) struct PendingRun {
     /// The connection, when this run is an interactive session. Carried whole
     /// rather than by name because a failed open is diagnosed against it.
     pub(super) connect: Option<Conn>,
+    /// What to do once this run has worked, when it is a fix offered for it.
+    pub(super) then: Option<Retry>,
+}
+
+/// The action an offered fix was for, done again once the fix has worked, so
+/// one Yes takes the person where they were going.
+#[derive(Clone)]
+pub(super) enum Retry {
+    /// Open the connection with this key, as Enter on it does.
+    Open(String),
+    /// Bring this forward back up, as Enter on its Tunnels row does.
+    Reopen {
+        kind: char,
+        spec: String,
+        host: String,
+    },
+    /// Submit the form that is open.
+    Submit,
+    /// Put this text on the clipboard.
+    Copy(String),
+}
+
+/// What came of handing the terminal to a program, so the event loop has to
+/// decide what to say rather than default to silence.
+enum Outcome {
+    /// It ran and exited 0.
+    Quiet,
+    /// It ran and failed after saying why on the screen we took back, so how
+    /// it ended (`exit 2`) is all a status line adds.
+    Note(String),
+    /// It never started, which has to be read.
+    Failed(io::Error),
 }
 
 pub(super) struct App {
@@ -131,6 +163,9 @@ pub(super) struct App {
     pub(super) conns: Vec<Conn>,
     pub(super) creds: Vec<Cred>,
     pub(super) tunnels: Vec<tunnels::Entry>,
+    /// Every recorded via by connection key, read with `tunnels`: a forward
+    /// two connections share is one row naming one of them.
+    pub(super) vias: Vec<(String, crate::vias::Via)>,
     pub(super) snippets: Vec<crate::snippets::Snippet>,
     pub(super) conn_state: ListState,
     pub(super) cred_state: ListState,
@@ -169,9 +204,9 @@ pub(super) struct App {
     /// Whether each engine's client is on PATH, worked out once per refresh
     /// rather than per row per frame.
     pub(super) installed: [bool; 4],
-    /// The choices that are yours rather than the clients'.
     /// A failure that has to be read. It owns every key until dismissed.
     pub(super) alert: Option<alert::Alert>,
+    /// The choices that are yours rather than the clients'.
     pub(super) settings: Settings,
     pub(super) snippet_state: ListState,
     pub(super) settings_state: ListState,
@@ -187,6 +222,7 @@ impl App {
             conns: Vec::new(),
             creds: Vec::new(),
             tunnels: Vec::new(),
+            vias: Vec::new(),
             snippets: Vec::new(),
             conn_state: ListState::default().with_selected(Some(0)),
             cred_state: ListState::default().with_selected(Some(0)),
@@ -243,7 +279,13 @@ impl App {
         let line = format!("{said}: {err}");
         // Too tall or too wide for the bar, so it goes in the box.
         if err.lines().count() > 1 || line.chars().count() > 90 {
-            self.alert(title, format!("{cmd}\n\n{err}"));
+            self.alert(
+                title,
+                match cmd.is_empty() {
+                    true => format!("{said}:\n\n{err}"),
+                    false => format!("{cmd}\n\n{err}"),
+                },
+            );
         } else {
             self.set_failed(line);
         }
@@ -281,7 +323,7 @@ impl App {
         self.refresh_conns();
         self.refresh_creds();
         self.refresh_tunnels();
-        self.refresh_snippets();
+        let _ = self.refresh_snippets();
     }
 
     pub(super) fn refresh_conns(&mut self) {
@@ -329,29 +371,21 @@ impl App {
     /// connection's host and port, if one is open. This is what stops easysql
     /// offering to dig a tunnel it has already dug.
     pub(super) fn tunnel_carrying(&self, c: &Conn) -> Option<String> {
-        let port = c.port_or_default();
-        self.tunnels.iter().find_map(|t| {
-            // Only a forward that is actually running carries anything: a
-            // sleeping row is a row, not a tunnel, and offering to reuse it
-            // would point the connection at a port with nothing behind it.
-            if !t.on() {
-                return None;
-            }
-            let (open, target, onward) = t.ports()?;
-            let same_host = target.eq_ignore_ascii_case(&c.host)
-                || crate::sshhosts::is_same_machine(&t.host, &c.host)
-                    && matches!(target, "127.0.0.1" | "localhost");
-            (t.kind == 'L' && same_host && onward == port).then(|| open.to_string())
-        })
+        self.tunnels
+            .iter()
+            .find(|t| reaches(t, c))
+            .and_then(|t| t.ports().map(|(open, _, _)| open.to_string()))
     }
 
-    pub(super) fn refresh_snippets(&mut self) {
+    /// Reload the snippets and keep `~/.psqlrc` in step, saying whether that
+    /// rewrote it.
+    pub(super) fn refresh_snippets(&mut self) -> Result<bool> {
         self.snippets = crate::snippets::list();
-        // Editing a `.sql` with `o` would otherwise leave `:name` expanding to the old
-        // query. Writes nothing when nothing changed.
-        let _ = crate::snippets::sync_psqlrc();
         let n = self.snippet_rows().len();
         Self::clamp(&mut self.snippet_state, n);
+        // Editing a `.sql` with `o` would otherwise leave `:name` expanding to the old
+        // query. Writes nothing when nothing changed.
+        crate::snippets::sync_psqlrc()
     }
 
     pub(super) fn selected_snippet(&self) -> Option<&crate::snippets::Snippet> {
@@ -360,9 +394,17 @@ impl App {
     }
 
     pub(super) fn refresh_tunnels(&mut self) {
+        self.vias = crate::vias::all();
         self.tunnels = crate::vias::rows();
         let n = self.tunnel_rows().len();
         Self::clamp(&mut self.tunnel_state, n);
+    }
+
+    /// The entry acted on is no longer in its file as it was listed: the list
+    /// is read again for the person, rather than telling them to.
+    pub(super) fn reread_creds(&mut self, gone: &anyhow::Error) {
+        self.refresh_creds();
+        self.set_failed(format!("{gone}: the list is read again"));
     }
 
     /// Is there a saved password that answers for this connection? Only asked
@@ -381,8 +423,9 @@ impl App {
         self.reach_gen += 1;
         // Turned off in Settings: forget what we knew rather than leave dots
         // that stop being true the moment anything moves.
+        // A connection no longer probed keeps no dot from an older round.
+        self.reach.clear();
         if !self.settings.probe {
-            self.reach.clear();
             return;
         }
         let targets: Vec<reach::Target> = self
@@ -512,8 +555,9 @@ impl App {
         }
     }
 
-    /// Put the cursor on the tunnel with this pid: the one you just made is the
-    /// one you are looking for, and on a busy list it is not row one.
+    /// Put the cursor on the tunnel with this spec through this host: the one
+    /// you just made is the one you are looking for, and on a busy list it is
+    /// not row one.
     pub(super) fn select_tunnel(&mut self, spec: &str, host: &str) {
         let at = self.tunnel_rows().iter().position(|&r| {
             let t = &self.tunnels[r];
@@ -634,6 +678,19 @@ impl App {
 // Terminal lifecycle + event loop
 // ==========================================================================
 
+/// Whether `t` is up and its far end is exactly `c`'s host and port, the far
+/// end being named the way the ssh host sees it. Only a forward that is
+/// running carries anything: a sleeping row is a row, not a tunnel.
+pub(super) fn reaches(t: &tunnels::Entry, c: &Conn) -> bool {
+    let Some((_, target, onward)) = t.ports() else {
+        return false;
+    };
+    let same_host = target.eq_ignore_ascii_case(&c.host)
+        || crate::sshhosts::is_same_machine(&t.host, &c.host)
+            && matches!(target, "127.0.0.1" | "localhost");
+    t.on() && t.kind == 'L' && same_host && onward == c.port_or_default()
+}
+
 /// Entry point for bare `esql`.
 pub fn run() -> Result<()> {
     install_panic_hook();
@@ -671,18 +728,28 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             continue;
         }
 
-        if let Some(run) = app.on_key(key) {
+        let mut pending = app.on_key(key);
+        while let Some(run) = pending.take() {
             // The same question the CLI asks before a read-only session, and
-            // the same refusal, as an alert rather than a session.
+            // the same refusal, as an alert rather than a session. An answer
+            // that cannot be had is said above the session, as the CLI says it.
+            let mut unconfirmed = None;
             if let Some(c) = run.connect.as_ref()
                 && c.engine == crate::engines::Engine::Pg
                 && c.read_only()
-                && let Some((headline, fix)) =
-                    crate::engines::pg::check_read_only(c, None, app.settings.probe_timeout)
-                        .refusal(&c.name)
             {
-                app.alert("not read-only", format!("{headline}\n\n{fix}"));
-                continue;
+                let check =
+                    crate::engines::pg::check_read_only(c, None, app.settings.probe_timeout);
+                if let Some((headline, fix)) = check.refusal(&c.name) {
+                    app.alert("not read-only", format!("{headline}\n\n{fix}"));
+                    continue;
+                }
+                if let crate::engines::pg::ReadOnlyCheck::Unknown(said) = check {
+                    unconfirmed = Some(format!(
+                        "could not confirm `{}` is read-only: {said}",
+                        c.name
+                    ));
+                }
             }
             // The same orientation line the CLI prints. It belongs here too, and
             // more so: Enter in the list is the usual way in, and the whole gap
@@ -732,63 +799,71 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 .connect
                 .as_ref()
                 .and_then(|c| crate::engines::mssql::usql_password_note(c, &app.settings, false));
-            let banner = match (note, hint) {
-                (Some(n), Some(h)) => Some(format!("{n}\n  {h}")),
-                (n, h) => n.or(h),
-            };
-            let status = run_suspended(terminal, &argv, &env, banner)?;
+            let banner: Vec<String> = [unconfirmed, note, hint].into_iter().flatten().collect();
+            let banner = (!banner.is_empty()).then(|| banner.join("\n  "));
+            let outcome = run_suspended(terminal, &argv, &env, banner)?;
             drop(secret);
+            let worked = matches!(outcome, Outcome::Quiet);
 
             if let Some(conn) = run.connect.clone() {
-                match status {
+                match &outcome {
                     // A session you actually got into is what makes a connection
                     // "recent"; a failed one leaves the ordering alone.
-                    Some(s) if s.success() => {
+                    Outcome::Quiet => {
                         history::record(&conn.key());
                         app.history = history::load();
                     }
                     // The client printed why and then we redrew over it. Ask the
                     // server the same question non-interactively and offer the
                     // fix in a modal instead of a status that flashes past.
-                    Some(_) => app.offer_fix(&conn),
-                    None => {}
+                    Outcome::Note(_) => app.offer_fix(&conn),
+                    Outcome::Failed(_) => {}
                 }
             }
 
-            match status {
-                Some(s) if s.success() => app.set_status(format!("{} ✓", run.label)),
-                // The client ran and failed. `offer_fix` above already put up an
-                // offer when the server's answer could be classified; when it
-                // could not, the exit code is all we have and it belongs in the
-                // status line, not in a box with nothing to say.
-                Some(s) => app.set_failed(format!(
-                    "{} failed (exit {})",
-                    run.label,
-                    s.code().unwrap_or(-1)
-                )),
-                // Nothing ran at all: the program is missing or not executable,
-                // and this is the one line explaining why the screen came back
-                // unchanged. A status line would clear it after STATUS_TTL.
-                None => {
+            match outcome {
+                Outcome::Quiet => app.set_status(format!("{} ✓", run.label)),
+                // `offer_fix` above already put up an offer when the server's
+                // answer could be classified; how it ended goes on the status
+                // line either way, and never a box with nothing in it.
+                Outcome::Note(how) => app.set_failed(format!("{} failed ({how})", run.label)),
+                // Nothing ran at all, and this is the one line explaining why the
+                // screen came back unchanged.
+                Outcome::Failed(e) => {
                     let program = run.argv[0].clone();
-                    // Name the one command this machine needs, never a list of
-                    // distros' guesses, and never an errno in place of advice.
-                    let advice = run
-                        .connect
-                        .as_ref()
-                        .map(|c| c.engine)
-                        .and_then(|e| match engines::install_argv(e, &app.settings) {
-                            Some(argv) => Some(format!("Install it with:\n\n    {}", argv.join(" "))),
-                            None => engines::install_note(e, &app.settings).map(str::to_string),
-                        })
-                        .unwrap_or_else(|| {
-                            "Check that it is installed and on your PATH, or point the setting for this engine at the program you do have.".to_string()
-                        });
+                    // Install advice only for a program that is not there: one
+                    // that is there but cannot run is not fixed by installing it.
+                    let advice = match e.kind() {
+                        io::ErrorKind::NotFound => run
+                            .connect
+                            .as_ref()
+                            .map(|c| c.engine)
+                            .and_then(|e| {
+                                let hint = engines::install_hint_for(e, &app.settings, &program);
+                                match engines::install_argv(e, &app.settings) {
+                                    Some(argv) if hint == argv.join(" ") => {
+                                        Some(format!("Install it with:\n\n    {hint}"))
+                                    }
+                                    _ => engines::install_note(e, &app.settings)
+                                        .filter(|note| hint == *note)
+                                        .map(str::to_string)
+                                        .or(Some(hint)),
+                                }
+                            })
+                            .unwrap_or_else(|| match run.connect {
+                                Some(_) => "Check that it is installed and on your PATH, or point the setting for this engine at the program you do have.".to_string(),
+                                None => "Check that it is installed and on your PATH, or point $VISUAL or $EDITOR at one you have.".to_string(),
+                            }),
+                        _ => String::new(),
+                    };
                     app.alert(
                         "could not run it",
                         format!(
-                            "`{program}` could not be started, so nothing was opened.\n\n{advice}"
-                        ),
+                            "`{program}` could not be started, so nothing was opened: {}.\n\n{advice}",
+                            crate::commands::io_said(&e)
+                        )
+                        .trim_end()
+                        .to_string(),
                     )
                 }
             }
@@ -804,6 +879,10 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             // the client owned the terminal, and a `\c` inside psql can leave
             // the connection pointing somewhere else entirely.
             app.start_probes();
+            // A fix that worked goes straight on to what it was offered for.
+            if worked && let Some(then) = run.then {
+                pending = app.retry(then);
+            }
         }
     }
     Ok(())
@@ -817,7 +896,7 @@ fn run_suspended(
     argv: &[String],
     env: &[(String, String)],
     hint: Option<String>,
-) -> Result<Option<ExitStatus>> {
+) -> Result<Outcome> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     // ratatui hides the cursor while drawing and leaving the alt-screen does not
@@ -834,33 +913,58 @@ fn run_suspended(
 
     // A Ctrl-C at the client's prompt is meant for the client, and would
     // otherwise end the toolbox and leave the shell in raw mode.
-    let caught = swallow_interrupts();
+    let swallowed = swallow_interrupts();
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
-    let status = cmd.status().ok();
-    for id in caught {
-        signal_hook::low_level::unregister(id);
-    }
+    let outcome = match cmd.status() {
+        Ok(s) if s.success() => Outcome::Quiet,
+        Ok(s) => Outcome::Note(match s.code() {
+            Some(code) => format!("exit {code}"),
+            None => "ended by a signal".to_string(),
+        }),
+        Err(e) => Outcome::Failed(e),
+    };
+    drop(swallowed);
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
     terminal.clear()?;
-    Ok(status)
+    Ok(outcome)
 }
 
-/// Catch Ctrl-C and Ctrl-\ and do nothing with them, while a child that owns
-/// the terminal acts on them. A caught signal is reset to the default in an
-/// exec'd child, so this never reaches it, unlike `SIG_IGN`, which it would
-/// inherit. Hand the ids to `signal_hook::low_level::unregister` to stop.
-pub(crate) fn swallow_interrupts() -> Vec<signal_hook::SigId> {
+/// Whether Ctrl-C and Ctrl-\ act as they would uncaught, which is false only
+/// while a `Swallowed` lives.
+static ARMED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Ctrl-C and Ctrl-\ do nothing to us while the guard lives, and the child that
+/// owns the terminal acts on them. A caught signal is reset to the default in
+/// an exec'd child, so this never reaches it, unlike `SIG_IGN`, which it would
+/// inherit. A handler cannot be taken back once registered, so the one
+/// registered here acts as the signal would uncaught, ending the program,
+/// whenever no guard is alive.
+pub(crate) fn swallow_interrupts() -> Swallowed {
     use signal_hook::consts::{SIGINT, SIGQUIT};
-    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    [SIGINT, SIGQUIT]
-        .into_iter()
-        .filter_map(|signal| signal_hook::flag::register(signal, seen.clone()).ok())
-        .collect()
+    let armed = ARMED.get_or_init(|| {
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for signal in [SIGINT, SIGQUIT] {
+            let _ = signal_hook::flag::register_conditional_default(signal, armed.clone());
+        }
+        armed
+    });
+    armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    Swallowed(armed.clone())
+}
+
+/// While it lives, Ctrl-C and Ctrl-\ are the child's alone.
+pub(crate) struct Swallowed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Swallowed {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn setup() -> Result<Term> {

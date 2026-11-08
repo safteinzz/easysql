@@ -19,10 +19,10 @@ ENGINE=$(command -v podman || command -v docker) || {
 up() {
     "$ENGINE" run -d --name easysql-pg \
         -e POSTGRES_PASSWORD=devpass -e POSTGRES_USER=dev -e POSTGRES_DB=app \
-        -p 5432:5432 docker.io/library/postgres:17-alpine
+        -p 127.0.0.1:5432:5432 docker.io/library/postgres:17-alpine
     "$ENGINE" run -d --name easysql-my \
         -e MARIADB_ROOT_PASSWORD=devpass -e MARIADB_DATABASE=shop \
-        -p 3306:3306 docker.io/library/mariadb:11
+        -p 127.0.0.1:3306:3306 docker.io/library/mariadb:11
     cat <<'HINT'
 
 Both are starting. In esql, press `c` and add:

@@ -8,9 +8,9 @@
 //! `mysqldump` and everything else.
 //!
 //! Unlike Postgres, the password lives in the group rather than a file of its
-//! own, so `~/.my.cnf` is chmod 0600 on every write. That is also why nothing
-//! here ever passes `-p<password>`: MySQL itself warns that the command line is
-//! visible to every user on the box.
+//! own, so `~/.my.cnf` is written 0600. That is also why nothing here ever
+//! passes `-p<password>`: MySQL itself warns that the command line is visible
+//! to every user on the box.
 
 use super::{Conn, Engine, NewConn};
 use crate::ini;
@@ -35,10 +35,13 @@ pub fn group_of(name: &str) -> String {
 }
 
 /// The connection name a group belongs to, or `None` for `[client]` itself and
-/// for every group that is not ours (`[mysqld]`, `[mysqldump]`).
+/// for every group that is not ours (`[mysqld]`, `[mysqldump]`). MariaDB's
+/// `[client-server]` and `[client-mariadb]` are read by every one of its tools,
+/// as `[client]` is, and a name starting with `-` could not be typed after
+/// `esql` anyway.
 pub fn name_of(group: &str) -> Option<String> {
     let rest = group.strip_prefix(PREFIX)?;
-    (!rest.is_empty()).then(|| rest.to_string())
+    (!rest.is_empty() && !rest.starts_with('-')).then(|| rest.to_string())
 }
 
 pub fn list() -> Vec<Conn> {
@@ -46,17 +49,18 @@ pub fn list() -> Vec<Conn> {
 }
 
 pub fn list_in(path: &std::path::Path) -> Vec<Conn> {
-    ini::read(path)
+    ini::read_as(path, ini::Dialect::MySql)
         .into_iter()
         .filter_map(|s| {
             let name = name_of(&s.name)?;
+            let get = |key: &str| s.get(key).map(option_read).unwrap_or_default();
             Some(Conn {
                 engine: Engine::MySql,
                 name,
-                host: s.get("host").unwrap_or_default().to_string(),
-                port: s.get("port").unwrap_or_default().to_string(),
-                database: s.get("database").unwrap_or_default().to_string(),
-                user: s.get("user").unwrap_or_default().to_string(),
+                host: get("host"),
+                port: get("port"),
+                database: get("database"),
+                user: get("user"),
                 extra: s.rest(&KNOWN),
             })
         })
@@ -65,36 +69,43 @@ pub fn list_in(path: &std::path::Path) -> Vec<Conn> {
 
 /// Does this connection already carry a password in its group? The value is
 /// never read out, only its presence: that is all the Credentials tab shows.
+/// A bare `password` line is mysql's way of saying to prompt, so it is none.
 pub fn has_password(name: &str) -> bool {
-    ini::read(&cnf_path())
+    let (path, group) = (cnf_path(), group_of(name));
+    let set = ini::read_as(&path, ini::Dialect::MySql)
         .iter()
-        .any(|s| s.name == group_of(name) && s.get("password").is_some())
+        .any(|s| s.name == group && s.get("password").is_some());
+    set && !ini::bare_keys(&path, ini::Dialect::MySql, &group)
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case("password"))
 }
 
 /// The group's password, for usql alone: its driver never reads `~/.my.cnf`,
 /// so a usql session has nothing to log in with unless it is handed this,
 /// which is why it is one of the two reads of a stored password in the crate.
-/// Read the way mysql reads it (`option_read`).
+/// Read the way mysql reads it (`option_read`). An empty one is no password
+/// to hand over: usql refuses a passfile line with an empty field.
 pub fn password(name: &str) -> Option<String> {
-    let raw = ini::read(&cnf_path())
+    let raw = ini::read_as(&cnf_path(), ini::Dialect::MySql)
         .into_iter()
         .find(|s| s.name == group_of(name))?
         .get("password")?
         .to_string();
-    Some(option_read(&raw))
+    Some(option_read(&raw)).filter(|p| !p.is_empty())
 }
 
 /// An option value as mysql reads it, checked against the real client's
-/// `--print-defaults`: matching quotes are dropped and keep what is inside
-/// them, an unquoted value ends at `#`, and `\b \t \n \r \s \\ \" \'` are
-/// escapes, while a backslash before anything else stays a backslash.
-fn option_read(raw: &str) -> String {
+/// `--print-defaults`: a `#` outside quotes starts a comment, matching quotes
+/// are dropped and keep what is inside them, and `\b \t \n \r \s \\ \" \'`
+/// are escapes, while a backslash before anything else stays a backslash.
+pub(crate) fn option_read(raw: &str) -> String {
+    let raw = without_comment(raw).trim();
     let quoted = ['"', '\'']
         .into_iter()
         .find(|q| raw.len() >= 2 && raw.starts_with(*q) && raw.ends_with(*q));
     let body = match quoted {
         Some(_) => &raw[1..raw.len() - 1],
-        None => raw.split('#').next().unwrap_or_default().trim(),
+        None => raw,
     };
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
@@ -120,18 +131,36 @@ fn option_read(raw: &str) -> String {
     out
 }
 
-/// `password` written so mysql reads it back unchanged: as it is when nothing
+/// `raw` up to the `#` that starts a comment, which mysql's reader finds the
+/// same way: outside quotes, where inside them a backslash escapes the quote.
+fn without_comment(raw: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in raw.char_indices() {
+        if (c == '"' || c == '\'') && !escaped {
+            match quote {
+                None => quote = Some(c),
+                Some(q) if q == c => quote = None,
+                Some(_) => {}
+            }
+        }
+        if quote.is_none() && c == '#' {
+            return &raw[..i];
+        }
+        escaped = quote.is_some() && c == '\\' && !escaped;
+    }
+    raw
+}
+
+/// `value` written so mysql reads it back unchanged: as it is when nothing
 /// in it means anything to the option-file reader, else in double quotes with
 /// `\` and `"` escaped, which keeps a `#`, a quote and edge spaces intact.
-fn option_written(password: &str) -> String {
-    let plain = !password.contains(['#', '"', '\'', '\\']) && password.trim() == password;
+fn option_written(value: &str) -> String {
+    let plain = !value.contains(['#', '"', '\'', '\\']) && value.trim() == value;
     if plain {
-        return password.to_string();
+        return value.to_string();
     }
-    format!(
-        "\"{}\"",
-        password.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The connection as a usql URL, which carries no password: the database is
@@ -225,30 +254,38 @@ pub fn save(original: Option<&str>, nc: &NewConn) -> Result<()> {
     ] {
         let v = v.trim();
         if !v.is_empty() {
-            keys.push((k.to_string(), v.to_string()));
+            keys.push((k.to_string(), option_written(v)));
         }
     }
     // An edit must not drop the password that was already in the group; it is
     // not a field this wizard shows, so it is preserved rather than rewritten.
     let existing = from.as_deref().unwrap_or(&group);
-    if let Some(sec) = ini::read(&path).into_iter().find(|s| s.name == existing)
+    if let Some(sec) = ini::read_as(&path, ini::Dialect::MySql)
+        .into_iter()
+        .find(|s| s.name == existing)
         && let Some(pw) = sec.get("password")
     {
         keys.push(("password".to_string(), pw.to_string()));
     }
     keys.extend(nc.extra.iter().cloned());
-    ini::upsert(&path, from.as_deref(), &group, &keys)
+    ini::upsert_as(&path, ini::Dialect::MySql, from.as_deref(), &group, &keys)
 }
 
 pub fn delete(name: &str) -> Result<()> {
     ini::remove(&cnf_path(), &group_of(name))
 }
 
-/// Write or clear the group's password. The only place in easysql that touches
-/// a secret, and it goes straight into the file the client reads.
+/// Write or clear the group's password, straight into the file the client
+/// reads.
 pub fn set_password(name: &str, password: Option<&str>) -> Result<()> {
     let written = password.map(option_written);
-    ini::set_key(&cnf_path(), &group_of(name), "password", written.as_deref())
+    ini::set_key_as(
+        &cnf_path(),
+        ini::Dialect::MySql,
+        &group_of(name),
+        "password",
+        written.as_deref(),
+    )
 }
 
 pub fn probe_argv(c: &Conn, s: &crate::settings::Settings) -> (Vec<String>, Vec<(String, String)>) {
@@ -327,6 +364,16 @@ connect_timeout=5
         assert_eq!(
             conns[0].extra,
             vec![("connect_timeout".to_string(), "5".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_hash_outside_quotes_starts_a_comment_as_mysql_reads_it() {
+        assert_eq!(option_read("db.example.com # staging"), "db.example.com");
+        assert_eq!(
+            option_read("\"pa#ss\" # note"),
+            "pa#ss",
+            "inside quotes a # is part of the value"
         );
     }
 }

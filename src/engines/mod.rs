@@ -2,10 +2,12 @@
 //! below it, one module per engine knows exactly one thing: which file its
 //! client already reads, and which argv that client wants.
 //!
-//! That is the whole design rule. easysql never invents a store and never holds
-//! a password: it writes the file `psql`, `mysql` or `sqlite3` reads on its own,
-//! so uninstalling this tool costs you nothing and every script, GUI and
-//! colleague's `psql` keeps working.
+//! That is the whole design rule. easysql never invents a store where the
+//! client already has one: it writes the file `psql` or `mysql` reads on its
+//! own, so uninstalling this tool costs you nothing and every script, GUI and
+//! colleague's `psql` keeps working. SQLite and SQL Server have no such file,
+//! so their lists are easysql's own, and so is a SQL Server password, kept only
+//! once the `mssql_passwords` setting allows it.
 
 use crate::settings::Settings;
 use anyhow::Result;
@@ -266,11 +268,10 @@ impl Engine {
     }
 
     /// True when easysql can save this engine's password into a file its client
-    /// reads on its own. SQL Server has no such file - the modern `sqlcmd`
-    /// keeps an obfuscated copy in its own YAML and the classic one reads
-    /// nothing - and `SQLCMDPASSWORD` would mean holding the secret and handing
-    /// it to a child, which this crate does not do. So sqlcmd prompts instead,
-    /// which is also Microsoft's own advice.
+    /// reads on its own. SQL Server has no such file: the modern `sqlcmd` keeps
+    /// an obfuscated copy in its own YAML and the classic one reads nothing, so
+    /// a password for it is one easysql holds and hands over itself, which
+    /// `keeps_password` allows only once the user has said so.
     pub fn stores_password(self) -> bool {
         matches!(self, Engine::Pg | Engine::MySql)
     }
@@ -304,6 +305,16 @@ impl Conn {
     /// both call a connection `prod`.
     pub fn key(&self) -> String {
         format!("{}:{}", self.engine.slug(), self.name)
+    }
+
+    /// The keys of this block written with no `=` at all, which `extra` reads
+    /// as empty and an edit that leaves them alone keeps bare.
+    pub fn bare_keys(&self) -> Vec<String> {
+        let (section, d) = match self.engine {
+            Engine::MySql => (mysql::group_of(&self.name), crate::ini::Dialect::MySql),
+            _ => (self.name.clone(), crate::ini::Dialect::Plain),
+        };
+        crate::ini::bare_keys(&self.engine.store(), d, &section)
     }
 
     /// `user@host:port/db`, the second column and the `ls -v` line. SQLite has
@@ -468,7 +479,14 @@ impl Conn {
             Engine::MySql if self.engine.uses_usql(s) => argv.push(mysql::usql_url(self, db)),
             Engine::Pg => argv.push(pg::conninfo(&self.name, db)),
             Engine::MySql => {
-                argv.push(format!("--defaults-group-suffix={}", self.name));
+                // mysql takes `--defaults-group-suffix` only as its first
+                // option, so it goes straight after the program word, ahead of
+                // any flag the configured command carries.
+                let at = argv
+                    .iter()
+                    .position(|w| is_own_client(Engine::MySql, w))
+                    .map_or(argv.len(), |i| i + 1);
+                argv.insert(at, format!("--defaults-group-suffix={}", self.name));
                 if let Some(db) = db {
                     argv.push(format!("--database={db}"));
                 }
@@ -537,32 +555,33 @@ impl Conn {
     }
 
     /// A URL for the connection, which is what a GUI, an ORM config or a
-    /// colleague's chat window wants. Never carries the password.
+    /// colleague's chat window wants. Never carries the password. Every part
+    /// is percent-encoded, an IPv6 host is bracketed, and SQL Server's database
+    /// is its `database` parameter, since a path there names an instance.
     pub fn url(&self) -> String {
-        match self.engine {
-            Engine::Sqlite => format!("sqlite://{}", self.database),
-            _ => {
-                let scheme = match self.engine {
-                    Engine::Pg => "postgresql",
-                    Engine::MsSql => "sqlserver",
-                    _ => "mysql",
-                };
-                let host = if self.host.is_empty() {
-                    "localhost"
-                } else {
-                    &self.host
-                };
-                let user = match self.user.is_empty() {
-                    true => String::new(),
-                    false => format!("{}@", self.user),
-                };
-                let db = match self.database.is_empty() {
-                    true => String::new(),
-                    false => format!("/{}", self.database),
-                };
-                format!("{scheme}://{user}{host}:{}{db}", self.port_or_default())
-            }
+        if self.engine == Engine::Sqlite {
+            return format!("sqlite://{}", self.database);
         }
+        let scheme = match self.engine {
+            Engine::Pg => "postgresql",
+            Engine::MsSql => "sqlserver",
+            _ => "mysql",
+        };
+        let host = match self.host.as_str() {
+            "" => "localhost".to_string(),
+            h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
+            h => percent_encode(h, "[]:"),
+        };
+        let user = match self.user.is_empty() {
+            true => String::new(),
+            false => format!("{}@", percent_encode(&self.user, "")),
+        };
+        let db = match (self.database.is_empty(), self.engine) {
+            (true, _) => String::new(),
+            (false, Engine::MsSql) => format!("?database={}", percent_encode(&self.database, "")),
+            (false, _) => format!("/{}", percent_encode(&self.database, "")),
+        };
+        format!("{scheme}://{user}{host}:{}{db}", self.port_or_default())
     }
 }
 
@@ -817,14 +836,41 @@ fn find_target_among(all: Vec<Conn>, needle: &str) -> Result<(Conn, Option<Strin
 }
 
 /// Create or rewrite a connection. `original` is the name being replaced, which
-/// differs from `nc.name` only when an edit renamed it.
+/// differs from `nc.name` only when an edit renamed it. A new connection, or a
+/// rename, onto a name this engine already has is refused, because the write
+/// would replace that connection or leave two blocks of the same name.
 pub fn save(original: Option<&str>, nc: &NewConn) -> Result<()> {
+    let name = nc.name.trim();
+    let taken = list()
+        .iter()
+        .any(|c| c.engine == nc.engine && c.name == name);
+    if taken && original != Some(name) {
+        anyhow::bail!(
+            "a {} connection named '{name}' already exists: edit that one, or choose another name",
+            nc.engine.label()
+        );
+    }
     match nc.engine {
         Engine::Pg => pg::save(original, nc),
         Engine::MySql => mysql::save(original, nc),
         Engine::Sqlite => sqlite::save(original, nc),
         Engine::MsSql => mssql::save(original, nc),
     }
+}
+
+/// Rewrite the connection's host and port and nothing else, which is what
+/// pointing it at a forward, and back, takes.
+pub fn repoint(c: &Conn, host: &str, port: &str) -> Result<()> {
+    let nc = NewConn {
+        engine: c.engine,
+        name: c.name.clone(),
+        host: host.to_string(),
+        port: port.to_string(),
+        database: c.database.clone(),
+        user: c.user.clone(),
+        extra: c.extra.clone(),
+    };
+    save(Some(&c.name), &nc)
 }
 
 pub fn delete(c: &Conn) -> Result<()> {
@@ -874,6 +920,9 @@ pub fn set_read_only(engine: Engine, extra: &mut Vec<(String, String)>, on: bool
 /// Each is tried even when one before it failed, and the first failure is
 /// returned, saying which of them did not move.
 pub fn carry_rename(engine: Engine, from: &str, to: &str) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
     let old_key = format!("{}:{from}", engine.slug());
     let new_key = format!("{}:{to}", engine.slug());
     let tunnel = crate::vias::rename(&old_key, &new_key);
@@ -889,12 +938,21 @@ pub fn carry_rename(engine: Engine, from: &str, to: &str) -> Result<()> {
     }
 }
 
-/// Delete a connection and what easysql keeps for it: the remembered tunnel,
-/// so the file does not fill with forwards for nothing, and a kept SQL Server
-/// password, so a new connection reusing the name does not inherit it. A
-/// `.pgpass` line is the client's and stays.
+/// Delete a connection and what easysql keeps for it: the remembered tunnel
+/// and the forward carrying it, unless another connection rides on that
+/// forward too, so the file does not fill with forwards for nothing, its
+/// history, and a kept SQL Server password, so a new connection reusing the
+/// name inherits neither its place in the list nor its password. A `.pgpass`
+/// line is the client's and stays.
 pub fn delete_with_keyed(c: &Conn) -> Result<()> {
     delete(c).map_err(|e| e.context("it was not deleted"))?;
+    crate::history::forget(&c.key());
+    // Its forward goes too: once the via is forgotten nothing names it, so
+    // nothing could stop it later.
+    if let Some(t) = forward_only_of(c) {
+        crate::tunnels::kill(t.pid)
+            .map_err(|e| e.context("deleted, but its tunnel was not stopped"))?;
+    }
     crate::vias::remove(&c.key())
         .map_err(|e| e.context("deleted, but its tunnel record was not forgotten"))?;
     if c.engine == Engine::MsSql {
@@ -902,6 +960,48 @@ pub fn delete_with_keyed(c: &Conn) -> Result<()> {
             .map_err(|e| e.context("deleted, but its kept password was not forgotten"))?;
     }
     Ok(())
+}
+
+/// The running forward that carries `c`'s via and no other connection's,
+/// which is the one deleting `c` stops.
+pub fn forward_only_of(c: &Conn) -> Option<crate::tunnels::Tunnel> {
+    let via = crate::vias::get(&c.key())?;
+    crate::tunnels::carrying_via(&via).filter(|t| crate::vias::sharing(&c.key(), t).is_empty())
+}
+
+/// The name as `esql` takes it: bare, or `<engine>:<name>` when another
+/// engine has the same name, when it is also a command, or when it starts with
+/// an engine's prefix, since the bare word would then be refused or open
+/// something else.
+pub fn typed_name(c: &Conn, all: &[Conn]) -> String {
+    let shared = all
+        .iter()
+        .filter(|o| o.name == c.name && o.engine != c.engine)
+        .count()
+        > 0;
+    let prefixed = c
+        .name
+        .split_once(':')
+        .is_some_and(|(p, _)| Engine::from_slug(p).is_some());
+    match shared || prefixed || crate::commands::COMMANDS.contains(&c.name.as_str()) {
+        true => c.key(),
+        false => c.name.clone(),
+    }
+}
+
+/// Whether a key in a connection's block holds a secret, which is shown only
+/// as being there: libpq's `password` and `sslpassword`, and MySQL's
+/// `password` with its multi-factor `password1` to `password3`.
+pub fn is_secret_key(engine: Engine, key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    match engine {
+        Engine::Pg => matches!(key.as_str(), "password" | "sslpassword"),
+        Engine::MySql => matches!(
+            key.as_str(),
+            "password" | "password1" | "password2" | "password3"
+        ),
+        Engine::Sqlite | Engine::MsSql => key == "password",
+    }
 }
 
 /// One connection by the name the CLI is given: bare `prod`, or `pg:prod` when
@@ -1015,6 +1115,31 @@ fn package(manager: PackageManager, engine: Engine) -> Option<&'static str> {
     }
 }
 
+/// A program easysql runs besides the database clients, which it offers to
+/// install when it is missing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// `ssh`, which every tunnel runs.
+    Ssh,
+    /// `wl-copy`, the clipboard in a Wayland session.
+    WlClipboard,
+    /// `xclip`, the clipboard in an X11 session.
+    Xclip,
+}
+
+/// What each tool's package is called, per manager, every cell checked by
+/// installing it. Exhaustive for the same reason `package` is.
+fn tool_package(manager: PackageManager, tool: Tool) -> &'static str {
+    use PackageManager::{Apk, Apt, Dnf, Pacman, Zypper};
+    match (manager, tool) {
+        (Apt | Apk, Tool::Ssh) => "openssh-client",
+        (Pacman, Tool::Ssh) => "openssh",
+        (Dnf | Zypper, Tool::Ssh) => "openssh-clients",
+        (Apt | Pacman | Dnf | Zypper | Apk, Tool::WlClipboard) => "wl-clipboard",
+        (Apt | Pacman | Dnf | Zypper | Apk, Tool::Xclip) => "xclip",
+    }
+}
+
 /// The exact command that would install the client this engine's sessions run
 /// under these settings. `None` on a machine whose package manager we do not
 /// recognise, where the honest answer is to name the program and let the user
@@ -1023,16 +1148,27 @@ pub fn install_argv(engine: Engine, s: &Settings) -> Option<Vec<String>> {
     if engine.uses_usql(s) {
         return None;
     }
+    install_argv_for(Some(engine), &[])
+}
+
+/// One command that installs `client`'s own client and `tools` together, so
+/// one answer installs everything that is missing. `None` when no package
+/// manager we know is on PATH, when the client has no package, or when there
+/// is nothing to install.
+pub fn install_argv_for(client: Option<Engine>, tools: &[Tool]) -> Option<Vec<String>> {
     let manager = PackageManager::detect()?;
-    let pkg = package(manager, engine)?;
     // No `-y`: the modal already asked whether to do this, and the package
     // manager showing what it is about to pull in is information, not noise.
-    Some(vec![
+    let mut argv = vec![
         "sudo".to_string(),
         manager.program().to_string(),
         manager.verb().to_string(),
-        pkg.to_string(),
-    ])
+    ];
+    if let Some(engine) = client {
+        argv.push(package(manager, engine)?.to_string());
+    }
+    argv.extend(tools.iter().map(|t| tool_package(manager, *t).to_string()));
+    (argv.len() > 3).then_some(argv)
 }
 
 /// The hint plus this machine's snippets, when the client can expand them
@@ -1050,11 +1186,19 @@ pub fn hint_line(engine: Engine, s: &Settings, by_name: bool) -> String {
 /// invented for it would be a guess.
 pub fn speaks_client_flags(engine: Engine, s: &Settings) -> bool {
     engine.uses_usql(s)
-        || engine.client_argv(s).iter().any(|w| {
-            std::path::Path::new(w)
-                .file_name()
-                .is_some_and(|f| f == engine.default_client())
-        })
+        || engine
+            .client_argv(s)
+            .iter()
+            .any(|w| is_own_client(engine, w))
+}
+
+/// Whether one word of a configured command is this engine's own client, by
+/// its file name: `psql`, `/usr/bin/psql`, and for MySQL `mariadb`, which is
+/// the same program under MariaDB's name and takes the same flags.
+fn is_own_client(engine: Engine, word: &str) -> bool {
+    std::path::Path::new(word).file_name().is_some_and(|f| {
+        f == engine.default_client() || (engine == Engine::MySql && f == "mariadb")
+    })
 }
 
 /// The half that decides, kept apart from the half that reads the disk, so it
@@ -1113,6 +1257,23 @@ pub fn install_hint(engine: Engine, s: &Settings) -> String {
             None => format!("install your distro's {} package", engine.default_client()),
         },
     }
+}
+
+/// How to get `program` running, when it is what a connect would run: the
+/// install command for this engine's own client or usql, and for a program
+/// the user named in place of it (`pgcli`, a wrapper), that program and the
+/// setting that chose it, since installing the engine's client is not what
+/// they asked for.
+pub fn install_hint_for(engine: Engine, s: &Settings, program: &str) -> String {
+    if is_own_client(engine, program) || (engine.uses_usql(s) && program == "usql") {
+        return install_hint(engine, s);
+    }
+    format!(
+        "install `{program}`, or point `{}` at a client you have: `esql set {} {}`",
+        engine.client_setting(),
+        engine.client_setting(),
+        engine.default_client()
+    )
 }
 
 /// Where a client comes from when no package manager here has it: sqlcmd,

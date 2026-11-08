@@ -40,10 +40,11 @@ impl Snippet {
 }
 
 /// `sql` with every `--` comment cut to the end of its line, except inside a
-/// '…' string, a "…" identifier, a $tag$ body or a `/* … */` block, which is
-/// kept whole (and nests, as the server reads it). Joined onto one line, a
-/// trailing comment would swallow everything after it: `:name` in psql then
-/// runs `select count(*) -- n from t` as `select count(*)`.
+/// '…' string (an `E'…'` one with its backslash escapes), a "…" identifier, a
+/// $tag$ body or a `/* … */` block, which is kept whole (and nests, as the
+/// server reads it). Joined onto one line, a trailing comment would swallow
+/// everything after it: `:name` in psql then runs `select count(*) -- n from
+/// t` as `select count(*)`.
 fn without_line_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;
@@ -58,26 +59,54 @@ fn without_line_comments(sql: &str) -> String {
             rest = &rest[len..];
             continue;
         }
-        let quoted = match c {
-            '\'' | '"' => Some(c.to_string()),
-            '$' => dollar_tag(rest),
+        let mut before = out.chars().rev();
+        let (last, second) = (before.next(), before.next());
+        let len = match c {
+            '\'' => {
+                let escapes =
+                    matches!(last, Some('E' | 'e')) && !second.is_some_and(identifier_char);
+                Some(quoted_len(rest, '\'', escapes))
+            }
+            '"' => Some(quoted_len(rest, '"', false)),
+            // `$` inside a name (`a$b$c`) is part of the name, not a tag.
+            '$' if !last.is_some_and(identifier_char) => dollar_tag(rest).map(|tag| {
+                rest[tag.len()..]
+                    .find(&tag)
+                    .map_or(rest.len(), |i| tag.len() * 2 + i)
+            }),
             _ => None,
         };
-        let Some(close) = quoted else {
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
-            continue;
-        };
-        // A doubled quote inside '…' or "…" closes and reopens it, which this
-        // reads the same as one string.
-        let body = &rest[close.len()..];
-        let len = body
-            .find(&close)
-            .map_or(rest.len(), |i| close.len() * 2 + i);
+        let len = len.unwrap_or(c.len_utf8());
         out.push_str(&rest[..len]);
         rest = &rest[len..];
     }
     out
+}
+
+/// A character that continues a name, `$` included, as the server lexes one.
+fn identifier_char(c: char) -> bool {
+    c == '_' || c == '$' || c.is_alphanumeric()
+}
+
+/// How long the run quoted with `q` at the start of `s` is, closing quote
+/// included, or all of `s` when it never closes. A doubled quote stays inside,
+/// and with `escapes` so does a quote after a backslash.
+fn quoted_len(s: &str, q: char, escapes: bool) -> usize {
+    let mut chars = s.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        if escapes && c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c == q {
+            if s[i + 1..].starts_with(q) {
+                chars.next();
+                continue;
+            }
+            return i + 1;
+        }
+    }
+    s.len()
 }
 
 /// How long the `/* … */` at the start of `s` is, nested ones included, or all
@@ -102,14 +131,20 @@ fn block_comment_len(s: &str) -> usize {
     s.len()
 }
 
-/// Whether psql takes `name` as a variable, so `:name` can expand at its
-/// prompt: letters, digits, `_` and any non-ASCII character. A snippet named
-/// otherwise still runs as `esql <conn> :name`, but gets no `\set`.
+/// Whether psql takes `name` as a variable of the user's own, so `:name` can
+/// expand at its prompt: letters, digits, `_` and any non-ASCII character, and
+/// not all upper case, the style psql keeps for the variables it acts on
+/// itself (`PROMPT1`, `ECHO`, `HISTFILE`), where a `\set` would change psql.
+/// A snippet named otherwise still runs as `esql <conn> :name`, but gets no
+/// `\set`.
 pub fn psql_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c == '_' || c.is_ascii_alphanumeric() || !c.is_ascii())
+    let takes = name
+        .chars()
+        .all(|c| c == '_' || c.is_ascii_alphanumeric() || !c.is_ascii());
+    let psqls_own = name
+        .chars()
+        .all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit());
+    !name.is_empty() && takes && !psqls_own
 }
 
 /// The `$tag$` opening a dollar-quoted string at the start of `s`, if one does;
@@ -144,9 +179,11 @@ pub fn list_in(dir: &std::path::Path) -> Vec<Snippet> {
             if path.extension()? != "sql" {
                 return None;
             }
+            // Listed even when it is not UTF-8, so it is seen and never
+            // taken for a free name; `connect` refuses to run it.
             Some(Snippet {
                 name: path.file_stem()?.to_string_lossy().into_owned(),
-                sql: fs::read_to_string(&path).ok()?,
+                sql: String::from_utf8_lossy(&fs::read(&path).ok()?).into_owned(),
                 path,
             })
         })
@@ -184,6 +221,26 @@ pub fn save_in(dir: &std::path::Path, name: &str, sql: &str) -> Result<PathBuf> 
     };
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// Give a saved query another name, its file moved whole, so nothing in it
+/// changes. A name another query already has is refused.
+pub fn rename(from: &str, to: &str) -> Result<()> {
+    let to = to.trim();
+    if !valid_name(to) {
+        anyhow::bail!("a snippet name cannot be empty, contain a slash, or start with a dot");
+    }
+    if from == to {
+        return Ok(());
+    }
+    let (old, new) = (
+        dir().join(format!("{from}.sql")),
+        dir().join(format!("{to}.sql")),
+    );
+    if new.exists() {
+        anyhow::bail!("a query called '{to}' is already saved");
+    }
+    fs::rename(&old, &new).with_context(|| format!("renaming {}", old.display()))
 }
 
 pub fn delete(name: &str) -> Result<()> {
@@ -229,54 +286,86 @@ pub fn psqlrc_block(snips: &[Snippet]) -> String {
 }
 
 /// Put that block into `~/.psqlrc`, replacing the previous one and copying
-/// every other line through verbatim.
-pub fn sync_psqlrc() -> Result<PathBuf> {
+/// every other line through byte for byte. Returns whether the file changed.
+pub fn sync_psqlrc() -> Result<bool> {
     let path = psqlrc_path();
-    let block = psqlrc_block(&list());
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let body = splice(&existing, &block);
+    let (existing, body) = psqlrc_after(&list())?;
     // Nothing to do is the common case, and it has to cost nothing: this runs on
     // the way into every postgres session, so writing unconditionally would
     // rewrite the file, and take a backup when those are on, on every connect.
     if body == existing {
-        return Ok(path);
+        return Ok(false);
     }
     if path.exists() {
         crate::ini::backup(&path)?;
     }
-    crate::ini::write_atomic(&path, &body)?;
-    Ok(path)
+    crate::ini::write_atomic_bytes(&path, &body)?;
+    Ok(true)
 }
 
+/// Whether `sync_psqlrc` would change the file with `snips` saved, so a dry
+/// run says exactly what the real one does.
+pub fn psqlrc_would_change(snips: &[Snippet]) -> bool {
+    psqlrc_after(snips).is_ok_and(|(now, after)| now != after)
+}
+
+/// `~/.psqlrc` as it is and as it would be with `snips` in its block. A file
+/// that cannot be read is an error, never an empty one to write over.
+fn psqlrc_after(snips: &[Snippet]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let path = psqlrc_path();
+    let existing = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let body = splice_bytes(&existing, &psqlrc_block(snips));
+    Ok((existing, body))
+}
+
+#[cfg(test)]
 /// Replace the marked block, or append one if there is not already a block.
 pub fn splice(existing: &str, block: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut inside = false;
-    let mut replaced = false;
-    for line in existing.lines() {
-        if line.starts_with(START) {
-            inside = true;
-            out.push(block.trim_end().to_string());
-            replaced = true;
-            continue;
-        }
-        if inside {
-            if line.trim() == END {
-                inside = false;
+    String::from_utf8_lossy(&splice_bytes(existing.as_bytes(), block)).into_owned()
+}
+
+/// `splice` over the file's bytes, every line outside the block copied as it
+/// was. A start marker with no end marker below it is a block of that one
+/// line, so the lines after it are never taken. A block with no `\set` in it
+/// removes the old one and adds none, so a machine without snippets never
+/// gains a `~/.psqlrc`.
+fn splice_bytes(existing: &[u8], block: &str) -> Vec<u8> {
+    let lines: Vec<&[u8]> = existing.split_inclusive(|b| *b == b'\n').collect();
+    let text = |l: &[u8]| String::from_utf8_lossy(l.trim_ascii_end()).into_owned();
+    let start = lines.iter().position(|l| text(l).starts_with(START));
+    let end = start.map(|s| {
+        (s + 1..lines.len())
+            .find(|&i| text(lines[i]).trim() == END)
+            .map_or(s + 1, |e| e + 1)
+    });
+    let empty = !block.lines().any(|l| l.starts_with("\\set "));
+    let mut out: Vec<u8> = Vec::with_capacity(existing.len() + block.len() + 2);
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            lines[..s].iter().for_each(|l| out.extend_from_slice(l));
+            if !empty {
+                out.extend_from_slice(block.as_bytes());
             }
-            continue;
+            lines[e..].iter().for_each(|l| out.extend_from_slice(l));
         }
-        out.push(line.to_string());
-    }
-    if !replaced {
-        if !out.is_empty() && !out.last().is_some_and(|l| l.trim().is_empty()) {
-            out.push(String::new());
+        _ => {
+            out.extend_from_slice(existing);
+            if !empty {
+                if !out.is_empty() && !out.ends_with(b"\n") {
+                    out.push(b'\n');
+                }
+                if !out.is_empty() && !out.ends_with(b"\n\n") {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(block.as_bytes());
+            }
         }
-        out.push(block.trim_end().to_string());
     }
-    let mut body = out.join("\n");
-    body.push('\n');
-    body
+    out
 }
 
 #[cfg(test)]
@@ -412,6 +501,16 @@ mod tests {
         assert!(
             block.contains("\\set cnt 'select count(*) from t /* a -- b */ where x = 1'"),
             "{block}"
+        );
+    }
+
+    #[test]
+    fn a_start_marker_with_no_end_takes_only_its_own_line() {
+        let existing = format!("\\set mine 1\n{START}\n\\timing on\n");
+        let out = splice(&existing, &psqlrc_block(&[]));
+        assert_eq!(
+            out, "\\set mine 1\n\\timing on\n",
+            "the user's lines after an unclosed marker must survive"
         );
     }
 }

@@ -3,8 +3,9 @@
 //! `vias::set` and the connection repointed with `engines::save`, the same
 //! three steps the form and its offer take, so a connect afterwards reopens it.
 
-use super::{DryRun, Yes, can_ask, confirm_delete, fail, find_conn, said, shown, step};
-use crate::engines::{self, Conn, NewConn};
+use super::{DryRun, can_ask, confirm_delete, fail, find_conn, said, shown, step};
+use crate::engines::{self, Conn};
+use crate::tunnels::Tunnel;
 use crate::vias::{self, Via};
 
 #[derive(clap::Subcommand)]
@@ -37,11 +38,12 @@ pub struct DownArgs {
     #[arg(value_name = "NAME",
           add = clap_complete::ArgValueCompleter::new(crate::completion::conn_names))]
     name: String,
-    /// Also forget the record, so a connect no longer reopens it
+    /// Also forget the record, so a connect no longer reopens it, and point the connection back at the database
     #[arg(long)]
     forget: bool,
-    #[command(flatten)]
-    yes: Yes,
+    /// With `--forget`, forget it without asking, which is required when there is no terminal to ask on
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
     #[command(flatten)]
     dry: DryRun,
 }
@@ -82,7 +84,7 @@ fn up(args: UpArgs) {
                 v.local, t.spec, t.host
             ));
         }
-        open(&c, v, false, args.dry.dry_run);
+        open(&c, v, None, false, args.dry.dry_run);
         return;
     }
     let settings = crate::settings::load();
@@ -97,13 +99,26 @@ fn up(args: UpArgs) {
             ))
         });
     // A connection already pointed at its own forward asks for 127.0.0.1, so
-    // the far address is the one the record kept, not the one in the block.
+    // its database is the far address the record kept, seen again from the
+    // hop asked for now: `127.0.0.1` meant the old hop, never the new one.
     let (target, port) = match &recorded {
-        Some(v) if vias::points_at_it(&c, v) => (v.target.clone(), v.port.clone()),
+        Some(v) if vias::points_at_it(&c, v) => (
+            vias::forward_target(&host, &vias::far_address(v)),
+            v.port.clone(),
+        ),
         _ => (vias::forward_target(&host, &c.host), c.port_or_default()),
     };
     let local = args.local.unwrap_or_else(|| port.clone());
-    if let Some(t) = crate::tunnels::carrying(&local) {
+    // The forward this connection had is replaced, never left running with
+    // nothing remembering it and no command that could stop it, unless another
+    // connection rides on it too.
+    let replaced = recorded
+        .as_ref()
+        .and_then(crate::tunnels::carrying_via)
+        .filter(|t| vias::sharing(&key, t).is_empty());
+    if let Some(t) = crate::tunnels::carrying(&local)
+        && replaced.as_ref().is_none_or(|r| r.pid != t.pid)
+    {
         fail(&format!(
             "localhost:{local} is already forwarded to {} through {}: pick another with `--local <port>`",
             t.spec, t.host
@@ -115,37 +130,45 @@ fn up(args: UpArgs) {
         port,
         local,
     };
-    open(&c, &via, true, args.dry.dry_run);
+    open(&c, &via, replaced, true, args.dry.dry_run);
 }
 
-/// Open `via`, remember it when it is new, and point the connection at it.
-fn open(c: &Conn, via: &Via, remember: bool, dry: bool) {
+/// Stop the forward `via` replaces, open `via`, remember it when it is new,
+/// and point the connection at it. Each step is printed as it is taken, so a
+/// failure leaves no line for a step that never happened, and a dry run
+/// prints them all.
+fn open(c: &Conn, via: &Via, replaced: Option<Tunnel>, remember: bool, dry: bool) {
+    if let Some(t) = replaced {
+        step(&format!("stop {} (pid {})", t.command(), t.pid));
+        if !dry && let Err(e) = crate::tunnels::kill(t.pid) {
+            fail(&format!("could not stop it: {}", said(&e)));
+        }
+    }
     step(&format!("open {}", via.command()));
+    if !dry && let Err(e) = crate::tunnels::open('L', &via.spec(), &via.host) {
+        fail(&format!("ssh did not open the tunnel: {}", said(&e)));
+    }
     if remember {
         step(&format!(
             "remember it for {} in {}",
             c.key(),
             shown(&vias::store_path())
         ));
+        if !dry && let Err(e) = vias::set(&c.key(), via) {
+            fail(&format!(
+                "the tunnel is open, but it was not remembered: {}",
+                said(&e)
+            ));
+        }
     }
-    let moves = !vias::points_at_it(c, via);
-    if moves {
+    if !vias::points_at_it(c, via) {
         step(&point_line(c, &via.local));
-    }
-    if dry {
-        return;
-    }
-    if let Err(e) = crate::tunnels::open('L', &via.spec(), &via.host) {
-        fail(&format!("ssh did not open the tunnel: {}", said(&e)));
-    }
-    if remember && let Err(e) = vias::set(&c.key(), via) {
-        fail(&format!(
-            "the tunnel is open, but it was not remembered: {}",
-            said(&e)
-        ));
-    }
-    if moves {
-        save_pointed(c, &via.local);
+        if !dry && let Err(e) = engines::repoint(c, "127.0.0.1", &via.local) {
+            fail(&format!(
+                "the tunnel is open, but the connection was not pointed at it: {}",
+                said(&e)
+            ));
+        }
     }
 }
 
@@ -156,8 +179,11 @@ fn repoint(c: &Conn, local: &str, dry: bool) {
         return;
     }
     step(&point_line(c, local));
-    if !dry {
-        save_pointed(c, local);
+    if !dry && let Err(e) = engines::repoint(c, "127.0.0.1", local) {
+        fail(&format!(
+            "the tunnel is open, but the connection was not pointed at it: {}",
+            said(&e)
+        ));
     }
 }
 
@@ -167,25 +193,6 @@ fn point_line(c: &Conn, local: &str) -> String {
         c.key(),
         shown(&c.engine.store())
     )
-}
-
-/// Rewrite the block's host and port and nothing else, as the repoint offer does.
-fn save_pointed(c: &Conn, local: &str) {
-    let nc = NewConn {
-        engine: c.engine,
-        name: c.name.clone(),
-        host: "127.0.0.1".into(),
-        port: local.to_string(),
-        database: c.database.clone(),
-        user: c.user.clone(),
-        extra: c.extra.clone(),
-    };
-    if let Err(e) = engines::save(Some(&c.name), &nc) {
-        fail(&format!(
-            "the tunnel is open, but the connection was not pointed at it: {}",
-            said(&e)
-        ));
-    }
 }
 
 fn down(args: DownArgs) {
@@ -198,9 +205,13 @@ fn down(args: DownArgs) {
         ));
     };
     let live = crate::tunnels::carrying_via(&via);
+    let others = live
+        .as_ref()
+        .map(|t| vias::sharing(&key, t))
+        .unwrap_or_default();
     let what = format!("the tunnel record for {key}");
     if args.forget {
-        can_ask(&what, args.yes.yes, args.dry.dry_run);
+        can_ask(&what, args.yes, args.dry.dry_run);
     }
     if live.is_none() && !args.forget {
         step(&format!(
@@ -208,20 +219,34 @@ fn down(args: DownArgs) {
         ));
         return;
     }
+    // Forgetting this connection's record leaves running a forward another
+    // connection rides on; stopping it is what a plain `down` asks for.
+    let live = live.filter(|_| !args.forget || others.is_empty());
     if let Some(t) = &live {
-        step(&format!(
-            "stop ssh -N -L {} {} (pid {})",
-            t.spec, t.host, t.pid
-        ));
+        let also = match others.is_empty() {
+            true => String::new(),
+            false => format!(", which {} uses too", others.join(", ")),
+        };
+        step(&format!("stop {} (pid {}){also}", t.command(), t.pid));
     }
     if args.forget {
         step(&format!("forget it in {}", shown(&vias::store_path())));
+        // The record is the only place the real address is kept once the
+        // connection points at its forward, so it goes back there first.
+        if vias::points_at_it(&c, &via) {
+            step(&format!(
+                "point {key} back at {}:{} in {}",
+                vias::far_address(&via),
+                via.port,
+                shown(&c.engine.store())
+            ));
+        }
     }
     if args.dry.dry_run {
         return;
     }
     if args.forget {
-        confirm_delete(&what, None, args.yes.yes);
+        confirm_delete(&what, None, args.yes);
     }
     if let Some(t) = live
         && let Err(e) = crate::tunnels::kill(t.pid)
@@ -229,7 +254,7 @@ fn down(args: DownArgs) {
         fail(&format!("could not stop it: {}", said(&e)));
     }
     if args.forget
-        && let Err(e) = vias::remove(&key)
+        && let Err(e) = vias::forget(&c)
     {
         fail(&format!(
             "stopped, but the record was not forgotten: {}",

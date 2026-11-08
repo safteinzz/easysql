@@ -44,11 +44,11 @@ fn update(args: UpdateArgs) {
         std::process::exit(1);
     }
     if !args.yes && !confirm() {
-        println!("{}", "Aborted.".dimmed());
+        outln!("{}", "Aborted.".dimmed());
         return;
     }
 
-    println!(
+    outln!(
         "{} {}\n",
         "Updating easysql via".dimmed(),
         "cargo install easysql --force".bold()
@@ -59,14 +59,18 @@ fn update(args: UpdateArgs) {
         .status()
     {
         Ok(status) if status.success() => {
-            println!("\n{}", "✓ easysql is up to date.".green());
+            outln!("\n{}", "✓ easysql is up to date.".green());
         }
         Ok(status) => {
             eprintln!("\n{}", "✗ update failed.".red());
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(e) => {
-            eprintln!("{} {e}", "esql: could not run cargo:".red());
+            eprintln!(
+                "{} {}",
+                "esql: could not run cargo:".red(),
+                super::io_said(&e)
+            );
             eprintln!(
                 "{}",
                 "is cargo installed and on your PATH? (https://rustup.rs)".dimmed()
@@ -83,16 +87,16 @@ fn check() {
     let current = env!("CARGO_PKG_VERSION");
     match latest() {
         Ok(latest) if newer(&latest, current) => {
-            println!(
+            outln!(
                 "{} {} {}",
                 format!("easysql {latest}").bold(),
                 "is available, you have".dimmed(),
                 current.bold()
             );
-            println!("{} {}", "run".dimmed(), "esql self update".bold());
+            outln!("{} {}", "run".dimmed(), "esql self update".bold());
             std::process::exit(1);
         }
-        Ok(_) => println!(
+        Ok(_) => outln!(
             "{} {}",
             format!("easysql {current}").bold(),
             "is the latest release.".dimmed()
@@ -110,7 +114,7 @@ fn latest() -> Result<String, String> {
     let out = Command::new("cargo")
         .args(["search", CRATE, "--limit", "1"])
         .output()
-        .map_err(|e| format!("could not run cargo: {e}"))?;
+        .map_err(|e| format!("could not run cargo: {}", super::io_said(&e)))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -123,15 +127,44 @@ fn latest() -> Result<String, String> {
         .ok_or_else(|| format!("the registry did not list `{CRATE}`"))
 }
 
-/// Compare dotted versions field by field, so `0.10.0` correctly beats `0.9.9`
-/// where a plain string compare would not.
+/// Whether release `a` is newer than `b`, in semver's order: the dotted
+/// numbers field by field, so `0.10.0` beats `0.9.9` where a string compare
+/// would not, then a release above its own pre-releases (`0.6.0` over
+/// `0.6.0-rc.1`), and pre-releases by their dotted parts, numbers below words.
 fn newer(a: &str, b: &str) -> bool {
-    let fields = |v: &str| {
-        v.split(['.', '-'])
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
+    use std::cmp::Ordering;
+    let parse = |v: &str| {
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, pre) = match v.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (v, None),
+        };
+        let core: Vec<u64> = core.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        (
+            core,
+            pre.map(|p| p.split('.').map(str::to_string).collect::<Vec<_>>()),
+        )
     };
-    fields(a) > fields(b)
+    let ((a_core, a_pre), (b_core, b_pre)) = (parse(a), parse(b));
+    if a_core != b_core {
+        return a_core > b_core;
+    }
+    match (a_pre, b_pre) {
+        (None, Some(_)) => true,
+        (Some(x), Some(y)) => x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| match (p.parse::<u64>(), q.parse::<u64>()) {
+                (Ok(m), Ok(n)) => m.cmp(&n),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => p.cmp(q),
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or_else(|| x.len().cmp(&y.len()))
+            .is_gt(),
+        _ => false,
+    }
 }
 
 /// Ask the user to confirm. Defaults to No, so a bare Enter cancels.
