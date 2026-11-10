@@ -11,8 +11,8 @@
 //! We `exec` (replace this process) so the client owns the terminal cleanly,
 //! except under `--md`, where the client runs as a child so its rows can be
 //! redrawn as markdown, and for a usql run holding a passfile or a service
-//! file, which a child has to outlive so it can be deleted. `--dump` execs the
-//! engine's dump tool instead.
+//! file, which a child has to outlive so it can be deleted. `--dump` and
+//! `--restore` exec the engine's dump and restore tools instead.
 
 use colored::Colorize;
 
@@ -151,26 +151,32 @@ fn run_then_forget(
 }
 
 /// Replace this process with `program`, so it owns the terminal and its exit
-/// status is ours. `install` is what the failure says to do about it.
-fn exec(program: &str, args: &[String], env: Vec<(String, String)>, install: &str) -> ! {
+/// status is ours, reading `stdin` instead of ours when given. `install` is
+/// what the failure says to do about it.
+fn exec(
+    program: &str,
+    args: &[String],
+    env: Vec<(String, String)>,
+    stdin: Option<std::fs::File>,
+    install: &str,
+) -> ! {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).envs(env);
+    if let Some(f) = stdin {
+        cmd.stdin(f);
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // exec never returns on success; the client takes over this PID and terminal.
-        let err = std::process::Command::new(program)
-            .args(args)
-            .envs(env)
-            .exec();
+        let err = cmd.exec();
         could_not_run(program, &err, install);
     }
 
     #[cfg(not(unix))]
     {
-        match std::process::Command::new(program)
-            .args(args)
-            .envs(env)
-            .status()
-        {
+        match cmd.status() {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(e) => could_not_run(program, &e, install),
         }
@@ -251,7 +257,16 @@ fn dump(conn: &crate::engines::Conn, db: Option<&str>, mut rest: Vec<String>) ->
         std::process::exit(2);
     };
     let (program, args) = argv.split_first().expect("dump_argv is never empty");
-    // The dump tool is the engine's own whichever client opens its sessions.
+    let install = need_engine_tool(conn, program);
+    reopen_tunnel(conn);
+    crate::history::record(&conn.key());
+    exec(program, args, Vec::new(), None, &install)
+}
+
+/// Exit 127 naming the install command when `program`, one of the engine's own
+/// tools whichever client opens its sessions, is not on PATH; else that command,
+/// for `exec` to name should starting it fail.
+fn need_engine_tool(conn: &crate::engines::Conn, program: &str) -> String {
     let install = crate::engines::install_hint(conn.engine, &crate::settings::Settings::default());
     if !crate::engines::on_path(program) {
         eprintln!(
@@ -262,12 +277,122 @@ fn dump(conn: &crate::engines::Conn, db: Option<&str>, mut rest: Vec<String>) ->
         eprintln!("      {}  {}", "install it:".dimmed(), install.bold());
         std::process::exit(127);
     }
-    reopen_tunnel(conn);
-    crate::history::record(&conn.key());
-    exec(program, args, Vec::new(), &install)
+    install
 }
 
-pub fn run(args: Vec<String>, md: bool, dump: bool) {
+/// `esql --restore <name> <file> [args]`: the engine's restore tool takes this
+/// process and loads `file` into the connection, its output and exit status the
+/// tool's own. Words after the file are the tool's, a leading `--` dropped.
+fn restore(conn: &crate::engines::Conn, db: Option<&str>, mut rest: Vec<String>) -> ! {
+    use crate::engines::Engine;
+    if conn.engine == Engine::MsSql {
+        eprintln!(
+            "{}",
+            "esql: `--restore` cannot restore SQL Server, since it has no dump file of its own."
+                .red()
+        );
+        eprintln!(
+            "{}",
+            "      a script runs with `esql <name> -b -i app.sql` (-b exits 1 on an error), a `.bak` with `RESTORE DATABASE` on the server."
+                .dimmed()
+        );
+        std::process::exit(2);
+    }
+    if rest.first().is_some_and(|a| a == "--") {
+        rest.remove(0);
+    }
+    let usage = |headline: &str| -> ! {
+        eprintln!("{}", format!("esql: {headline}").red());
+        eprintln!(
+            "{}",
+            "      the file goes first, the tool's flags after it: `esql --restore <name> app.dump --clean`"
+                .dimmed()
+        );
+        std::process::exit(2);
+    };
+    match rest.first() {
+        None => usage("`--restore` needs the file to load."),
+        Some(first) if first.starts_with('-') => usage(&format!(
+            "`{first}` is a flag, where `--restore` wants the file."
+        )),
+        Some(_) => {}
+    }
+    let file = rest.remove(0);
+    if rest.first().is_some_and(|a| a == "--") {
+        rest.remove(0);
+    }
+    if conn.engine == Engine::Sqlite && !rest.is_empty() {
+        eprintln!(
+            "{}",
+            "esql: a SQLite restore takes nothing after the file, since sqlite3 reads a bare word as the database to open."
+                .red()
+        );
+        std::process::exit(2);
+    }
+    if conn.read_only() {
+        eprintln!(
+            "{}",
+            format!(
+                "esql: `{}` is read-only, so nothing can be restored into it.",
+                conn.name
+            )
+            .red()
+        );
+        eprintln!(
+            "{}",
+            format!(
+                "      turn it off for the load: `esql conn edit {} --read-only off`",
+                conn.key()
+            )
+            .dimmed()
+        );
+        std::process::exit(2);
+    }
+    let unreadable = |e: std::io::Error| -> ! {
+        eprintln!(
+            "{}",
+            format!("esql: could not read `{file}`: {}", super::io_said(&e)).red()
+        );
+        std::process::exit(2);
+    };
+    let archive = match conn.engine {
+        Engine::Pg => crate::engines::pg::is_archive(std::path::Path::new(&file))
+            .unwrap_or_else(|e| unreadable(e)),
+        _ => false,
+    };
+    // A directory on stdin reads as an empty dump to sqlite3, which then exits 0.
+    if conn.engine != Engine::Pg
+        && std::fs::metadata(&file)
+            .unwrap_or_else(|e| unreadable(e))
+            .is_dir()
+    {
+        eprintln!(
+            "{}",
+            format!(
+                "esql: `{file}` is a directory, and only a Postgres archive (`pg_dump -Fd`) is one."
+            )
+            .red()
+        );
+        std::process::exit(2);
+    }
+    let plan = conn
+        .restore_argv(db, &file, archive, &rest)
+        .expect("only SQL Server has no restore tool");
+    let stdin = match plan.stdin {
+        true => Some(std::fs::File::open(&file).unwrap_or_else(|e| unreadable(e))),
+        false => None,
+    };
+    let (program, args) = plan
+        .argv
+        .split_first()
+        .expect("restore_argv is never empty");
+    let install = need_engine_tool(conn, program);
+    reopen_tunnel(conn);
+    crate::history::record(&conn.key());
+    exec(program, args, Vec::new(), stdin, &install)
+}
+
+pub fn run(args: Vec<String>, md: bool, dump: bool, restore: bool) {
     if args.is_empty() {
         eprintln!(
             "{}",
@@ -304,6 +429,9 @@ pub fn run(args: Vec<String>, md: bool, dump: bool) {
     let rest: Vec<String> = args.into_iter().skip(1).collect();
     if dump {
         self::dump(&conn, db.as_deref(), rest);
+    }
+    if restore {
+        self::restore(&conn, db.as_deref(), rest);
     }
     // Nothing after the connection name means a session is being opened rather
     // than a one-shot query. Asked before `rest` is consumed below.
@@ -544,5 +672,5 @@ pub fn run(args: Vec<String>, md: bool, dump: bool) {
     }
     let mut env = env;
     env.extend(secret.env);
-    exec(&program, &rest, env, &install);
+    exec(&program, &rest, env, None, &install);
 }

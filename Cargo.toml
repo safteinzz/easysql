@@ -7,7 +7,7 @@ description = "getting to the sql prompt, quick and easy - saved connections, th
 authors = ["Pablo Antonio Hernández Hernández (safteinzz)"]
 license = "AGPL-3.0-only"
 readme = "README.md"
-repository = "https://gitlab.com/safteinzz/easysql"
+repository = "https://github.com/safteinzz/easysql"
 keywords = ["postgres", "mysql", "sql", "tui", "cli"]
 categories = ["command-line-utilities", "database"]
 # README screenshots are fetched over the network by crates.io via absolute raw
@@ -16,7 +16,7 @@ exclude = ["readme-assets/", "demo/", "dev/"]
 
 # The programs esql starts, for tools that ask what an install needs beside its libraries.
 [package.metadata]
-runs = ["psql", "pg_dump", "mysql", "mysqldump", "sqlite3", "sqlcmd", "usql", "ssh", "kill", "wl-copy", "xclip", "xsel", "pbcopy", "sudo", "apt-get", "pacman", "dnf", "zypper", "apk", "nano", "vi"]
+runs = ["psql", "pg_dump", "pg_restore", "mysql", "mysqldump", "sqlite3", "sqlcmd", "usql", "ssh", "kill", "wl-copy", "xclip", "xsel", "pbcopy", "sudo", "apt-get", "pacman", "dnf", "zypper", "apk", "nano", "vi"]
 
 # The crate is `easysql`, but the command you type is the shorter `esql`
 # (sql + one letter).

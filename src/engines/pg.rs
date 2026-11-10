@@ -224,6 +224,27 @@ pub fn conninfo(name: &str, db: Option<&str>) -> String {
     }
 }
 
+/// True when `path` is a pg_dump archive for pg_restore rather than SQL for
+/// psql: a directory (`-Fd`), or a file opening with the custom format's
+/// `PGDMP` (`-Fc`) or carrying tar's `ustar` mark (`-Ft`). Anything but a plain
+/// file or directory is SQL, never read here, since what a pipe gives up to
+/// this check never reaches the tool.
+pub fn is_archive(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
+        return Ok(true);
+    }
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    let mut head = Vec::with_capacity(262);
+    std::fs::File::open(path)?
+        .take(262)
+        .read_to_end(&mut head)?;
+    Ok(head.starts_with(b"PGDMP") || head.get(257..262) == Some(b"ustar".as_slice()))
+}
+
 /// libpq conninfo quoting: single quotes around a value with whitespace in it,
 /// a backslash before a quote or a backslash.
 fn quote(v: &str) -> String {

@@ -45,14 +45,15 @@ const TEMPLATE: &str =
 /// Shown under `esql --help`, above the command list: the shapes clap cannot
 /// list, because most of this tool is not a subcommand.
 const WAYS: &str = "\x1b[1mWays to run it (not subcommands):\x1b[0m
-  esql                       open the toolbox (TUI): connections, passwords, tunnels, saved queries
-  esql <name>                open a saved connection (`esql prod`, or `esql pg:prod` when the name is shared or a command)
-  esql <name>/<db>           the same connection, another database on that server
-  esql <name> 'select 1'     run one query and exit, the way `ssh host 'cmd'` does
-  esql <name> :<query>       run a saved query (`esql snippet ls` lists them)
-  esql <name> [client args]  anything else goes to the client (`esql prod -c 'select 1'`)
-  esql --md <name> ...       a query or a saved query as above, its rows printed as markdown tables
-  esql --dump <name>[/<db>]  print the database as SQL (`> app.sql`), any words after it going to the dump tool";
+  esql                                 open the toolbox (TUI): connections, passwords, tunnels, saved queries
+  esql <name>                          open a saved connection (`esql prod`, or `esql pg:prod` when the name is shared or a command)
+  esql <name>/<db>                     the same connection, another database on that server
+  esql <name> 'select 1'               run one query and exit, the way `ssh host 'cmd'` does
+  esql <name> :<query>                 run a saved query (`esql snippet ls` lists them)
+  esql <name> [client args]            anything else goes to the client (`esql prod -c 'select 1'`)
+  esql --md <name> ...                 a query or a saved query as above, its rows printed as markdown tables
+  esql --dump <name>[/<db>]            print the database as SQL (`> app.sql`), any words after it going to the dump tool
+  esql --restore <name>[/<db>] <file>  load a dump into it (`esql --restore prod/app app.sql`), any words after the file going to the restore tool";
 
 /// The rest of the block: the words the output uses, what a script can
 /// expect, then where to look next.
@@ -67,13 +68,15 @@ What it prints:
 
 A connect hands the terminal to the client: once it starts, stdout, stderr and
 the exit code are the client's own, rows or the dump on stdout. Before that
-easysql exits 2 for a name, snippet, `/db`, `--md` or `--dump` it cannot use,
-127 when there is no client to run, and 1 when a tunnel it needs will not open
-or a read-only connection would not be read-only. Everything after `--` reaches
-the client untouched. Every other command prints its result on stdout and its
+easysql exits 2 for a name, snippet, `/db`, `--md`, `--dump` or `--restore` it
+cannot use (a read-only connection takes no restore), 127 when there is no
+client to run, and 1 when a tunnel it needs will not open or a read-only
+connection would not be read-only. Everything after `--` reaches the client
+untouched. Every other command prints its result on stdout and its
 errors on stderr, exiting 1 on a failure and 2 on a usage error (`self check`
-has codes of its own, in `esql self --help`): a command that changes something
-prints one line per step, and -n prints the same lines and changes nothing.
+has codes of its own, in `esql self --help`): a command that changes
+something prints one line per step, and --dry-run prints the same lines and
+changes nothing.
 `rm` and `down` take one name each, so every delete names what it loses, and a
 script loops over `ls` for more.
 Nothing asks without a terminal: a delete asks first only on one, and -y
@@ -118,6 +121,9 @@ struct Cli {
     /// Print the database as SQL with pg_dump, mysqldump or sqlite3, not for SQL Server; goes before the connection name
     #[arg(long, conflicts_with = "md")]
     dump: bool,
+    /// Load a dump file with psql, pg_restore, mysql or sqlite3, not for SQL Server; goes before the connection name
+    #[arg(long, conflicts_with_all = ["md", "dump"])]
+    restore: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -182,6 +188,10 @@ fn main() {
         eprintln!("esql: `--dump` needs a connection: `esql --dump <name> > dump.sql`.");
         std::process::exit(2);
     }
+    if cli.restore && !matches!(cli.command, Some(Cmd::Connect(_))) {
+        eprintln!("esql: `--restore` needs a connection: `esql --restore <name> dump.sql`.");
+        std::process::exit(2);
+    }
     // Every command that rewrites a user's file keeps the copies the setting asks for.
     if cli.command.is_some() {
         ini::set_backups(settings::load().backups);
@@ -210,6 +220,6 @@ fn main() {
         Some(Cmd::Set(args)) => commands::set::run(args),
         Some(Cmd::Completions(args)) => commands::completions::run(args, Cli::command()),
         Some(Cmd::Selfie(cmd)) => commands::selfcmd::run(cmd),
-        Some(Cmd::Connect(args)) => commands::connect::run(args, cli.md, cli.dump),
+        Some(Cmd::Connect(args)) => commands::connect::run(args, cli.md, cli.dump, cli.restore),
     }
 }

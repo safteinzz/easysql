@@ -1,7 +1,5 @@
 # easysql (`esql`)
 
-> **Canonical:** [gitlab.com/safteinzz/easysql](https://gitlab.com/safteinzz/easysql) · **Mirror:** [github.com/safteinzz/easysql](https://github.com/safteinzz/easysql)
-
 <!-- desc:start -->
 getting to the sql prompt, quick and easy - saved connections, their passwords and their tunnels in one CLI + TUI
 <!-- desc:end -->
@@ -18,7 +16,7 @@ No cargo yet? Rust installs the same way on every distro: [rustup.rs](https://ru
 
 ## Browse and connect
 
-![Moving down the connection list to a postgres connection whose tunnel is not running, the tunnel reopening into a real psql session, then that forward turned off on the Tunnels tab](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/browse.gif)
+![Moving down the connection list to a postgres connection whose tunnel is not running, the tunnel reopening into a real psql session, then that forward turned off on the Tunnels tab](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/browse.gif)
 
 Legend: green answered · red did not · yellow its tunnel is not running · `pw` a password on file · `no client` its program is missing · blue name refuses writes
 
@@ -31,7 +29,7 @@ A forward dies with a reboot, but the connection that needs it remembers it, so 
 
 ## Edit a connection
 
-![Editing a postgres connection: the preview follows the database as it is typed, then Read only is switched on and the saved connection's name turns blue](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/edit.gif)
+![Editing a postgres connection: the preview follows the database as it is typed, then Read only is switched on and the saved connection's name turns blue](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/edit.gif)
 
 ```bash
 esql analytics 'select count(*) from orders'   # rows, as usual
@@ -39,32 +37,32 @@ esql analytics 'truncate orders'               # ERROR: cannot execute TRUNCATE 
 esql ls -v                                     # marks it (read-only)
 ```
 
-![esql ls -v printing seven connections with their engine, name and user@host:port/database, one marked read-only](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/ls.png)
+![esql ls -v printing seven connections with their engine, name and user@host:port/database, one marked read-only](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/ls.png)
 
 **Read only** makes every session refuse writes, and easysql asks the server whether it really does before going in. It is a guardrail, not a permission, so a production database also wants a role granted nothing but `SELECT`.
 
 ## Passwords, where the client looks
 
-![Saving a password for the one connection without one, typed as dots, then the Passwords tab listing it among the others, never shown](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/passwords.gif)
+![Saving a password for the one connection without one, typed as dots, then the Passwords tab listing it among the others, never shown](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/passwords.gif)
 
 Typed once, written straight to the file that engine's client reads, and never shown, echoed or put in an argv.
 
 ## Saved queries
 
-![Making a saved query in the Snippets tab as one line, then its file open in vim with a longer version pasted in, which the details panel then shows](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippets.gif)
+![Making a saved query in the Snippets tab as one line, then its file open in vim with a longer version pasted in, which the details panel then shows](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/snippets.gif)
 
 ```bash
 esql app :tables       # → psql … -c
 esql notes :tables     # → sqlite3 … (bare argument)
 ```
 
-![Running esql app :tables from the shell, printing the table list from the connection](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/snippet-run.png)
+![Running esql app :tables from the shell, printing the table list from the connection](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/snippet-run.png)
 
 The check you keep rewriting, kept as a `.sql` file: the same `:name` runs on every engine, and on Postgres it also expands at the psql prompt.
 
 ## Your defaults, not mine
 
-![The Settings tab showing seventeen settings grouped into behaviour, usql and defaults, with the details panel explaining the selected one and naming the key it writes](https://gitlab.com/safteinzz/easysql/-/raw/main/readme-assets/settings.png)
+![The Settings tab showing seventeen settings grouped into behaviour, usql and defaults, with the details panel explaining the selected one and naming the key it writes](https://raw.githubusercontent.com/safteinzz/easysql/main/readme-assets/settings.png)
 
 Which program opens each engine, whether ports are checked, what order the list is in. `d` puts any of them back.
 
@@ -88,6 +86,7 @@ esql prod/reporting                          # the same connection, another data
 esql prod -c 'select 1'                      # anything starting with - goes to the client
 esql --md prod -f q.sql                      # the rows as markdown tables, ready to paste
 esql --dump prod > prod.sql                  # back it up with pg_dump, mysqldump or sqlite3
+esql --restore prod prod.sql -1              # load it back, all or nothing (-1 is Postgres's)
 esql ls                                      # list them, one name per line
 esql conn add pg prod --host db.example.com  # save one where psql reads it
 esql conn edit prod --read-only              # change only what you name
@@ -104,7 +103,7 @@ esql set backups 5                           # change a setting, and `esql set` 
 
 `esql <command> --help` has the details, and `?` in the toolbox lists every key.
 
-For a script: nothing asks without a terminal (`-y` answers a delete, `pw set --stdin` reads a pipe), `-n` prints the steps without taking them, `--json` has fixed field names, and once the client starts the exit code is its own.
+For a script: nothing asks without a terminal (`-y` answers a delete, `pw set --stdin` reads a pipe), `--dry-run` prints the steps without taking them, `--json` has fixed field names, and once the client starts the exit code is its own.
 
 ## Tab completion
 

@@ -265,22 +265,29 @@ fn a_dry_run_changes_no_file() {
                 "other",
                 "--host",
                 "db.example.com",
-                "-n",
+                "--dry-run",
             ][..],
             "",
         ),
         (
             &[
-                "conn", "edit", "app", "--port", "6543", "--rename", "app2", "-n",
+                "conn",
+                "edit",
+                "app",
+                "--port",
+                "6543",
+                "--rename",
+                "app2",
+                "--dry-run",
             ],
             "",
         ),
-        (&["conn", "rm", "app", "-y", "-n"], ""),
-        (&["pw", "set", "app", "--stdin", "-n"], "s3cret\n"),
-        (&["snippet", "add", "q2", "select 2", "-n"], ""),
-        (&["snippet", "rm", "q", "-y", "-n"], ""),
-        (&["set", "backups", "3", "-n"], ""),
-        (&["set", "hints", "--default", "-n"], ""),
+        (&["conn", "rm", "app", "-y", "--dry-run"], ""),
+        (&["pw", "set", "app", "--stdin", "--dry-run"], "s3cret\n"),
+        (&["snippet", "add", "q2", "select 2", "--dry-run"], ""),
+        (&["snippet", "rm", "q", "-y", "--dry-run"], ""),
+        (&["set", "backups", "3", "--dry-run"], ""),
+        (&["set", "hints", "--default", "--dry-run"], ""),
     ] {
         let out = s.esql_fed(args, stdin);
         assert!(out.status.success(), "{args:?} should succeed: {out:?}");
@@ -288,6 +295,137 @@ fn a_dry_run_changes_no_file() {
             !out.stdout.is_empty(),
             "{args:?} should print the steps it would take"
         );
-        assert!(s.files() == before, "{args:?} with -n changed a file");
+        assert!(
+            s.files() == before,
+            "{args:?} with --dry-run changed a file"
+        );
+    }
+}
+
+/// The tool a Postgres `--restore` handed `file` to, from the stand-ins' logs.
+fn restored_by(s: &Stage, file: &std::path::Path) -> &'static str {
+    let file = file.display().to_string();
+    let psql = s.log("psql");
+    let pg_restore = s.log("pg_restore");
+    match (psql.contains(&file), pg_restore.contains(&file)) {
+        (true, false) => "psql",
+        (false, true) => "pg_restore",
+        _ => panic!(
+            "expected exactly one tool to get {file}\npsql: {psql}\npg_restore: {pg_restore}"
+        ),
+    }
+}
+
+#[test]
+fn a_postgres_restore_sends_archives_to_pg_restore_and_sql_to_psql() {
+    let s = pg_stage("");
+    s.client("psql", "", "");
+    s.client("pg_restore", "", "");
+
+    let mut tar = vec![0u8; 512];
+    tar[257..262].copy_from_slice(b"ustar");
+    let dir = s.0.join("app.dir");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("toc.dat"), b"PGDMP").unwrap();
+    for (name, body, tool) in [
+        ("app.dump", b"PGDMP\x01\x0e\x00".to_vec(), "pg_restore"),
+        ("app.tar", tar, "pg_restore"),
+        ("app.sql", b"create table t (i int);\n".to_vec(), "psql"),
+    ] {
+        let path = s.0.join(name);
+        fs::write(&path, body).unwrap();
+        let out = s.esql(&["--restore", "prod", path.to_str().unwrap()]);
+        assert!(out.status.success(), "{name}: {out:?}");
+        assert_eq!(
+            restored_by(&s, &path),
+            tool,
+            "{name} went to the wrong tool"
+        );
+    }
+    let out = s.esql(&["--restore", "prod", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        restored_by(&s, &dir),
+        "pg_restore",
+        "a `pg_dump -Fd` directory is an archive"
+    );
+}
+
+#[test]
+fn a_postgres_restore_from_a_pipe_never_reads_it_first() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let s = pg_stage("");
+    s.client("psql", "", "");
+    s.client("pg_restore", "", "");
+    let fifo = s.0.join("app.pipe");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    // An archive's mark waits in the pipe, so a peek would send it to pg_restore.
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok(mut w) = fs::OpenOptions::new().write(true).open(&fifo) {
+                let _ = w.write_all(b"PGDMP");
+            }
+        })
+    };
+    let out = s.esql(&["--restore", "prod", fifo.to_str().unwrap()]);
+    // Lets the writer's open return whether or not esql opened the pipe.
+    let _unblock = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o4000) // O_NONBLOCK on Linux
+        .open(&fifo)
+        .unwrap();
+    writer.join().unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        restored_by(&s, &fifo),
+        "psql",
+        "bytes read from a pipe never reach the tool, so a pipe is SQL, never peeked"
+    );
+}
+
+#[test]
+fn a_restore_it_refuses_runs_no_tool_and_changes_no_file() {
+    let s = pg_stage("");
+    s.client("psql", "", "");
+    s.client("pg_restore", "", "");
+    s.file(
+        ".config/easysql/mssql.conf",
+        "[reporting]\nhost=db.example.com\nuser=sa\n",
+        0o644,
+    );
+    s.client("sqlcmd", "", "");
+    let dump = s.0.join("app.dump");
+    fs::write(&dump, b"PGDMP").unwrap();
+    let dump = dump.to_str().unwrap().to_string();
+    let missing = s.0.join("nope.sql").to_str().unwrap().to_string();
+    let before = s.files();
+
+    for (args, why) in [
+        (
+            vec!["--restore", "ro", &dump],
+            "a read-only connection takes no restore",
+        ),
+        (
+            vec!["--restore", "reporting", &dump],
+            "SQL Server has no restore tool",
+        ),
+        (vec!["--restore", "prod", &missing], "the file is missing"),
+        (
+            vec!["--restore", "prod", "--clean", &dump],
+            "a flag where the file goes is not read as the file",
+        ),
+        (vec!["--restore", "prod"], "there is no file"),
+    ] {
+        let out = s.esql(&args);
+        assert_eq!(out.status.code(), Some(2), "{why}: {out:?}");
+        assert!(
+            s.files() == before,
+            "{why}: the refused run ran a tool or wrote a file"
+        );
     }
 }

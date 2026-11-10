@@ -39,11 +39,11 @@ pub const COMMANDS: [&str; 9] = [
     "help",
 ];
 
-/// `-n`, shared by every command that changes something.
+/// `--dry-run`, shared by every command that changes something.
 #[derive(clap::Args)]
 pub struct DryRun {
     /// Dry run: print the steps it would take and change nothing
-    #[arg(short = 'n', long = "dry-run")]
+    #[arg(long = "dry-run")]
     pub dry_run: bool,
 }
 

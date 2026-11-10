@@ -205,6 +205,19 @@ impl Engine {
         }
     }
 
+    /// The program `esql --restore` runs: pg_restore for a Postgres archive
+    /// (`pg::is_archive`), else the engine's own client fed the SQL. SQL Server
+    /// has no dump file of its own, so none.
+    pub fn restore_client(self, archive: bool) -> Option<&'static str> {
+        match self {
+            Engine::Pg if archive => Some("pg_restore"),
+            Engine::Pg => Some("psql"),
+            Engine::MySql => Some("mysql"),
+            Engine::Sqlite => Some("sqlite3"),
+            Engine::MsSql => None,
+        }
+    }
+
     /// The one line of orientation printed before the terminal is handed over.
     ///
     /// Ordered the way you actually move through a server - databases, then
@@ -554,6 +567,59 @@ impl Conn {
         Some(argv)
     }
 
+    /// What `esql --restore` runs to load `file`: `Engine::restore_client`
+    /// aimed at the same block the client reads, with `args` handed to it
+    /// verbatim. psql skips `~/.psqlrc` and stops at the first error, so a load
+    /// that fails exits non-zero, as mysql and sqlite3 (`-bail`) do; those two
+    /// read `file` on stdin, which the caller opens when `Restore::stdin` says
+    /// so. pg_restore runs past a failed statement and exits 1 at the end; `-1`
+    /// from the user makes either Postgres load all or nothing, never added
+    /// here, since pg_restore refuses it beside `--create` and `--jobs`. `None`
+    /// for SQL Server.
+    pub fn restore_argv(
+        &self,
+        db: Option<&str>,
+        file: &str,
+        archive: bool,
+        args: &[String],
+    ) -> Option<Restore> {
+        let mut argv = vec![self.engine.restore_client(archive)?.to_string()];
+        match self.engine {
+            Engine::Pg => {
+                if !archive {
+                    argv.extend(["-X", "-v", "ON_ERROR_STOP=1", "-f", file].map(String::from));
+                }
+                argv.push("-d".into());
+                argv.push(pg::conninfo(&self.name, db));
+                argv.extend(args.iter().cloned());
+                if archive {
+                    argv.push(file.to_string());
+                }
+                Some(Restore { argv, stdin: false })
+            }
+            Engine::MySql => {
+                // mysql takes `--defaults-group-suffix` only as its first option.
+                argv.push(format!("--defaults-group-suffix={}", self.name));
+                if let Some(db) = db {
+                    argv.push(format!("--database={db}"));
+                }
+                argv.extend(args.iter().cloned());
+                Some(Restore { argv, stdin: true })
+            }
+            Engine::Sqlite => {
+                argv.push("-bail".into());
+                argv.extend(args.iter().cloned());
+                argv.push(
+                    crate::ini::expand_tilde(&self.database)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                Some(Restore { argv, stdin: true })
+            }
+            Engine::MsSql => None,
+        }
+    }
+
     /// A URL for the connection, which is what a GUI, an ORM config or a
     /// colleague's chat window wants. Never carries the password. Every part
     /// is percent-encoded, an IPv6 host is bracketed, and SQL Server's database
@@ -583,6 +649,12 @@ impl Conn {
         };
         format!("{scheme}://{user}{host}:{}{db}", self.port_or_default())
     }
+}
+
+/// What `Conn::restore_argv` runs, and whether the dump goes on its stdin.
+pub struct Restore {
+    pub argv: Vec<String>,
+    pub stdin: bool,
 }
 
 /// What `Conn::secret_env` hands a launcher: the variables, and the passfile
